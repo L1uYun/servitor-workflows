@@ -11,33 +11,32 @@
 ## Installation
 
 ```powershell
-cd D:\AgentWork\tools\servitor-workflows
 pip install -e .
 ```
 
-## Usage
+Requires Python 3.11+. Depends on servitor (install it first: pip install -e ../servitor). No other dependencies.## Usage
 
 ```powershell
 # Run a workflow (plan mode: no model calls)
-python -m servitor_workflows run examples/hello.workflow.py --plan --auto-effort --json
+servitor-workflows run examples/hello.workflow.py --plan --auto-effort --json
 
 # Run with real servitor agents; default provider is pi when available
-python -m servitor_workflows run examples/hello_smoke.workflow.py --fresh --json
+servitor-workflows run examples/hello_smoke.workflow.py --fresh --json
 
 # Replay from journal cache
-python -m servitor_workflows run examples/hello_smoke.workflow.py --resume --json
+servitor-workflows run examples/hello_smoke.workflow.py --resume --json
 
 # Override provider only when needed
-python -m servitor_workflows run examples/hello_smoke.workflow.py --agent codebuddy --model kimi-for-coding --fresh --json
+servitor-workflows run examples/hello_smoke.workflow.py --agent codebuddy --model kimi-for-coding --fresh --json
 
 # ASCII execution DAG
-python -m servitor_workflows map .workflow-journal/hello.workflow.jsonl
+servitor-workflows map .workflow-journal/hello.workflow.jsonl
 
 # Run summary
-python -m servitor_workflows summarize .workflow-journal/hello.workflow.jsonl
+servitor-workflows summarize .workflow-journal/hello.workflow.jsonl
 
 # Fleet status
-python -m servitor_workflows status .workflow-journal
+servitor-workflows status .workflow-journal
 ```
 
 ## Testing
