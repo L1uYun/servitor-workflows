@@ -1,6 +1,6 @@
 # Servitor-Workflows Follow-up Plan / Goal Contract
 
-Last updated: 2026-07-08 CST after P2 provider-default implementation.
+Last updated: 2026-07-09 CST after P0/P0.5/P1/P2 completion + agy removal + advisor subcommand.
 
 ## Purpose
 
@@ -11,17 +11,20 @@ Primary objective for the next agent: make real provider execution boring and ob
 ## Current verified state
 
 - Package path: `D:\AgentWork\tools\servitor-workflows`.
-- Upstream reference: `D:\AgentWork\_tmp\workflow-port\upstream-claude-dynamic-workflows-codex\runner\`.
-- Original port plan: `D:\AgentWork\_tmp\workflow-port\servitor-dynamic-workflows-port-plan.md`.
-- `python -m pytest -q` in `D:\AgentWork\tools\servitor-workflows` passed on 2026-07-08: `49 passed in 0.85s`.
-- `python -m servitor_workflows --help` exposes: `run`, `summarize`, `map`, `status`, `compare`, `supervise`.
-- `python -m servitor agents list --json` shows captured providers available: `claude`, `codebuddy`, `agy-tui`, `pi`; retired launch-only: `agy`.
-- Real provider smoke has run with `codebuddy` and multi-provider `codebuddy` + `pi`; later work should prefer `pi` as default and only use `codebuddy` explicitly when needed.
-- `servitor-workflows run` now resolves a deterministic default provider: explicit `--agent` > workflow `meta.agent/default_agent/defaultAgent` > captured provider preference `pi`, then `codebuddy`, then `claude`, then `agy-tui`.
-- The chosen provider is recorded in `.meta.json` as `effectiveAgent` / `effectiveAgentSource`, in `.events.jsonl` as a `defaults` event, and per agent journal/event entries as `agent`.
-- Agent state visibility already exists in code: `agent.status()`, `agent.stalled(threshold_ms)`, `session.poll()` with `elapsed_ms` and `idle_ms`, and `waitAny` return includes `stalled` / `stalledLabels`.
-- `compare_runs.py` and `supervise.py` exist and are wired into CLI, but do not yet have dedicated tests.
-- `README.md` and old phase language were stale; this file is the current plan source.
+- `pip install -e .` installed for both `servitor` and `servitor-workflows`; no PYTHONPATH needed.
+- `python -m pytest -q` in `D:\AgentWork\tools\servitor-workflows` passed on 2026-07-08: `53 passed in 0.88s`.
+- `servitor-workflows --help` (CLI on PATH) exposes: `run`, `summarize`, `map`, `status`, `compare`, `supervise`.
+- `servitor agents list --json` shows captured providers: `claude`, `codebuddy`, `agy-tui`, `pi`. The retired launch-only `agy` provider has been fully removed from `providers.py` (2026-07-09).
+- Real provider smoke verified:
+  - `pi` single-provider: run_dir `20260708T083147570427Z`, `provider=pi, ok=true, result="pong"`.
+  - `codebuddy` + `pi` multi-provider: journal `multi_provider_pong.workflow.result.json` = `{"codebuddy": "codebuddy", "pi": "pi"}`.
+  - Journal replay with `--resume` uses cached results.
+- `servitor-workflows run` resolves default provider: explicit `--agent` > workflow meta > captured preference `pi` > `codebuddy` > `claude` > `agy-tui`. Chosen provider recorded in `.meta.json`, `.events.jsonl`, journal entries.
+- `servitor advisor` subcommand added (2026-07-09): controller-side advisor with `--check` audit, call counter in `~/.servitor/advisor_state.json`, `advisor` role preset.
+- `agent-dispatch` SKILL.md slimmed from 238 to 68 lines (2026-07-09); transport/provider details in `references/servitor-transport-details.md`.
+- User model preference: GLM-5.2 (`newapi/glm-5.2`) executor, GPT-5.5 (`newapi/gpt-5.5`) advisor. Claude channels closed.
+- `compare_runs.py` and `supervise.py` exist and are wired into CLI, but do not yet have dedicated tests (P3).
+- All 5 tools pushed to private GitHub repos under `L1uYun/`.
 
 ## User decisions to preserve
 
@@ -51,9 +54,11 @@ Forbidden unless the user explicitly expands scope:
 
 ## Priority ledger
 
-### P0 — Real provider execution confidence
+### P0 — Real provider execution confidence — COMPLETE
 
-Goal: prove real workflows can run, be replayed, and expose true state without guessing. This comes before展示层.
+Goal: prove real workflows can run, be replayed, and expose true state without guessing.
+
+Verified 2026-07-08: 53 passed, pi single-provider pong, multi-provider codebuddy+pi, journal replay cached.
 
 Tasks:
 
@@ -98,7 +103,7 @@ Tasks:
    - Add only the smallest missing state field if a real run proves another agent cannot infer `working`, `idle`, `stalled`, `failed`, or `completed`.
    - Do not build `view`/HTML. Text/JSON status is enough.
 
-### P0.5 — Durability and Git provenance
+### P0.5 — Durability and Git provenance — COMPLETE
 
 Goal: make sure the project can be carried forward safely.
 
@@ -118,7 +123,7 @@ Tasks:
 
 Acceptance: future agent can tell which changed files are source/docs/tests versus generated runtime state.
 
-### P1 — Slim `agent-dispatch` skill into a route table
+### P1 — Slim `agent-dispatch` skill into a route table — COMPLETE
 
 Goal: reduce model cognitive entropy. The skill should route decisions; implementation details should move to references.
 
