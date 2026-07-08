@@ -1,93 +1,78 @@
 # servitor-workflows
 
-1:1 Python port of [claude-dynamic-workflows-codex](https://github.com/scasella/claude-dynamic-workflows-codex) — run dynamic-workflow scripts on local servitor subagents instead of Codex app-server.
+Run dynamic multi-agent workflows on top of [servitor](https://github.com/L1uYun/servitor). Parallel fan-out, pipelines, journal-backed replay, sessionful workers, and human gates — all in Python.
 
-## Design
+## Why
 
-`servitor` remains transport-only. This package adds: workflow DSL, runtime, deterministic provider defaults, journal/resume, sessionful workers, human gates, run sidecars, text status, analytics, and fleet supervision. HTML viewer parity is deferred.
+One `servitor run` call is one agent. But real tasks need orchestration: run three agents in parallel, pipeline results through stages, resume from a journal cache, or pause for human approval. servitor-workflows adds that layer without locking you into a GUI or a hosted platform.
 
-**No upstream code is copied.** This is an independent Python implementation of the same concept, ported module-by-module from the upstream JS source.
+## Install
 
-## Installation
-
-```powershell
+```
 pip install -e .
 ```
 
-Requires Python 3.11+. Depends on servitor (install it first: pip install -e ../servitor). No other dependencies.## Usage
+Python 3.11+. Depends on `servitor` (install it first).
+
+## 30-second start
 
 ```powershell
-# Run a workflow (plan mode: no model calls)
-servitor-workflows run examples/hello.workflow.py --plan --auto-effort --json
-
-# Run with real servitor agents; default provider is pi when available
 servitor-workflows run examples/hello_smoke.workflow.py --fresh --json
-
-# Replay from journal cache
-servitor-workflows run examples/hello_smoke.workflow.py --resume --json
-
-# Override provider only when needed
-servitor-workflows run examples/hello_smoke.workflow.py --agent codebuddy --model kimi-for-coding --fresh --json
-
-# ASCII execution DAG
-servitor-workflows map .workflow-journal/hello.workflow.jsonl
-
-# Run summary
-servitor-workflows summarize .workflow-journal/hello.workflow.jsonl
-
-# Fleet status
-servitor-workflows status .workflow-journal
 ```
+
+## Workflow DSL
+
+A workflow is a Python file with `meta = {}` and `async def main(...)`:
+
+```python
+meta = {"name": "review", "description": "Two agents review in parallel"}
+
+async def main(agent, parallel, pipeline, phase, log, budget, args, human, workflow):
+    phase("Review")
+    a, b = await parallel([
+        lambda: agent("Review this code for bugs", {"label": "reviewer-a"}),
+        lambda: agent("Review this code for security", {"label": "reviewer-b"}),
+    ])
+    log(f"a={a}")
+    log(f"b={b}")
+    return {"a": a, "b": b}
+```
+
+## Commands
+
+```powershell
+servitor-workflows run <file.workflow.py> --fresh --json     # run with real agents
+servitor-workflows run <file.workflow.py> --resume --json     # replay from journal
+servitor-workflows run <file.workflow.py> --plan --json       # dry run, no model calls
+servitor-workflows map <journal.jsonl>                        # ASCII execution DAG
+servitor-workflows summarize <journal.jsonl>                  # run summary
+servitor-workflows status <dir>                               # fleet status
+servitor-workflows compare <dir>                              # compare runs over time
+servitor-workflows supervise <dir> --interval 5               # poll fleet status
+```
+
+## Key APIs
+
+- `agent(prompt, opts)` — one-shot servitor call with journal cache
+- `parallel(thunks)` — concurrent fan-out under a semaphore
+- `pipeline(items, *stages)` — per-item sequential stages
+- `agent.start(prompt, opts)` — sessionful worker (returns before turn completes)
+- `agent.waitAny(sessions)` — first actionable session
+- `agent.status()` / `agent.stalled(threshold_ms)` — fleet observability
+- `human(question, opts)` — declared checkpoint, journaled and replayed
+
+## Journal
+
+Every run writes `.workflow-journal/<name>.{jsonl,events.jsonl,meta.json,result.json}`. Re-run with `--resume` to skip cached agent calls. State is the source of truth — not memory.
 
 ## Testing
 
 All tests use fake transport — no real provider calls.
 
-```powershell
-cd D:\AgentWork\tools\servitor-workflows
+```
 python -m pytest -q
 ```
 
-## Module mapping (upstream JS → this package)
+## License
 
-| Upstream | This package | Status |
-|----------|-------------|--------|
-| `runner/src/journal.js` | `journal.py` | ✅ |
-| `runner/src/runtime.js` | `runtime.py` + `session_runtime.py` | ✅ |
-| `runner/src/runWorkflow.js` | `run_workflow.py` | ✅ |
-| `runner/src/codexAgent.js` | `servitor_agent.py` | ✅ |
-| `runner/src/codexSession.js` | `servitor_session.py` | ✅ |
-| `runner/src/meter.js` | `meter.py` | ✅ |
-| `runner/src/modelMap.js` | `model_map.py` | ✅ |
-| `runner/src/agentTypes.js` | `agent_types.py` | ✅ |
-| `runner/src/worktree.js` | `worktree.py` | ✅ |
-| `runner/src/runModel.js` | `run_model.py` | ✅ |
-| `runner/src/runSummary.js` | `run_summary.py` | ✅ |
-| `runner/src/asciiMap.js` | `ascii_map.py` | ✅ |
-| `runner/src/fleetStatus.js` | `fleet_status.py` | ✅ |
-| `runner/src/compareRuns.js` | `compare_runs.py` | implemented; tests pending |
-| `runner/bin/run-workflow.js` | `cli.py` (`run`) | ✅ |
-| `runner/bin/summarize-run.js` | `cli.py` (`summarize`) | ✅ |
-| `runner/bin/map-run.js` | `cli.py` (`map`) | ✅ |
-| `runner/bin/fleet.js` | `cli.py` (`status`) | ✅ |
-| `runner/bin/view-run.js` | — (HTML viewer) | deferred |
-| `runner/bin/supervise.js` | `supervise.py` + `cli.py` (`supervise`) | implemented; tests pending |
-
-## Phase status
-
-- Phase 0: package skeleton + transport ✅
-- Phase 1: MVP runtime (agent/parallel/pipeline/journal) ✅ 22 tests
-- Phase 2: sessionful workers (start/steer/wait/waitAny/cancel/close) ✅ 7 tests
-- Phase 3: human gates (questions/answers sidecars) ✅ 6 tests
-- Phase 4: run model & sidecars ✅ 5 tests
-- Phase 5: summary & analytics ✅
-- Phase 6: ASCII map viewer ✅ 3 tests
-- Phase 7: fleet status ✅
-- Phase 8: agent-dispatch integration ✅ route table slimmed into `agent-dispatch`
-- Phase 9: provider defaults ✅ `pi`-first default recorded in meta/events/journal
-
-## Follow-up plan
-
-Current plan source: `D:\AgentWork\tools\servitor-workflows\GOAL-CONTRACT.md`.
-
-Priority order: Codex-as-servitor provider next if needed, then tests for `compare_runs` / `supervise`. HTML viewer is explicitly deferred until requested.
+MIT
