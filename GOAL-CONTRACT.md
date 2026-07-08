@@ -1,6 +1,6 @@
 # Servitor-Workflows Follow-up Plan / Goal Contract
 
-Last updated: 2026-07-09 CST after P0/P0.5/P1/P2 completion + agy removal + advisor subcommand.
+Last updated: 2026-07-09 CST after P1.5 (codex provider) + P3 (compare_runs/supervise tests) + providers.py refactor into providers/ package.
 
 ## Purpose
 
@@ -25,6 +25,10 @@ Primary objective for the next agent: make real provider execution boring and ob
 - User model preference: GLM-5.2 (`newapi/glm-5.2`) executor, GPT-5.5 (`newapi/gpt-5.5`) advisor. Claude channels closed.
 - `compare_runs.py` and `supervise.py` exist and are wired into CLI, but do not yet have dedicated tests (P3).
 - All 5 tools pushed to private GitHub repos under `L1uYun/`.
+
+- `servitor run --agent codex` registered (2026-07-09): uses `codex exec --dangerously-bypass-approvals-and-sandbox --output-last-message <file>`. Real smoke returned `pong` (run_dir `20260708T204106868146Z`).
+- `providers.py` refactored into `providers/` package (2026-07-09): base, extractors, model_discovery, utility, agy_tui, execution, registrations. Adding a new provider now requires only a registration call + optional model discovery function.
+- P3 tests added (2026-07-09): `test_compare_runs.py` (8 tests) + `test_supervise.py` (4 tests). Total: 65 passed.
 
 ## User decisions to preserve
 
@@ -153,7 +157,7 @@ Tasks:
    - no loss of essential operational details because references carry them;
    - `augury doctor` still passes after edit.
 
-### P1.5 — Add Codex as a `servitor` subagent / 灵体
+### P1.5 — Add Codex as a `servitor` subagent / 灵体 — COMPLETE
 
 Goal: allow `servitor run --agent codex ...` so Codex itself can be invoked as a bounded local worker when appropriate.
 
@@ -199,7 +203,7 @@ Acceptance: this command works without requiring the caller to know provider det
 python -m servitor_workflows run examples/hello_smoke.workflow.py --fresh --json
 ```
 
-### P3 — Tests for existing lower-priority modules
+### P3 — Tests for existing lower-priority modules — COMPLETE
 
 Goal: protect code already ported before adding more surface.
 
