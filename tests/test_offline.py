@@ -34,7 +34,7 @@ from servitor_workflows.run_workflow import run_workflow_source, extract_meta
 from servitor_workflows.runtime import effort_for_layer_width, _schema_skeleton, create_runtime, active_slots
 from servitor_workflows.journal import identity_hash, Journal
 from servitor_workflows.model_map import resolve_model, pick_frontier
-from servitor_workflows.servitor_agent import is_retryable, strictify_schema
+from servitor_workflows.servitor_agent import ServitorAgentError, _run_one_turn, is_retryable, strictify_schema
 from servitor_workflows.meter import reset_meter, record_token_usage, tokens_spent, output_spent, tokens_for_thread, mark_resumed_thread
 
 
@@ -537,6 +537,7 @@ def test_cli_meta_records_effective_default_agent(monkeypatch, tmp_path, capsys)
         no_summary=False,
         json=True,
         transport="servitor",
+        cancel_file=None,
     )
 
     assert _cmd_run(args) == 0
@@ -544,6 +545,122 @@ def test_cli_meta_records_effective_default_agent(monkeypatch, tmp_path, capsys)
     meta = json.loads((tmp_path / ".workflow-journal" / "tiny.workflow.meta.json").read_text(encoding="utf-8"))
     assert meta["effectiveAgent"] == "pi"
     assert meta["effectiveAgentSource"] == "auto"
+
+
+def test_cli_default_journal_is_beside_workflow_not_process_cwd(monkeypatch, tmp_path):
+    launch_dir = tmp_path / "launch"
+    workflow_dir = tmp_path / "workflows"
+    launch_dir.mkdir()
+    workflow_dir.mkdir()
+    monkeypatch.chdir(launch_dir)
+    script = workflow_dir / "tiny.workflow.py"
+    script.write_text(
+        'meta = {"name": "tiny"}\nasync def main(agent, parallel, pipeline, phase, log, budget, args, human, workflow):\n    return {"ok": True}\n',
+        encoding="utf-8",
+    )
+
+    assert _cmd_run(_run_cli_args(script, no_journal=False)) == 0
+
+    assert (workflow_dir / ".workflow-journal" / "tiny.workflow.jsonl").exists()
+    assert not (launch_dir / ".workflow-journal").exists()
+
+
+@pytest.mark.asyncio
+async def test_agent_failure_preserves_structured_run_evidence(monkeypatch, tmp_path):
+    run_dir = tmp_path / "servitor-run"
+    run_dir.mkdir()
+
+    async def fake_run_isolated_json(*_args, **_kwargs):
+        return {"run_dir": str(run_dir)}
+
+    import servitor
+    import servitor_workflows.servitor_agent as agent_module
+
+    monkeypatch.setattr(agent_module, "_run_isolated_json", fake_run_isolated_json)
+    monkeypatch.setattr(agent_module, "_available_models", ["model-a"])
+    monkeypatch.setattr(
+        servitor,
+        "wait_for_completion",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "failure_reason": "nonzero_exit",
+            "exit_code": 1,
+        },
+    )
+
+    with pytest.raises(ServitorAgentError) as caught:
+        await _run_one_turn(
+            "test",
+            {
+                "agent": "pi",
+                "requested_model": "model-a",
+                "timeout_seconds": 1,
+            },
+        )
+
+    evidence = caught.value.evidence
+    assert evidence["failure_reason"] == "nonzero_exit"
+    assert evidence["run_dir"] == str(run_dir)
+    assert evidence["metadata_path"] == str(run_dir / "metadata.json")
+    assert evidence["stdout_path"] == str(run_dir / "stdout.txt")
+    assert evidence["stderr_path"] == str(run_dir / "stderr.txt")
+    assert evidence["model"] == "model-a"
+    assert evidence["provider"] == "pi"
+    assert evidence["metadata"]["exit_code"] == 1
+    assert caught.value.codex_error_info == "nonzero_exit"
+
+
+@pytest.mark.asyncio
+async def test_workflow_agent_failure_surfaces_structured_run_evidence(monkeypatch, tmp_path):
+    run_dir = tmp_path / "workflow-run"
+    run_dir.mkdir()
+
+    async def fake_run_isolated_json(*_args, **_kwargs):
+        return {"run_dir": str(run_dir)}
+
+    import servitor
+    import servitor_workflows.servitor_agent as agent_module
+
+    monkeypatch.setattr(agent_module, "_run_isolated_json", fake_run_isolated_json)
+    monkeypatch.setattr(agent_module, "_available_models", ["model-a"])
+    monkeypatch.setattr(
+        servitor,
+        "wait_for_completion",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "failure_reason": "nonzero_exit",
+            "exit_code": 1,
+        },
+    )
+
+    src = """meta = {"name": "wf-failure"}
+async def main(agent, parallel, pipeline, phase, log, budget, args, human, workflow):
+    try:
+        await agent("x", {"agent": "pi", "model": "model-a", "timeout_seconds": 1})
+    except Exception as e:
+        return {
+            "cls": e.__class__.__name__,
+            "failure_reason": getattr(e, "failure_reason", None),
+            "run_dir": getattr(e, "run_dir", None),
+            "metadata_path": getattr(e, "metadata_path", None),
+            "stdout_path": getattr(e, "stdout_path", None),
+            "stderr_path": getattr(e, "stderr_path", None),
+            "provider": getattr(e, "provider", None),
+            "model": getattr(e, "model", None),
+        }
+    return {"cls": "no-error"}
+"""
+
+    result = await run_workflow_source(src, {})
+
+    assert result["cls"] == "ServitorAgentError"
+    assert result["failure_reason"] == "nonzero_exit"
+    assert result["run_dir"] == str(run_dir)
+    assert result["metadata_path"] == str(run_dir / "metadata.json")
+    assert result["stdout_path"] == str(run_dir / "stdout.txt")
+    assert result["stderr_path"] == str(run_dir / "stderr.txt")
+    assert result["provider"] == "pi"
+    assert result["model"] == "model-a"
 
 
 def _run_cli_args(script, **overrides):
@@ -568,6 +685,7 @@ def _run_cli_args(script, **overrides):
         "no_summary": False,
         "json": False,
         "transport": "servitor",
+        "cancel_file": None,
     }
     values.update(overrides)
     return argparse.Namespace(**values)

@@ -44,6 +44,7 @@ async def main(agent, parallel, pipeline, phase, log, budget, args, human, workf
 servitor-workflows run <file.workflow.py> --fresh --json     # run with real agents
 servitor-workflows run <file.workflow.py> --resume --json     # replay from journal
 servitor-workflows run <file.workflow.py> --plan --json       # dry run: no model calls; workflow Python still runs
+servitor-workflows run <file.workflow.py> --cancel-file /tmp/cancel.flag  # graceful cancel via sentinel file
 servitor-workflows map <journal.jsonl>                        # ASCII execution DAG
 servitor-workflows summarize <journal.jsonl>                  # run summary
 servitor-workflows status <dir>                               # fleet status
@@ -74,7 +75,7 @@ Phase/log/progress notes go to stderr, so `... | jq` stays clean.
 
 ## Journal
 
-Every run writes `.workflow-journal/<name>.{jsonl,events.jsonl,meta.json,result.json}`. Re-run with `--resume` to skip cached agent calls. State is the source of truth — not memory.
+Every run writes `.workflow-journal/<name>.{jsonl,events.jsonl,meta.json,result.json}` beside the workflow file by default, even when the workflow is launched by absolute path from another cwd. Use `--journal <path>` to override it. Re-run with `--resume` to skip cached agent calls. State is the source of truth — not memory.
 
 ## Testing
 
@@ -92,6 +93,17 @@ MIT
 ## Plan mode caveats
 
 `--plan` skips model calls (`agent()` returns schema skeletons) but still executes workflow Python. Gate disk/cache writes with the runtime `plan` flag exposed to `main(...)`.
+
+## Cancellation
+
+`--cancel-file <path>` enables graceful cancellation. The runtime checks the sentinel file before each `agent`/`parallel`/`pipeline`/`phase` call. To cancel a running workflow from another process:
+
+```powershell
+# From another terminal or exec session:
+New-Item /tmp/cancel.flag
+```
+
+The workflow stops at the next agent/phase boundary — in-flight agent calls complete, but no new ones start. The CLI exits with code 2 and prints `⛔ cancel file detected: <path>`.
 
 
 ## Windows + pi concurrency

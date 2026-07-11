@@ -116,7 +116,7 @@ async def run_workflow_source(src: str, options: dict | None = None) -> Any:
                                          "default_model", "pinned_model", "auto_effort",
                                          "pinned_effort", "plan", "on_phase", "on_log",
                                          "on_agent_plan", "on_event", "on_progress",
-                                         "journal", "run_agent", "start_session", "human_channel")},
+                                         "journal", "run_agent", "start_session", "human_channel", "cancel_file")},
                              default_agent=effective_default_agent)
 
     if not options.get("nested") and meta and meta.get("name"):
@@ -158,6 +158,7 @@ async def run_workflow_source(src: str, options: dict | None = None) -> Any:
             api["agent"].status = runtime["agent_status"]  # type: ignore
         if "agent_stalled" in runtime:
             api["agent"].stalled = runtime["agent_stalled"]  # type: ignore
+
         result = await main_func(**api)
         return result
     finally:

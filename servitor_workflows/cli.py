@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--run-id", default=None, help="Suffix for journal/sidecar paths")
     run_p.add_argument("--fresh", action="store_true", help="Discard prior journal before run")
     run_p.add_argument("--no-journal", action="store_true", help="Disable journal")
+    run_p.add_argument("--cancel-file", default=None, help="Path to sentinel file; workflow cancels when file appears")
     summary_mode = run_p.add_mutually_exclusive_group()
     summary_mode.add_argument("--summary", action="store_true", help="Print a richer bounded human result summary")
     summary_mode.add_argument("--no-summary", action="store_true", help="Suppress the human result summary")
@@ -212,7 +213,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         run_suffix = f"--{args.run_id}" if args.run_id else ""
         run_suffix = run_suffix.replace(" ", "_").replace("/", "_")
         default_name = Path(script).stem + run_suffix + ".jsonl"
-        journal_path = args.journal or str(Path(".workflow-journal") / default_name)
+        # Keep implicit workflow state with the workflow definition rather than
+        # whichever process cwd happened to launch an absolute script path.
+        journal_path = args.journal or str(Path(script).parent / ".workflow-journal" / default_name)
         journal_path = str(Path(journal_path).resolve())
         Path(journal_path).parent.mkdir(parents=True, exist_ok=True)
         if args.fresh:
@@ -268,6 +271,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "on_log": _on_log,
         "on_event": _on_event,
         "journal": journal,
+        "cancel_file": args.cancel_file,
     }
 
     # Write run-meta sidecar
@@ -294,6 +298,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
             result_path = Path(journal_path).with_suffix(".result.json")
             result_path.write_text(json.dumps(result, ensure_ascii=False, default=str), encoding="utf-8")
     except Exception as e:
+        from .runtime import WorkflowCancelled
+        if isinstance(e, WorkflowCancelled):
+            end_status = "cancelled"
+            print(f"\n⛔ {e}", file=sys.stderr)
+            return 2
         end_status = "budget_exceeded" if getattr(e, "code", None) == "BUDGET_EXCEEDED" else "failed"
         if getattr(e, "code", None) == "BUDGET_EXCEEDED":
             print(f"\n💸 {e}", file=sys.stderr)

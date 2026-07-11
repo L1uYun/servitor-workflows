@@ -10,12 +10,18 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import os
+import pathlib
 import sys
 import time
 from typing import Any, Callable
 
 from .journal import Journal, identity_hash
 from .meter import tokens_spent, output_spent
+
+
+class WorkflowCancelled(RuntimeError):
+    """Raised when the workflow is cancelled via --cancel-file sentinel."""
+    pass
 def effort_for_layer_width(width: int) -> str:
     """Thinking effort scales INVERSELY with layer width.
 
@@ -153,6 +159,7 @@ def create_runtime(
     run_agent: Callable | None = None,
     start_session: Callable | None = None,
     human_channel: dict | None = None,
+    cancel_file: str | None = None,
 ) -> dict:
     """Create the workflow runtime API dict.
 
@@ -216,9 +223,22 @@ def create_runtime(
         if on_log:
             on_log(message)
 
+    # ── cancellation: check sentinel file before each agent/phase/pipeline ──
+    _cancelled = False
+
+    def _check_cancelled():
+        nonlocal _cancelled
+        if _cancelled:
+            raise WorkflowCancelled("workflow already cancelled")
+        if cancel_file and pathlib.Path(cancel_file).exists():
+            _cancelled = True
+            _log(f"  ⛔ cancel file detected: {cancel_file}")
+            raise WorkflowCancelled(f"cancel file detected: {cancel_file}")
+
     # ── agent() ─────────────────────────────────────────────────────────────
     async def agent(prompt: str, opts: dict | None = None) -> Any:
         opts = opts or {}
+        _check_cancelled()
         _bump_agent_count()
         merged = {**_defaults, **opts}
         agent_name = opts.get("agent") or default_agent
@@ -306,6 +326,7 @@ def create_runtime(
 
     # ── parallel() ──────────────────────────────────────────────────────────
     async def parallel(thunks: list) -> list:
+        _check_cancelled()
         width = len(thunks)
         async def _run_one(thunk):
             token = _layer_width.set(width)
@@ -324,6 +345,7 @@ def create_runtime(
 
     # ── pipeline() ──────────────────────────────────────────────────────────
     async def pipeline(items: list, *stages: Callable) -> list:
+        _check_cancelled()
         width = len(items)
         async def _run_item(item, index):
             token = _layer_width.set(width)
@@ -354,6 +376,7 @@ def create_runtime(
 
     # ── phase() / log() ─────────────────────────────────────────────────────
     def phase(title: str):
+        _check_cancelled()
         nonlocal_state["current_phase"] = title
         if on_phase:
             on_phase(title)
