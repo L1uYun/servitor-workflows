@@ -141,8 +141,18 @@ async def run_workflow_source(src: str, options: dict | None = None) -> Any:
         raise SyntaxError("Workflow `main` must be a callable")
 
     try:
-        api = {k: runtime[k] for k in ("agent", "parallel", "pipeline", "phase", "log",
-                                       "budget", "args", "human", "workflow")}
+        import inspect
+        wanted = ("agent", "parallel", "pipeline", "phase", "log",
+                  "budget", "args", "human", "workflow", "plan")
+        try:
+            sig = inspect.signature(main_func)
+            accepted = set(sig.parameters.keys())
+            # If main uses **kwargs, pass everything available.
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                accepted = set(wanted)
+        except (TypeError, ValueError):
+            accepted = set(wanted)
+        api = {k: runtime[k] for k in wanted if k in runtime and k in accepted}
         # Attach sessionful observability methods to agent
         if "agent_status" in runtime:
             api["agent"].status = runtime["agent_status"]  # type: ignore

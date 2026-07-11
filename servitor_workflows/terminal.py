@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import subprocess
 
+from servitor.providers.utility import _hidden_process_kwargs
+
 
 async def run_git(cwd: str, args: list[str]) -> str:
     """Run a git command in cwd and return stdout (stripped).
@@ -19,6 +21,7 @@ async def run_git(cwd: str, args: list[str]) -> str:
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **_hidden_process_kwargs(),
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
@@ -40,6 +43,7 @@ async def run_command(cmd: list[str], cwd: str | None = None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
+        **_hidden_process_kwargs(),
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)

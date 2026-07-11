@@ -13,15 +13,103 @@ agentType loading, worktree isolation, per-agent metrics collection.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import pathlib
 import re
+import signal
+import subprocess
+import sys
 import time
 from typing import Any, Callable
+
+from servitor.providers.utility import _hidden_process_kwargs
 
 from .agent_types import load_agent_type
 from .model_map import resolve_model
 from .meter import tokens_for_thread
 from .worktree import create_worktree, is_git_repo
+
+
+_SERVITOR_RUN_SCRIPT = """
+import json
+import sys
+
+import servitor
+
+payload = json.load(sys.stdin)
+result = servitor.run_agent(**payload)
+json.dump(result, sys.stdout, ensure_ascii=False)
+"""
+
+
+async def _terminate_process_tree(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is not None:
+        return
+    if sys.platform == "win32":
+        killer = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/PID",
+            str(proc.pid),
+            "/T",
+            "/F",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            **_hidden_process_kwargs(),
+        )
+        await killer.communicate()
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=2)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+
+async def _run_isolated_json(
+    payload: dict[str, Any],
+    *,
+    timeout_seconds: float,
+    script: str = _SERVITOR_RUN_SCRIPT,
+) -> dict[str, Any]:
+    process_kwargs = _hidden_process_kwargs()
+    if sys.platform == "win32":
+        process_kwargs["creationflags"] = (
+            process_kwargs.get("creationflags", 0) | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        process_kwargs["start_new_session"] = True
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        **process_kwargs,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(json.dumps(payload, ensure_ascii=False).encode("utf-8")),
+            timeout=timeout_seconds,
+        )
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        await _terminate_process_tree(proc)
+        raise
+    if proc.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"isolated servitor worker failed ({proc.returncode}): {detail}")
+    try:
+        result = json.loads(stdout.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("isolated servitor worker returned invalid JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("isolated servitor worker returned a non-object result")
+    return result
 
 
 def strictify_schema(s: dict | None) -> dict | None:
@@ -53,16 +141,21 @@ def strictify_schema(s: dict | None) -> dict | None:
     return out
 
 
-def parse_schema_result(text: str | None, schema: dict | None) -> Any:
-    """Parse a result text under an optional schema.
+def parse_schema_result(text: Any, schema: dict | None) -> Any:
+    """Parse a result under an optional schema.
 
-    1:1 port of upstream parseSchemaResult(). Without a schema the raw text passes
-    through.
+    `apply_output_contract(..., expect_json=True)` may already leave `result` as a
+    parsed dict/list. Accept structured values as-is when a schema is present;
+    only parse strings. Without a schema the value passes through unchanged.
     """
     if not schema:
         return text
     if text is None:
         return None
+    if isinstance(text, (dict, list)):
+        return text
+    if not isinstance(text, str):
+        return text
     import json
     try:
         return json.loads(text)
@@ -250,7 +343,11 @@ async def _run_one_turn(prompt: str, opts: dict) -> Any:
     if schema:
         schema = strictify_schema(schema)
 
-    # Build kwargs for servitor.run_agent
+    # Build kwargs for servitor.run_agent.
+    # Launch asynchronously (no timeout_seconds) so the provider uses the
+    # detached launcher + _DONE/metadata completion protocol. Then wait here.
+    # Passing timeout_seconds would force the sync path and couple the isolated
+    # worker lifetime to a single blocking subprocess without the DONE wait path.
     run_kwargs: dict[str, Any] = {
         "provider_name": agent_name,
         "prompt": prompt,
@@ -264,25 +361,37 @@ async def _run_one_turn(prompt: str, opts: dict) -> Any:
         run_kwargs["native_args"] = opts["native_args"]
     if opts.get("run_dir_label"):
         run_kwargs["run_dir_label"] = opts["run_dir_label"]
-    if opts.get("timeout_seconds"):
-        run_kwargs["timeout_seconds"] = opts["timeout_seconds"]
+    wait_seconds = float(opts.get("timeout_seconds") or 600)
+    # Bound detached provider lifetime to the same deadline the workflow waits on.
+    # Prevents orphan pi processes after wait_elapsed.
+    run_kwargs["provider_timeout_seconds"] = float(
+        opts.get("provider_timeout_seconds") or wait_seconds
+    )
 
-    # Call servitor.run_agent (blocking) in a thread
-    run_info = await asyncio.to_thread(servitor.run_agent, **run_kwargs)
+    # Isolate the blocking provider call so cancellation can reap its process
+    # tree instead of leaving asyncio.run waiting on a default-executor thread.
+    # Launch is fast (async spawn); wait is the long part and uses wait_for_completion.
+    run_info = await _run_isolated_json(
+        run_kwargs,
+        timeout_seconds=max(30.0, min(wait_seconds, 120.0)),
+    )
     run_dir = run_info.get("run_dir") if isinstance(run_info, dict) else getattr(run_info, "run_dir", None)
-    thread_id = run_info.get("session_id") if isinstance(run_info, dict) else getattr(run_info, "session_id", None)
+    if not run_dir:
+        raise RuntimeError(f"servitor.run_agent returned no run_dir: {run_info!r}")
 
-    # Wait for completion
-    wait_seconds = opts.get("timeout_seconds") or 600
-    await asyncio.to_thread(servitor.wait_for_completion, run_dir, wait_seconds)
+    # Wait until metadata terminal status or _DONE.txt (healed if needed).
+    def _wait():
+        return servitor.wait_for_completion(run_dir, wait_seconds=wait_seconds)
 
-    # Read result
-    meta = await asyncio.to_thread(servitor.read_result, run_dir)
+    meta = await asyncio.to_thread(_wait)
+    if not isinstance(meta, dict):
+        meta = servitor.read_result(run_dir)
+    # If wait elapsed, surface still_running as failure below.
+    thread_id = meta.get("session_id") if isinstance(meta, dict) else None
 
     # Apply output contract if schema is provided
     if schema or opts.get("check_contains") or opts.get("check_regex"):
-        meta = await asyncio.to_thread(
-            servitor.apply_output_contract,
+        meta = servitor.apply_output_contract(
             meta,
             expect_json=schema is not None,
             schema=schema,

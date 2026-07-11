@@ -17,12 +17,18 @@
 import asyncio
 import argparse
 import json
+import os
+import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
 
 import servitor_workflows.run_workflow as run_workflow
+import servitor_workflows.cli as workflow_cli
+import servitor_workflows.terminal as terminal
 from servitor_workflows.cli import _cmd_run
 from servitor_workflows.run_workflow import run_workflow_source, extract_meta
 from servitor_workflows.runtime import effort_for_layer_width, _schema_skeleton, create_runtime, active_slots
@@ -38,6 +44,43 @@ def test_extract_meta_ignores_comment():
     meta = extract_meta(src)
     assert meta is not None
     assert meta["name"] == "x"
+
+
+def test_delayed_provider_timeout_does_not_block_asyncio_shutdown():
+    root = Path(__file__).resolve().parents[1]
+    code = r'''
+import asyncio
+from servitor_workflows.servitor_agent import _run_isolated_json
+
+async def main():
+    echo = "import json,sys; payload=json.load(sys.stdin); json.dump(payload, sys.stdout)"
+    assert await _run_isolated_json({"ok": True}, timeout_seconds=1, script=echo) == {"ok": True}
+    worker = "import json,sys,time; json.load(sys.stdin); time.sleep(5)"
+    try:
+        await _run_isolated_json({}, timeout_seconds=0.05, script=worker)
+    except asyncio.TimeoutError:
+        return
+    raise AssertionError("delayed provider fixture did not time out")
+
+asyncio.run(main())
+print("exited")
+'''
+    env = {**os.environ, "PYTHONPATH": str(root)}
+    started = time.monotonic()
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "exited"
+    assert time.monotonic() - started < 2
 
 
 # 2) Workflow body runs with return value.
@@ -501,3 +544,118 @@ def test_cli_meta_records_effective_default_agent(monkeypatch, tmp_path, capsys)
     meta = json.loads((tmp_path / ".workflow-journal" / "tiny.workflow.meta.json").read_text(encoding="utf-8"))
     assert meta["effectiveAgent"] == "pi"
     assert meta["effectiveAgentSource"] == "auto"
+
+
+def _run_cli_args(script, **overrides):
+    values = {
+        "script": str(script),
+        "args": None,
+        "args_file": None,
+        "budget": None,
+        "agent": None,
+        "model": None,
+        "pin_model": None,
+        "effort": None,
+        "auto_effort": False,
+        "pin_effort": None,
+        "plan": False,
+        "resume": False,
+        "journal": None,
+        "run_id": None,
+        "fresh": True,
+        "no_journal": True,
+        "summary": False,
+        "no_summary": False,
+        "json": False,
+        "transport": "servitor",
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def test_cli_run_output_modes_are_distinct_and_bounded(monkeypatch, tmp_path, capsys):
+    script = tmp_path / "output.workflow.py"
+    script.write_text(
+        'meta = {"name": "output"}\nasync def main(agent, parallel, pipeline, phase, log, budget, args, human, workflow):\n    return {}\n',
+        encoding="utf-8",
+    )
+    result = {
+        "status": "completed",
+        "answer": "done",
+        "details": "x" * 5000,
+        "items": [{"id": index, "text": "y" * 500} for index in range(30)],
+    }
+
+    async def fake_run_workflow_file(script_path, options):
+        return result
+
+    monkeypatch.setattr(workflow_cli, "run_workflow_file", fake_run_workflow_file)
+
+    assert _cmd_run(_run_cli_args(script)) == 0
+    default = capsys.readouterr().out
+    assert len(default) < 600
+    assert "completed" in default
+    assert "x" * 100 not in default
+
+    assert _cmd_run(_run_cli_args(script, summary=True)) == 0
+    detailed = capsys.readouterr().out
+    assert len(default) < len(detailed) < 3000
+    assert "answer" in detailed
+    assert "items" in detailed
+
+    assert _cmd_run(_run_cli_args(script, no_summary=True)) == 0
+    assert capsys.readouterr().out == ""
+
+    assert _cmd_run(_run_cli_args(script, json=True, no_summary=True)) == 0
+    machine = capsys.readouterr().out
+    assert json.loads(machine) == result
+
+
+@pytest.mark.asyncio
+async def test_parallel_supports_repeated_same_agent_with_distinct_prompts_and_models():
+    calls = []
+
+    async def echo(prompt, opts):
+        calls.append((prompt, opts.get("agent"), opts.get("model"), opts.get("label")))
+        return prompt
+
+    src = '''meta = {"name": "heterogeneous"}
+async def main(agent, parallel, pipeline, phase, log, budget, args, human, workflow):
+    return await parallel([
+        lambda: agent("alpha", {"agent": "pi", "model": "model-a", "label": "a"}),
+        lambda: agent("beta", {"agent": "pi", "model": "model-b", "label": "b"}),
+    ])
+'''
+    result = await run_workflow_source(src, {"run_agent": echo})
+
+    assert result == ["alpha", "beta"]
+    assert sorted(calls) == [
+        ("alpha", "pi", "model-a", "a"),
+        ("beta", "pi", "model-b", "b"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_helpers_pass_hidden_process_kwargs(monkeypatch):
+    captured = []
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured.append((args, kwargs))
+        return Proc()
+
+    hidden = {"creationflags": 0x08000000, "startupinfo": object()}
+    monkeypatch.setattr(terminal, "_hidden_process_kwargs", lambda: hidden)
+    monkeypatch.setattr(terminal.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    assert await terminal.run_git(".", ["status"]) == "ok"
+    assert await terminal.run_command(["tool", "arg"]) == ("ok", "", 0)
+    assert len(captured) == 2
+    for _, kwargs in captured:
+        assert kwargs["creationflags"] == hidden["creationflags"]
+        assert kwargs["startupinfo"] is hidden["startupinfo"]

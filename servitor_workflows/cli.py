@@ -37,14 +37,15 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--effort", default=None, help="Default effort level")
     run_p.add_argument("--auto-effort", action="store_true", help="Scale effort by layer width")
     run_p.add_argument("--pin-effort", default=None, help="Pin all agents to one effort")
-    run_p.add_argument("--plan", action="store_true", help="Dry run: count agents, no model calls")
+    run_p.add_argument("--plan", action="store_true", help="Dry run: no model calls (agent() returns schema skeletons). Workflow Python still executes — avoid cache/file side effects or gate them with the plan flag.")
     run_p.add_argument("--resume", action="store_true", help="Reuse prior results from journal")
     run_p.add_argument("--journal", default=None, help="Journal path override")
     run_p.add_argument("--run-id", default=None, help="Suffix for journal/sidecar paths")
     run_p.add_argument("--fresh", action="store_true", help="Discard prior journal before run")
     run_p.add_argument("--no-journal", action="store_true", help="Disable journal")
-    run_p.add_argument("--summary", action="store_true", help="Print full summary at end")
-    run_p.add_argument("--no-summary", action="store_true", help="Silence end-of-run summary")
+    summary_mode = run_p.add_mutually_exclusive_group()
+    summary_mode.add_argument("--summary", action="store_true", help="Print a richer bounded human result summary")
+    summary_mode.add_argument("--no-summary", action="store_true", help="Suppress the human result summary")
     run_p.add_argument("--json", action="store_true", help="Output JSON result to stdout")
     run_p.add_argument("--transport", default="servitor", help="Transport backend (for testing)")
     run_p.set_defaults(func=_cmd_run)
@@ -150,6 +151,48 @@ def _cmd_status(args):
     return 0
 
 
+def _compact_text(value, limit=180):
+    text = " ".join(str(value if value is not None else "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _summary_value(value, limit=180):
+    if isinstance(value, dict):
+        return f"{{{len(value)} fields}}"
+    if isinstance(value, (list, tuple)):
+        return f"[{len(value)} items]"
+    return _compact_text(value, limit)
+
+
+def _render_result_summary(result, detailed=False):
+    if isinstance(result, dict):
+        if detailed:
+            lines = ["result:"]
+            for key, value in list(result.items())[:20]:
+                lines.append(f"  {key}: {_summary_value(value, 220)}")
+            if len(result) > 20:
+                lines.append(f"  ... {len(result) - 20} more fields; use --json")
+            return "\n".join(lines)
+        preferred = ("status", "ok", "answer", "summary", "message", "result")
+        keys = [key for key in preferred if key in result]
+        keys.extend(key for key in result if key not in keys)
+        parts = [f"{key}={_summary_value(result[key], 80)}" for key in keys[:6]]
+        if len(keys) > 6:
+            parts.append(f"+{len(keys) - 6} fields")
+        return "result: " + (" | ".join(parts) if parts else "(empty)")
+    if isinstance(result, (list, tuple)):
+        if detailed:
+            lines = [f"result: {len(result)} items"]
+            lines.extend(f"  - {_summary_value(value, 220)}" for value in result[:20])
+            if len(result) > 20:
+                lines.append(f"  ... {len(result) - 20} more items; use --json")
+            return "\n".join(lines)
+        return f"result: [{len(result)} items]"
+    return f"result: {_summary_value(result, 240)}"
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     script = str(Path(args.script).resolve())
     workflow_meta = extract_meta(Path(script).read_text(encoding="utf-8")) or {}
@@ -204,6 +247,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if args.effort:
         defaults["effort"] = args.effort
 
+    if args.plan:
+        print(
+            "⚠ --plan: agent() will not call models, but workflow Python still runs. "
+            "Gate disk/cache side effects with the runtime `plan` flag.",
+            file=sys.stderr,
+        )
     run_opts = {
         "args": workflow_args or {},
         "budget_total": args.budget,
@@ -236,11 +285,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
     end_status = "completed"
     try:
         result = asyncio.run(run_workflow_file(script, run_opts))
-        print("\n─── result ───", file=sys.stderr)
         if args.json:
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
-        else:
-            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        elif not args.no_summary:
+            print(_render_result_summary(result, detailed=args.summary))
         # Persist result
         if journal_path and result is not None:
             result_path = Path(journal_path).with_suffix(".result.json")

@@ -25,7 +25,26 @@ def effort_for_layer_width(width: int) -> str:
     return "xhigh" if width <= 1 else "high"
 
 
-_CAP = min(16, max(1, (os.cpu_count() or 4) - 2))
+def _default_cap() -> int:
+    """Default agent concurrency.
+
+    CPU-derived cap is fine for local fake transports, but real Windows+pi
+    launches stall when many agents start at once. Prefer a lower default on
+    Windows unless SERVITOR_WORKFLOW_CAP overrides.
+    """
+    env = os.environ.get("SERVITOR_WORKFLOW_CAP")
+    if env:
+        try:
+            return max(1, min(16, int(env)))
+        except ValueError:
+            pass
+    cpu_cap = min(16, max(1, (os.cpu_count() or 4) - 2))
+    if sys.platform == "win32":
+        return min(cpu_cap, 2)
+    return cpu_cap
+
+
+_CAP = _default_cap()
 _AGENT_CAP = 1000
 
 # ── layer-width context (Python's contextvars = JS's AsyncLocalStorage) ──────
@@ -591,6 +610,9 @@ def create_runtime(
         "agent": agent, "parallel": parallel, "pipeline": pipeline,
         "phase": phase, "log": log, "budget": budget, "args": _args,
         "workflow": workflow, "human": human, "CAP": _CAP, "finalize": finalize,
+        # True when --plan: agent() returns schema skeletons and does not call models.
+        # Workflow Python still runs; side-effecting disk writes remain the workflow authors responsibility.
+        "plan": plan,
     }
 
 

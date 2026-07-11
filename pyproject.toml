@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Dynamic workflow orchestration layer on top of servitor transport"
 requires-python = ">=3.11"
 dependencies = [
-    # editable local servitor dependency resolved at install time
+    "servitor>=0.1.0",
 ]
 
 [project.scripts]
@@ -19,4 +19,5 @@ where = ["."]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
