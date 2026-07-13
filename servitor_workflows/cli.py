@@ -17,6 +17,8 @@ from . import __version__
 from .journal import Journal
 from .run_workflow import extract_meta, resolve_default_agent, run_workflow_file
 
+from servitor.output_mode import add_output_mode_args, ensure_utf8_stdio, resolve_output_mode
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -26,29 +28,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command")
 
-    run_p = sub.add_parser("run", help="Run a workflow file")
+    run_p = sub.add_parser(
+        "run",
+        help="Run a workflow file",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Golden path:\n"
+            "  servitor-workflows run flow.workflow.py --fresh --output json\n"
+            "Output modes: --output human|json|quiet\n"
+            "Advanced: --journal/--run-id/--no-journal, pin/effort family, --cancel-file"
+        ),
+    )
     run_p.add_argument("script", help="Path to .workflow.py file")
     run_p.add_argument("--args", default=None, help="JSON args string")
     run_p.add_argument("--args-file", default=None, help="Path to JSON args file")
     run_p.add_argument("--budget", type=int, default=None, help="Token budget")
     run_p.add_argument("--agent", default=None, help="Default agent/provider (e.g. claude, codebuddy)")
     run_p.add_argument("--model", default=None, help="Default model")
-    run_p.add_argument("--pin-model", default=None, help="Pin all agents to one model")
-    run_p.add_argument("--effort", default=None, help="Default effort level")
-    run_p.add_argument("--auto-effort", action="store_true", help="Scale effort by layer width")
-    run_p.add_argument("--pin-effort", default=None, help="Pin all agents to one effort")
+    run_p.add_argument("--pin-model", default=None, help="Advanced: pin all agents to one model")
+    run_p.add_argument("--effort", default=None, help="Advanced: default effort level")
+    run_p.add_argument("--auto-effort", action="store_true", help="Advanced: scale effort by layer width")
+    run_p.add_argument("--pin-effort", default=None, help="Advanced: pin all agents to one effort")
     run_p.add_argument("--plan", action="store_true", help="Dry run: no model calls (agent() returns schema skeletons). Workflow Python still executes — avoid cache/file side effects or gate them with the plan flag.")
     run_p.add_argument("--resume", action="store_true", help="Reuse prior results from journal")
-    run_p.add_argument("--journal", default=None, help="Journal path override")
-    run_p.add_argument("--run-id", default=None, help="Suffix for journal/sidecar paths")
+    run_p.add_argument("--journal", default=None, help="Advanced: journal path override")
+    run_p.add_argument("--run-id", default=None, help="Advanced: suffix for journal/sidecar paths")
     run_p.add_argument("--fresh", action="store_true", help="Discard prior journal before run")
-    run_p.add_argument("--no-journal", action="store_true", help="Disable journal")
-    run_p.add_argument("--cancel-file", default=None, help="Path to sentinel file; workflow cancels when file appears")
-    summary_mode = run_p.add_mutually_exclusive_group()
-    summary_mode.add_argument("--summary", action="store_true", help="Print a richer bounded human result summary")
-    summary_mode.add_argument("--no-summary", action="store_true", help="Suppress the human result summary")
-    run_p.add_argument("--json", action="store_true", help="Output JSON result to stdout")
-    run_p.add_argument("--transport", default="servitor", help="Transport backend (for testing)")
+    run_p.add_argument("--no-journal", action="store_true", help="Advanced: disable journal")
+    run_p.add_argument("--cancel-file", default=None, help="Advanced: path to sentinel file; workflow cancels when file appears")
+    add_output_mode_args(run_p)
+    run_p.add_argument("--transport", default="servitor", help=argparse.SUPPRESS)
     run_p.set_defaults(func=_cmd_run)
 
     # summarize subcommand
@@ -56,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     sum_p.add_argument("journal", help="Journal path")
     sum_p.add_argument("--script", default=None, help="Workflow script path")
     sum_p.add_argument("--include-result", action="store_true")
-    sum_p.add_argument("--json", action="store_true")
+    add_output_mode_args(sum_p)
     sum_p.set_defaults(func=_cmd_summarize)
 
     # map subcommand
@@ -69,13 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
     # status subcommand
     status_p = sub.add_parser("status", help="Fleet status of one or more runs")
     status_p.add_argument("targets", nargs="*", help="Run directories or journal paths")
-    status_p.add_argument("--json", action="store_true")
+    add_output_mode_args(status_p)
     status_p.set_defaults(func=_cmd_status)
 
     # compare subcommand
     cmp_p = sub.add_parser("compare", help="Compare runs over time")
     cmp_p.add_argument("targets", nargs="*", help="Run directories or journal paths")
-    cmp_p.add_argument("--json", action="store_true")
+    add_output_mode_args(cmp_p)
     cmp_p.set_defaults(func=_cmd_compare)
 
     # supervise subcommand
@@ -88,11 +97,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+
+def _output_mode(args, default="human"):
+    return resolve_output_mode(args, default=default)
+
+
+def _validate_state_selectors(args):
+    if getattr(args, "fresh", False) and getattr(args, "resume", False):
+        raise SystemExit("servitor-workflows run: --fresh and --resume are mutually exclusive")
+
 def _cmd_compare(args):
     from .compare_runs import collect_comparison, render_comparison_text
     import json as _json
     data = collect_comparison(args.targets or ["."])
-    if args.json:
+    mode = _output_mode(args)
+    if mode == "quiet":
+        return 0
+    if mode == "json":
         print(_json.dumps(data, ensure_ascii=False, indent=2, default=str))
     else:
         print(render_comparison_text(data))
@@ -115,7 +137,10 @@ def _cmd_summarize(args):
     s = summarize_run(journal_path=args.journal, script_path=args.script,
                       include_result=args.include_result)
     import json as _json
-    if args.json:
+    mode = _output_mode(args)
+    if mode == "quiet":
+        return 0
+    if mode == "json":
         print(_json.dumps(s, ensure_ascii=False, indent=2, default=str))
     else:
         from .run_summary import render_end_of_run
@@ -145,7 +170,10 @@ def _cmd_status(args):
             for j in list_journals(tpath):
                 journals.append(j["path"])
     infos = [inspect_run(j) for j in journals]
-    if args.json:
+    mode = _output_mode(args)
+    if mode == "quiet":
+        return 0
+    if mode == "json":
         print(_json.dumps(infos, ensure_ascii=False, indent=2, default=str))
     else:
         print(render_fleet_text(infos))
@@ -174,7 +202,7 @@ def _render_result_summary(result, detailed=False):
             for key, value in list(result.items())[:20]:
                 lines.append(f"  {key}: {_summary_value(value, 220)}")
             if len(result) > 20:
-                lines.append(f"  ... {len(result) - 20} more fields; use --json")
+                lines.append(f"  ... {len(result) - 20} more fields; use --output json")
             return "\n".join(lines)
         preferred = ("status", "ok", "answer", "summary", "message", "result")
         keys = [key for key in preferred if key in result]
@@ -188,16 +216,18 @@ def _render_result_summary(result, detailed=False):
             lines = [f"result: {len(result)} items"]
             lines.extend(f"  - {_summary_value(value, 220)}" for value in result[:20])
             if len(result) > 20:
-                lines.append(f"  ... {len(result) - 20} more items; use --json")
+                lines.append(f"  ... {len(result) - 20} more items; use --output json")
             return "\n".join(lines)
         return f"result: [{len(result)} items]"
     return f"result: {_summary_value(result, 240)}"
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    _validate_state_selectors(args)
     script = str(Path(args.script).resolve())
     workflow_meta = extract_meta(Path(script).read_text(encoding="utf-8")) or {}
     effective_agent, effective_agent_source = resolve_default_agent(args.agent, workflow_meta)
+    output_mode = _output_mode(args)
 
     # Parse args
     workflow_args = None
@@ -289,10 +319,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
     end_status = "completed"
     try:
         result = asyncio.run(run_workflow_file(script, run_opts))
-        if args.json:
+        if output_mode == "json":
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
-        elif not args.no_summary:
-            print(_render_result_summary(result, detailed=args.summary))
+        elif output_mode == "human":
+            print(_render_result_summary(result, detailed=False))
         # Persist result
         if journal_path and result is not None:
             result_path = Path(journal_path).with_suffix(".result.json")
@@ -314,6 +344,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def main(argv=None) -> int:
+    ensure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     if not hasattr(args, "func"):

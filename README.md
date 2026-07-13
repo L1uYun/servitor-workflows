@@ -17,8 +17,8 @@ Python 3.11+. Runtime dependency: local `servitor>=0.1.0`. Install both editable
 ## 30-second start
 
 ```powershell
-servitor-workflows run examples/hello_smoke.workflow.py --fresh --json
-servitor-workflows run examples/hello_smoke.workflow.py --plan --json
+servitor-workflows run examples/hello_smoke.workflow.py --fresh --output json
+servitor-workflows run examples/hello_smoke.workflow.py --plan --output json
 ```
 
 ## Workflow DSL
@@ -44,9 +44,9 @@ async def main(agent, parallel, pipeline, phase, log, budget, args, human, workf
 ## Commands
 
 ```powershell
-servitor-workflows run <file.workflow.py> --fresh --json
-servitor-workflows run <file.workflow.py> --resume --json
-servitor-workflows run <file.workflow.py> --plan --json
+servitor-workflows run <file.workflow.py> --fresh --output json
+servitor-workflows run <file.workflow.py> --resume --output json
+servitor-workflows run <file.workflow.py> --plan --output json
 servitor-workflows run <file.workflow.py> --cancel-file D:\AgentWork\_tmp\cancel.flag
 servitor-workflows map <journal.jsonl>
 servitor-workflows summarize <journal.jsonl>
@@ -57,20 +57,23 @@ servitor-workflows supervise <dir> --interval 5
 
 Useful `run` flags:
 
-- `--agent` / `--model` / `--pin-model`
-- `--effort` / `--auto-effort` / `--pin-effort`
-- `--budget`
-- `--journal` / `--run-id` / `--fresh` / `--no-journal`
-- `--summary` / `--no-summary` / `--json`
+- golden path: `--agent` / `--model` / `--plan` / `--resume` / `--fresh` / `--args` / `--budget` / `--output`
+- advanced: `--pin-model`, effort family, `--journal` / `--run-id` / `--no-journal`, `--cancel-file`
 
 ## Output modes
 
 `run` writes **data to stdout** and **diagnostics to stderr**.
 
-- default: one bounded summary line
-- `--summary`: richer multi-line bounded summary
-- `--no-summary`: suppress human summary
-- `--json`: full machine schema (workflow return value)
+```text
+--output human|json|quiet
+```
+
+- `human` (default): bounded summary
+- `json`: full machine schema (workflow return value)
+- `quiet`: suppress stdout
+- no legacy mode flags; use `--output` only
+
+On Windows, the CLI initializes stdout/stderr and child Python processes as UTF-8 through the shared Servitor boundary.
 
 ## Key APIs
 

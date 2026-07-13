@@ -98,7 +98,7 @@ tests/test_role_behavior_eval.py
 ```powershell
 servitor-workflows run examples/role_behavior_eval.workflow.py `
   --args-file examples/role_behavior_eval_args.local.json `
-  --fresh --json
+  --fresh --output json
 ```
 
 `role_behavior_eval_args.local.json` 是本地运行参数，不作为仓库必需文件；也可以使用 `--args` 直接传 JSON。至少包含：

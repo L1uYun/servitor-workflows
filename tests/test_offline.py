@@ -533,9 +533,7 @@ def test_cli_meta_records_effective_default_agent(monkeypatch, tmp_path, capsys)
         run_id=None,
         fresh=True,
         no_journal=False,
-        summary=False,
-        no_summary=False,
-        json=True,
+        output="json",
         transport="servitor",
         cancel_file=None,
     )
@@ -681,9 +679,7 @@ def _run_cli_args(script, **overrides):
         "run_id": None,
         "fresh": True,
         "no_journal": True,
-        "summary": False,
-        "no_summary": False,
-        "json": False,
+        "output": "human",
         "transport": "servitor",
         "cancel_file": None,
     }
@@ -709,24 +705,55 @@ def test_cli_run_output_modes_are_distinct_and_bounded(monkeypatch, tmp_path, ca
 
     monkeypatch.setattr(workflow_cli, "run_workflow_file", fake_run_workflow_file)
 
-    assert _cmd_run(_run_cli_args(script)) == 0
+    assert _cmd_run(_run_cli_args(script, output="human")) == 0
     default = capsys.readouterr().out
     assert len(default) < 600
     assert "completed" in default
     assert "x" * 100 not in default
 
-    assert _cmd_run(_run_cli_args(script, summary=True)) == 0
-    detailed = capsys.readouterr().out
-    assert len(default) < len(detailed) < 3000
-    assert "answer" in detailed
-    assert "items" in detailed
-
-    assert _cmd_run(_run_cli_args(script, no_summary=True)) == 0
+    assert _cmd_run(_run_cli_args(script, output="quiet")) == 0
     assert capsys.readouterr().out == ""
 
-    assert _cmd_run(_run_cli_args(script, json=True, no_summary=True)) == 0
+    assert _cmd_run(_run_cli_args(script, output="json")) == 0
     machine = capsys.readouterr().out
     assert json.loads(machine) == result
+
+
+def test_cli_main_initializes_utf8_boundary(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(workflow_cli, "ensure_utf8_stdio", lambda: calls.append(True))
+    assert workflow_cli.main([]) == 0
+    assert calls == [True]
+    assert "servitor-workflows" in capsys.readouterr().out
+
+
+def test_cli_help_exposes_one_output_switch_and_rejects_legacy_flags():
+    parser = workflow_cli.build_parser()
+    run_parser = next(
+        action.choices["run"]
+        for action in parser._subparsers._actions
+        if getattr(action, "choices", None) and "run" in action.choices
+    )
+    help_text = run_parser.format_help()
+    assert "--output" in help_text
+    assert "--json" not in help_text
+    assert "--summary" not in help_text
+    assert "--no-summary" not in help_text
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run", "tiny.workflow.py", "--json"])
+
+
+def test_cli_fresh_and_resume_are_exclusive(tmp_path):
+    script = tmp_path / "tiny.workflow.py"
+    script.write_text(
+        'meta = {"name": "tiny"}\nasync def main(agent, parallel, pipeline, phase, log, budget, args, human, workflow):\n    return {"ok": True}\n',
+        encoding="utf-8",
+    )
+    try:
+        _cmd_run(_run_cli_args(script, fresh=True, resume=True))
+        assert False, "expected SystemExit"
+    except SystemExit as exc:
+        assert "mutually exclusive" in str(exc)
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,7 @@ Primary objective for the next agent: make real provider execution boring and ob
 - `pip install -e .` installed for both `servitor` and `servitor-workflows`; no PYTHONPATH needed.
 - `python -m pytest -q` in `D:\AgentWork\tools\servitor-workflows` passed on 2026-07-08: `53 passed in 0.88s`.
 - `servitor-workflows --help` (CLI on PATH) exposes: `run`, `summarize`, `map`, `status`, `compare`, `supervise`.
-- `servitor agents list --json` shows captured providers: `claude`, `codebuddy`, `agy-tui`, `pi`. The retired launch-only `agy` provider has been fully removed from `providers.py` (2026-07-09).
+- `servitor agents list --output json` shows captured providers: `claude`, `codebuddy`, `agy-tui`, `pi`. The retired launch-only `agy` provider has been fully removed from `providers.py` (2026-07-09).
 - Real provider smoke verified:
   - `pi` single-provider: run_dir `20260708T083147570427Z`, `provider=pi, ok=true, result="pong"`.
   - `codebuddy` + `pi` multi-provider: journal `multi_provider_pong.workflow.result.json` = `{"codebuddy": "codebuddy", "pi": "pi"}`.
@@ -71,7 +71,7 @@ Tasks:
    - Set `PYTHONPATH=D:\AgentWork\tools\servitor-workflows;D:\AgentWork\tools\servitor` if editable installs are not active.
    - Verify `python -m pytest -q`.
    - Verify `python -m servitor_workflows --help`.
-   - Verify `python -m servitor agents list --json`.
+   - Verify `python -m servitor agents list --output json`.
 
 2. Single-provider real smoke.
    - Use `codebuddy` first because prior evidence shows it returned `pong` in about 14-15s.
@@ -79,7 +79,7 @@ Tasks:
      ```powershell
      cd D:\AgentWork\tools\servitor-workflows
      $env:PYTHONPATH = "D:\AgentWork\tools\servitor-workflows;D:\AgentWork\tools\servitor"
-     python -m servitor_workflows run examples/hello_smoke.workflow.py --agent codebuddy --fresh --json
+     python -m servitor_workflows run examples/hello_smoke.workflow.py --agent codebuddy --fresh --output json
      ```
    - Acceptance: command exits 0, result contains `pong`, journal/event/result sidecars are written, and the final report names the exact journal path.
 
@@ -93,7 +93,7 @@ Tasks:
    - Acceptance: at least two real agent invocations complete, or one completes and the other has a provider-level failure reason backed by `metadata.json` / `servitor result`, not a controller guess.
 
 5. Timeout/state semantics.
-   - For every slow or failed real run, capture `run_dir`, `failure_reason`, `exit_code`, `stderr.txt`, `metadata.json`, and `servitor result <run_dir> --json`.
+   - For every slow or failed real run, capture `run_dir`, `failure_reason`, `exit_code`, `stderr.txt`, `metadata.json`, and `servitor result <run_dir> --output json`.
    - Distinguish:
      - shell command timeout: wrapper stopped waiting;
      - `wait_elapsed`: servitor wait window elapsed;
@@ -177,11 +177,11 @@ Tasks:
 3. Add tests for registration and result extraction using fake/subprocess-controlled output.
 4. Run a real smoke only after tests:
    ```powershell
-   python -m servitor run --agent codex --prompt "reply with exactly pong" --cwd D:\AgentWork --wait 120 --json
+   python -m servitor run --agent codex --prompt "reply with exactly pong" --cwd D:\AgentWork --wait 120 --output json
    ```
 5. Update `servitor` docs and `agent-dispatch` route table only if the provider works.
 
-Acceptance: `codex` appears in `servitor agents list --json`, a real bounded prompt can complete, and failures produce the same `failure_reason` contract as other captured providers.
+Acceptance: `codex` appears in `servitor agents list --output json`, a real bounded prompt can complete, and failures produce the same `failure_reason` contract as other captured providers.
 
 ### P2 — Simplify workflow parameters — implemented 2026-07-08
 
@@ -200,7 +200,7 @@ Implemented behavior:
 Acceptance: this command works without requiring the caller to know provider details:
 
 ```powershell
-python -m servitor_workflows run examples/hello_smoke.workflow.py --fresh --json
+python -m servitor_workflows run examples/hello_smoke.workflow.py --fresh --output json
 ```
 
 ### P3 — Tests for existing lower-priority modules — COMPLETE
