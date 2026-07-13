@@ -1,6 +1,6 @@
 # Servitor-Workflows Follow-up Plan / Goal Contract
 
-Last updated: 2026-07-09 CST after P1.5 (codex provider) + P3 (compare_runs/supervise tests) + providers.py refactor into providers/ package.
+Last updated: 2026-07-12 CST after P5 role behavior ratchet design.
 
 ## Purpose
 
@@ -235,6 +235,30 @@ Potential future task:
 - Assemble `viewer.py` from existing `viewer_assets/viewer.css` + `viewer.js` + run model JSON.
 - Keep it static/offline; no web server.
 
+### P5 — Cross-provider role behavior ratchet — DESIGN READY
+
+Goal: verify that the same servitor role preserves observable core behavior across provider/model boundaries; do not mistake prompt transport for behavioral equivalence.
+
+Design source: `docs/role-behavior-ratchet-spec.md`.
+
+Current state:
+
+- Design only; no runtime role-normalization fix, workflow, cases, baseline, or real provider evaluation has been implemented.
+- `servitor-workflows` owns matrix execution, schema, journal/resume, deterministic case assertions, and result aggregation.
+- `servitor` remains transport-only and owns role/provider prompt semantics plus run evidence.
+- Phase 1 is intentionally limited to `code-reviewer`, two fixed cases, explicit provider/model args, wave size 1, and deterministic required/forbidden checks.
+- No leaked prompt corpus, LLM judge, scheduler, database, automatic role edit, or automatic baseline refresh.
+
+Next slice:
+
+1. Reconcile the current working-tree implementation slice before touching its modified files.
+2. Sharpen `runtime.agent()` before journal allocation so `opts["role"]` is resolved through `servitor.resolve_system_prompt()` and effective prompt bytes participate in identity; add its offline regression to the existing test owner.
+3. Add only the three new Phase 1 artifacts named in the design.
+4. Prove plan mode makes zero model calls, a bad fake output fails, resume makes zero new calls, and existing tests still pass.
+5. Run the two-case smoke on at least two explicitly selected captured providers; keep real smoke out of unit tests.
+
+Acceptance: both providers satisfy the same case invariants with `aggregate_status=consistent_pass`, requested and resolved exact model ids match, all evidence fingerprints are present, and transport/schema/case/divergence failures remain distinguishable.
+
 ## Suggested next execution order
 
 1. P0 baseline + single-provider real smoke.
@@ -243,7 +267,8 @@ Potential future task:
 4. P1 slim `agent-dispatch` while preserving current provider facts.
 5. P1.5 add `codex` provider, if still useful.
 6. P3 tests for `compare_runs` / `supervise`.
-7. P4 HTML viewer only on explicit request.
+7. P5 role behavior ratchet Phase 1 after the current working-tree slice is reconciled.
+8. P4 HTML viewer only on explicit request.
 
 ## Stop conditions
 

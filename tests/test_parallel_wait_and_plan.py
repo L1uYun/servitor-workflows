@@ -1,6 +1,8 @@
 """Ratchet: workflow parallel([2]) completes under fake transport; plan exposes flag."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from servitor_workflows.runtime import create_runtime
@@ -65,6 +67,30 @@ async def main(agent, parallel, pipeline, phase, log, budget, args, human, workf
     r2 = await run_workflow_source(src, {"plan": False, "args": {"path": str(target)}})
     assert r2["plan"] is False
     assert target.exists()
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_fixture_skips_l3_on_incomplete_evidence():
+    fixture = Path(__file__).resolve().parent / "fixtures" / "skill_review_workflow" / "skill_portfolio_review.workflow.py"
+    phases = []
+    logs = []
+
+    result = await run_workflow_source(
+        fixture.read_text(encoding="utf-8"),
+        {
+            "plan": True,
+            "script_path": str(fixture),
+            "on_phase": phases.append,
+            "on_log": logs.append,
+        },
+    )
+
+    assert result["plan"] is True
+    assert result["l3_ok"] is False
+    assert result["l1_missing"] == ["alpha"]
+    assert result["l2_missing"] == ["phase_gate"]
+    assert "L3-portfolio-synthesis" not in phases
+    assert any("Skipping L3 due to incomplete evidence in plan mode" in line for line in logs)
 
 
 def test_default_cap_honors_env_override(monkeypatch):

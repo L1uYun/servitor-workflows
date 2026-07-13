@@ -43,6 +43,20 @@ json.dump(result, sys.stdout, ensure_ascii=False)
 """
 
 
+class ServitorAgentError(RuntimeError):
+    """Agent failure that preserves the servitor run evidence boundary."""
+
+    def __init__(self, evidence: dict[str, Any]):
+        self.evidence = evidence
+        for key, value in evidence.items():
+            setattr(self, key, value)
+        failure = evidence.get("failure_reason") or "unknown"
+        run_dir = evidence.get("run_dir") or "unknown"
+        super().__init__(f"turn ended with failure_reason={failure}; run_dir={run_dir}")
+        # Preserve the existing retry-classification contract.
+        self.codex_error_info = failure
+
+
 async def _terminate_process_tree(proc: asyncio.subprocess.Process) -> None:
     if proc.returncode is not None:
         return
@@ -415,9 +429,18 @@ async def _run_one_turn(prompt: str, opts: dict) -> Any:
         failure = meta.get("failure_reason") if isinstance(meta, dict) else "unknown"
         if failure == "interrupted":
             return None
-        err = Exception(f"turn ended with failure_reason={failure}")
-        setattr(err, "codex_error_info", failure)
-        raise err
+        run_path = pathlib.Path(run_dir)
+        evidence = {
+            "failure_reason": failure,
+            "run_dir": str(run_path),
+            "metadata_path": str(run_path / "metadata.json"),
+            "stdout_path": str(run_path / "stdout.txt"),
+            "stderr_path": str(run_path / "stderr.txt"),
+            "model": model,
+            "provider": agent_name,
+            "metadata": meta,
+        }
+        raise ServitorAgentError(evidence)
 
     return parse_schema_result(result_text, schema)
 

@@ -1,0 +1,6 @@
+{
+  "phase_gate": {
+    "question": "verify phase gate",
+    "skills": ["alpha"]
+  }
+}
