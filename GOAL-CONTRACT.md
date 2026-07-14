@@ -235,7 +235,7 @@ Potential future task:
 - Assemble `viewer.py` from existing `viewer_assets/viewer.css` + `viewer.js` + run model JSON.
 - Keep it static/offline; no web server.
 
-### P5 — Cross-provider role behavior ratchet — DESIGN READY
+### P5 — Cross-provider role behavior ratchet — COMPLETE 2026-07-14
 
 Goal: verify that the same servitor role preserves observable core behavior across provider/model boundaries; do not mistake prompt transport for behavioral equivalence.
 
@@ -243,21 +243,24 @@ Design source: `docs/role-behavior-ratchet-spec.md`.
 
 Current state:
 
-- Design only; no runtime role-normalization fix, workflow, cases, baseline, or real provider evaluation has been implemented.
+- `runtime.agent()` resolves `role` through public `servitor.resolve_system_prompt()` before plan handling, journal identity allocation, and provider execution; explicit `system_prompt` still wins.
+- Phase 1 workflow, cases, and tests are implemented in the three owner files named by the design.
 - `servitor-workflows` owns matrix execution, schema, journal/resume, deterministic case assertions, and result aggregation.
 - `servitor` remains transport-only and owns role/provider prompt semantics plus run evidence.
 - Phase 1 is intentionally limited to `code-reviewer`, two fixed cases, explicit provider/model args, wave size 1, and deterministic required/forbidden checks.
 - No leaked prompt corpus, LLM judge, scheduler, database, automatic role edit, or automatic baseline refresh.
 
-Next slice:
+Completion evidence:
 
-1. Reconcile the current working-tree implementation slice before touching its modified files.
-2. Sharpen `runtime.agent()` before journal allocation so `opts["role"]` is resolved through `servitor.resolve_system_prompt()` and effective prompt bytes participate in identity; add its offline regression to the existing test owner.
-3. Add only the three new Phase 1 artifacts named in the design.
-4. Prove plan mode makes zero model calls, a bad fake output fails, resume makes zero new calls, and existing tests still pass.
-5. Run the two-case smoke on at least two explicitly selected captured providers; keep real smoke out of unit tests.
+1. Targeted role/evaluator tests passed: `10 passed`.
+2. Full offline suite passed: `100 passed`.
+3. CLI plan enumerated four cells with `START_EVENTS=0` and `JOURNAL_LINES=0`.
+4. Real captured-provider matrix passed on `pi/newapi/gpt-5.4` and `codebuddy/gpt-5.4`: four of four cells passed with `aggregate_status=consistent_pass`.
+5. Journal verification found four rows and zero requested/resolved model mismatches.
+6. A complete `--resume` replay produced four cached events, zero start events, and zero end events.
+7. An earlier real run surfaced `location` objects as `schema_failed`; the prompt was sharpened to require a string without weakening the schema. A transient `provider_no_output` stayed `inconclusive` and resume reran only the missing cell.
 
-Acceptance: both providers satisfy the same case invariants with `aggregate_status=consistent_pass`, requested and resolved exact model ids match, all evidence fingerprints are present, and transport/schema/case/divergence failures remain distinguishable.
+Acceptance satisfied: both providers satisfy the same case invariants with `aggregate_status=consistent_pass`, requested and resolved exact model ids match, all evidence fingerprints are present, and transport/schema/case/divergence failures remain distinguishable.
 
 ## Suggested next execution order
 
@@ -267,7 +270,7 @@ Acceptance: both providers satisfy the same case invariants with `aggregate_stat
 4. P1 slim `agent-dispatch` while preserving current provider facts.
 5. P1.5 add `codex` provider, if still useful.
 6. P3 tests for `compare_runs` / `supervise`.
-7. P5 role behavior ratchet Phase 1 after the current working-tree slice is reconciled.
+7. P5 role behavior ratchet Phase 1 — complete.
 8. P4 HTML viewer only on explicit request.
 
 ## Stop conditions

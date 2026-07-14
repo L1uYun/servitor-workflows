@@ -1,6 +1,6 @@
 # Servitor Role 行为一致性棘轮设计
 
-状态：设计完成，待实现 Phase 1。  
+状态：Phase 1 已实现并通过离线与真实 provider 验证（2026-07-14）。
 Owner：`servitor-workflows`；`servitor` 保持 transport-only。  
 保护对象：同一个 role 经不同 provider/model 执行时，仍满足可观察的核心行为契约。
 
@@ -8,13 +8,22 @@ Owner：`servitor-workflows`；`servitor` 保持 transport-only。
 
 当前 `servitor` 已能把 role 作为原生 system prompt 注入 Claude/CodeBuddy，或在 Pi/agy-tui 等无原生 system channel 的 provider 上前置到 user prompt。现有测试能够证明 role 被解析、传输和拼接，却不能证明同一个 role 在不同 provider 上产生等价的关键行为。
 
-代码核对还发现一个更窄的前置缺口：`servitor-workflows/journal.py` 已把 `role` 纳入 agent identity，但当前 runtime 没有在 journal key 分配前把 role 解析为有效 `system_prompt`。因此 Phase 1 必须在 `runtime.agent()` 的既有输入归一化边界完成解析：复用 `servitor.resolve_system_prompt(role, system_prompt)`，保持显式 `system_prompt` 优先，把有效 prompt bytes 写回 merged opts，再计算 journal identity 和调用 transport。这样 role 文件内容变化会自然改变 cache identity，案例 workflow 也不需要自行读取 `~/.servitor/roles`。
+实现前的代码核对发现一个更窄的前置缺口：`servitor-workflows/journal.py` 已把 `role` 纳入 agent identity，但 runtime 没有在 journal key 分配前把 role 解析为有效 `system_prompt`。Phase 1 已在 `runtime.agent()` 的既有输入归一化边界补齐解析：复用 `servitor.resolve_system_prompt(role, system_prompt)`，保持显式 `system_prompt` 优先，把有效 prompt bytes 写回 merged opts，再计算 journal identity 和调用 transport。role 文件内容变化现在会自然改变 cache identity，案例 workflow 不自行承担 prompt 注入。
 
 本设计增加一个由 `servitor-workflows` 驱动的行为棘轮：使用小型、可判定、无真实项目数据的任务案例，按 `case × provider × model × role` 运行；通过 JSON Schema 约束结果，再用确定性断言判断契约是否满足。比较的是行为不变量，不是措辞相似度。
 
 第一版只覆盖 `code-reviewer`，只设两个案例，并要求显式传入至少两个 provider。它证明执行、证据和失败分类闭环后，才扩展 `architect`、`advisor` 或更多模型。
 
 不建设新的 prompt 仓库、数据库、守护进程、定时 watcher 或通用评测框架。`system_prompts_leaks` 只作为人工设计案例时的外部参考，不成为运行时依赖，也不把其原始文本送进本地模型。
+
+## Phase 1 实现证据
+
+- Implementation commit：`servitor-workflows@144122e1cd82ff52db6d0f89bcedf6909a4da814`；真实验证时 `servitor@dfe0678406f6adfec2806bf22837a5bef33ba421`，两个仓库均为 clean。
+- Offline：新增目标测试 `10 passed`；全量 `python -m pytest -q` 为 `100 passed`。
+- Plan：`matrix_expected=4`、`matrix_completed=0`，零 start event、零 journal row。
+- Real matrix：`pi/newapi/gpt-5.4` 与 `codebuddy/gpt-5.4` 完成两个固定案例，最终四单元全部 `passed`，`aggregate_status=consistent_pass`，`cross_provider_consistent=true`。
+- Identity evidence：journal 四行均与请求的精确 model id 一致，model mismatch 为 `0`；完整 `--resume` 为四个 cached event、零 start/end event。
+- 首轮真实输出把 `location` 写成对象并触发 `schema_failed`；实现保持 string schema 不变，只 sharpen prompt 的字段类型要求。一次 `provider_no_output` 被保留为 `inconclusive`，后续 resume 只补跑缺失单元，没有把 transport failure 标成角色分歧。
 
 ## 为什么需要这个实体
 

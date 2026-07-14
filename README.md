@@ -111,9 +111,16 @@ Prefer wave size 1 for `pi` on Windows. Large simultaneous launches can leave pr
 
 ## Role behavior ratchet
 
-Design-ready, not yet a runtime product surface: `docs/role-behavior-ratchet-spec.md`.
+Phase 1 is implemented for `code-reviewer`: `docs/role-behavior-ratchet-spec.md`.
 
-Goal: prove the same servitor role keeps observable core behavior across provider/model boundaries. Phase 1 is intentionally small (`code-reviewer`, two fixed cases, explicit provider/model args, deterministic assertions). servitor-workflows owns matrix execution and evidence aggregation; servitor remains transport-only.
+The workflow uses two fixed synthetic cases, exact provider/model ids, schema validation, deterministic required/forbidden assertions, journal resume, and evidence fingerprints. `servitor-workflows` owns matrix execution and aggregation; `servitor` remains transport-only.
+
+```powershell
+servitor-workflows run examples/role_behavior_eval.workflow.py `
+  --args-file <local-args.json> --fresh --output json
+```
+
+Select model ids from fresh `servitor models list --agent <agent> --output json` output. Phase 1 acceptance is `aggregate_status=consistent_pass`; transport or schema failures remain `inconclusive`, not provider behavior divergence.
 
 ## Testing
 
