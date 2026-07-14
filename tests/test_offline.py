@@ -457,6 +457,73 @@ async def test_journal_replay():
 
 
 @pytest.mark.asyncio
+async def test_runtime_resolves_role_before_provider_and_journal_identity(monkeypatch, tmp_path):
+    import servitor.roles as servitor_roles
+
+    roles_dir = tmp_path / "roles"
+    roles_dir.mkdir()
+    monkeypatch.setattr(servitor_roles, "role_dir", lambda: roles_dir)
+    role_path = roles_dir / "runtime-reviewer.md"
+    seen = []
+
+    async def echo(_prompt, opts):
+        seen.append(dict(opts))
+        return "ok"
+
+    src = (
+        'meta = {"name": "role-runtime"}\n'
+        'async def main(agent, parallel, pipeline, phase, log, budget, args, human, workflow):\n'
+        '    return await agent("same prompt", {"role": "runtime-reviewer", "model": "model-a"})\n'
+    )
+
+    async def run_once(body, journal_path):
+        role_path.write_text(
+            "---\nname: runtime-reviewer\ndescription: test role\n---\n" + body + "\n",
+            encoding="utf-8",
+        )
+        journal = Journal(journal_path, reuse=False)
+        journal.load()
+        await run_workflow_source(src, {"run_agent": echo, "journal": journal})
+        return json.loads(journal_path.read_text(encoding="utf-8").splitlines()[0])["key"]
+
+    key_v1 = await run_once("ROLE BODY V1", tmp_path / "v1.jsonl")
+    assert seen[-1]["role"] == "runtime-reviewer"
+    assert seen[-1]["system_prompt"] == "ROLE BODY V1"
+
+    key_v2 = await run_once("ROLE BODY V2", tmp_path / "v2.jsonl")
+    assert seen[-1]["system_prompt"] == "ROLE BODY V2"
+    assert key_v1 != key_v2
+
+
+@pytest.mark.asyncio
+async def test_runtime_explicit_system_prompt_wins_during_role_resolution(monkeypatch):
+    import servitor
+
+    resolved = []
+
+    def resolve_system_prompt(role, system_prompt):
+        resolved.append((role, system_prompt))
+        return system_prompt
+
+    monkeypatch.setattr(servitor, "resolve_system_prompt", resolve_system_prompt)
+    seen = []
+
+    async def echo(_prompt, opts):
+        seen.append(dict(opts))
+        return "ok"
+
+    src = (
+        'meta = {"name": "role-override"}\n'
+        'async def main(agent, parallel, pipeline, phase, log, budget, args, human, workflow):\n'
+        '    return await agent("x", {"role": "missing-role", "system_prompt": "EXPLICIT"})\n'
+    )
+    await run_workflow_source(src, {"run_agent": echo})
+
+    assert resolved == [("missing-role", "EXPLICIT")]
+    assert seen[0]["system_prompt"] == "EXPLICIT"
+
+
+@pytest.mark.asyncio
 async def test_default_agent_auto_resolves_to_pi(monkeypatch):
     monkeypatch.setattr(run_workflow, "_captured_provider_names", lambda: ["codebuddy", "pi"])
     calls = []

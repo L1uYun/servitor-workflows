@@ -1,9 +1,9 @@
 """Provider-neutral runtime: agent/parallel/pipeline/phase/log/budget/args/workflow/human.
 
-1:1 Python port of runner/src/runtime.js createRuntime(). Nothing here mentions
-servitor or any specific provider — only agent() reaches a model, via the
-servitor_agent seam. Concurrency is capped at min(16, cpu-2), with a hard
-1000-agent backstop.
+1:1 Python port of runner/src/runtime.js createRuntime(). agent() owns the
+provider-neutral call lifecycle plus servitor role normalization; provider
+execution still goes through the servitor_agent seam. Concurrency is capped at
+min(16, cpu-2), with a hard 1000-agent backstop.
 """
 from __future__ import annotations
 
@@ -241,6 +241,20 @@ def create_runtime(
         _check_cancelled()
         _bump_agent_count()
         merged = {**_defaults, **opts}
+
+        # Normalize a role into the effective prompt before plan handling,
+        # journal identity allocation, or provider execution. Keep the role
+        # name too: journal identity then captures both the selected role and
+        # the exact prompt bytes produced by the public servitor resolver.
+        import servitor
+        effective_system_prompt = servitor.resolve_system_prompt(
+            merged.get("role"), merged.get("system_prompt")
+        )
+        if effective_system_prompt is None:
+            merged.pop("system_prompt", None)
+        else:
+            merged["system_prompt"] = effective_system_prompt
+
         agent_name = opts.get("agent") or default_agent
         if agent_name:
             merged["agent"] = agent_name
