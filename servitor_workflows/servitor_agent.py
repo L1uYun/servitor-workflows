@@ -291,7 +291,8 @@ async def servitor_agent(
     1:1 port of upstream codexAgent(). Returns string | parsed dict (schema) | None.
 
     opts keys: agent, model, schema, effort, system_prompt, agent_type, cwd,
-    isolation, retries, default_model, pinned_model, on_metrics, on_progress.
+    isolation, worktree_branch, verify_command, verify_timeout_seconds, retries,
+    default_model, pinned_model, on_metrics, on_integration, on_progress.
     """
     opts = opts or {}
     _log = log or (lambda *_: None)
@@ -321,22 +322,40 @@ async def servitor_agent(
     worktree = None
     if opts.get("isolation") == "worktree" and cwd:
         if await is_git_repo(cwd):
-            worktree = await create_worktree(cwd)
+            worktree = await create_worktree(cwd, branch=opts.get("worktree_branch"))
             cwd = worktree["dir"]
         else:
             _log(f"isolation:'worktree' ignored — {cwd} is not a git repo")
 
+    integration = None
     try:
-        return await _with_retry(
+        result = await _with_retry(
             lambda: _run_one_turn(prompt, {**opts, "system_prompt": system_prompt,
                                            "requested_model": requested_model, "cwd": cwd, "log": _log}),
             retries=opts.get("retries", 3),
             log=_log,
             label=opts.get("label"),
         )
-    finally:
         if worktree:
+            verification = await worktree["verify"](
+                opts.get("verify_command"), opts.get("verify_timeout_seconds")
+            )
+            integration = await worktree["cleanup"]()
+            if verification:
+                integration["verification"] = verification
+            if opts.get("on_integration"):
+                opts["on_integration"](integration)
+            if verification and verification["exit_code"] != 0:
+                raise RuntimeError(
+                    f"project verification failed in {integration['dir']}: "
+                    f"{verification['command']} (exit {verification['exit_code']})"
+                )
+        return result
+    finally:
+        if worktree and integration is None:
             r = await worktree["cleanup"]()
+            if opts.get("on_integration"):
+                opts["on_integration"](r)
             if not r["removed"]:
                 _log(f"worktree kept (modified): {r['dir']}")
 

@@ -89,14 +89,14 @@ When a turn fails, the agent boundary preserves run evidence (`failure_reason`, 
 
 ## Structured output (control/analysis separation)
 
-When a workflow needs machine-readable output from an agent, pass output=StructuredOutput(...) to gent(). The runtime:
+When a workflow needs machine-readable output from an agent, pass output=StructuredOutput(...) to agent(). The runtime:
 
 1. Appends prompt instructions telling the model to emit <control>...</control> JSON and <analysis>...</analysis> prose.
 2. Parses the control block from raw model output.
 3. Returns {control: <parsed>, analysis: <prose>} on success.
 4. Raises StructuredOutputError (classified: missing_control, invalid_control_json, schema_validation_failed) on failure.
 
-`python
+```python
 from servitor_workflows import StructuredOutput
 
 async def main(agent, phase, log):
@@ -107,11 +107,26 @@ async def main(agent, phase, log):
     # result == {"control": {"verdict": "pass"}, "analysis": "The code is clean..."}
     if result["control"]["verdict"] == "fail":
         log("FAILED: " + result["analysis"])
-`
+```
 
 The schema fingerprint is included in journal identity, so changing the schema invalidates cached entries. Plan mode returns a minimal skeleton satisfying the schema.
 
-Without output=, gent() behavior is unchanged (backward compatible).
+Without output=, agent() behavior is unchanged (backward compatible).
+
+## Isolated write tasks
+
+For a task that modifies a Git project, make its integration evidence explicit:
+
+```python
+result = await agent("Implement the approved change, then commit it.", {
+    "cwd": r"D:\\AgentWork\\products\\audio-report",
+    "isolation": "worktree",
+    "worktree_branch": "codex/audio-report-task-slug",
+    "verify_command": ["pnpm", "verify"],
+})
+```
+
+The isolated worktree starts from a recorded base commit. Its journal entry records the branch, final HEAD, dirty state, and (when configured) the verification command and result. A clean worktree is removed after completion; a dirty worktree is retained for inspection. The controller reviews that evidence and performs the merge and any deployment separately.
 
 ## Journal
 
