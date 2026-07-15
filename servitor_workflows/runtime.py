@@ -17,6 +17,12 @@ from typing import Any, Callable
 
 from .journal import Journal, identity_hash
 from .meter import tokens_spent, output_spent
+from .structured_output import (
+    StructuredOutput,
+    StructuredOutputError,
+    parse_control_analysis,
+    schema_skeleton as so_skeleton,
+)
 
 
 class WorkflowCancelled(RuntimeError):
@@ -268,15 +274,27 @@ def create_runtime(
         else:
             merged["effort"] = resolved_effort
 
+        # Extract StructuredOutput if provided
+        so = opts.get("output")
+        if isinstance(so, StructuredOutput):
+            effective_prompt = prompt + so.instruction_text()
+            so_fingerprint = so.schema_fingerprint()
+        else:
+            so = None
+            so_fingerprint = None
+            effective_prompt = prompt
+
         # --plan dry run
         if plan:
             if on_agent_plan:
                 on_agent_plan({
                     "label": label, "phase": effective_phase,
                     "effort": resolved_effort, "width": width,
-                    "schema": bool(opts.get("schema")),
+                    "schema": bool(opts.get("schema")) or so is not None,
                     "agent": agent_name,
                 })
+            if so:
+                return so_skeleton(so)
             return _schema_skeleton(opts.get("schema"))
 
         _check_budget()
@@ -285,7 +303,9 @@ def create_runtime(
         key = None
         if journal:
             opts_for_key = {**merged, "agent": agent_name, "model": pinned_model or opts.get("model") or default_model}
-            key = journal.next_key(prompt, opts_for_key)
+            if so_fingerprint:
+                opts_for_key["output_schema"] = so_fingerprint
+            key = journal.next_key(effective_prompt, opts_for_key)
             if journal.hit(key):
                 _log(f"  ◦ agent (cached): {label}")
                 _record_event("cached", id=key, label=label, phase=effective_phase, agent=agent_name)
@@ -293,7 +313,7 @@ def create_runtime(
 
         req_model = pinned_model or opts.get("model") or default_model
         effort_tag = f"  ⟪{resolved_effort}⟫" if resolved_effort else ""
-        _log(f"  · agent: {label}{('  [schema]' if opts.get('schema') else '')}{effort_tag}")
+        _log(f"  · agent: {label}{('  [schema]' if opts.get('schema') else '')}{('  [structured]' if so else '')}{effort_tag}")
         _record_event(
             "start", id=key, label=label, phase=effective_phase,
             effort=resolved_effort, model=req_model, agent=agent_name,
@@ -307,10 +327,20 @@ def create_runtime(
 
         call_opts = {**merged, "agent": agent_name, "default_model": default_model, "pinned_model": pinned_model,
                      "log": _log, "on_metrics": _on_metrics}
+        if so:
+            call_opts["control_schema"] = so.control_schema
+            call_opts["structured_output"] = True
         if on_progress:
             call_opts["on_progress"] = lambda text: on_progress(label, text, key)
 
-        result = await _pooled(lambda: _run_agent(prompt, call_opts))
+        result = await _pooled(lambda: _run_agent(effective_prompt, call_opts))
+
+        # Parse control/analysis if structured output was requested
+        if so and not (isinstance(result, dict) and "control" in result):
+            try:
+                result = parse_control_analysis(result, so)
+            except StructuredOutputError:
+                raise
 
         _record_event(
             "end", id=key, label=label, phase=effective_phase,

@@ -87,6 +87,32 @@ On Windows, the CLI initializes stdout/stderr and child Python processes as UTF-
 
 When a turn fails, the agent boundary preserves run evidence (`failure_reason`, `run_dir`, stdout/stderr/metadata paths) instead of collapsing to a bare exception string.
 
+## Structured output (control/analysis separation)
+
+When a workflow needs machine-readable output from an agent, pass output=StructuredOutput(...) to gent(). The runtime:
+
+1. Appends prompt instructions telling the model to emit <control>...</control> JSON and <analysis>...</analysis> prose.
+2. Parses the control block from raw model output.
+3. Returns {control: <parsed>, analysis: <prose>} on success.
+4. Raises StructuredOutputError (classified: missing_control, invalid_control_json, schema_validation_failed) on failure.
+
+`python
+from servitor_workflows import StructuredOutput
+
+async def main(agent, phase, log):
+    so = StructuredOutput(
+        control_schema={"type": "object", "properties": {"verdict": {"type": "string", "enum": ["pass", "fail"]}}, "required": ["verdict"]},
+    )
+    result = await agent("Review this code", {"output": so, "label": "reviewer"})
+    # result == {"control": {"verdict": "pass"}, "analysis": "The code is clean..."}
+    if result["control"]["verdict"] == "fail":
+        log("FAILED: " + result["analysis"])
+`
+
+The schema fingerprint is included in journal identity, so changing the schema invalidates cached entries. Plan mode returns a minimal skeleton satisfying the schema.
+
+Without output=, gent() behavior is unchanged (backward compatible).
+
 ## Journal
 
 Every run writes `.workflow-journal/<name>.{jsonl,events.jsonl,meta.json,result.json}` beside the workflow file by default, even when launched by absolute path from another cwd. Override with `--journal <path>`. Re-run with `--resume` to skip cached agent calls.

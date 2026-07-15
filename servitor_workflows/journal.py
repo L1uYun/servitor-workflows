@@ -15,7 +15,7 @@ from typing import Any
 
 # Only the inputs that determine the model's output participate in identity.
 # Cosmetic opts (label, cwd, isolation, timeout) do NOT.
-_IDENTITY_KEYS = ("model", "effort", "schema", "system_prompt", "native_args", "role", "agent")
+_IDENTITY_KEYS = ("model", "effort", "schema", "system_prompt", "native_args", "role", "agent", "output_schema")
 
 
 def _stable_stringify(v: Any) -> str:
