@@ -305,8 +305,11 @@ def create_runtime(
         def _on_metrics(m):
             metrics_holder.update(m)
 
+        def _on_integration(integration):
+            metrics_holder["integration"] = integration
+
         call_opts = {**merged, "agent": agent_name, "default_model": default_model, "pinned_model": pinned_model,
-                     "log": _log, "on_metrics": _on_metrics}
+                     "log": _log, "on_metrics": _on_metrics, "on_integration": _on_integration}
         if on_progress:
             call_opts["on_progress"] = lambda text: on_progress(label, text, key)
 
@@ -334,6 +337,8 @@ def create_runtime(
                 meta["tokensOut"] = tok.get("output", 0) + tok.get("reasoning", 0)
             if metrics_holder.get("ms") is not None:
                 meta["ms"] = metrics_holder["ms"]
+            if metrics_holder.get("integration") is not None:
+                meta["integration"] = metrics_holder["integration"]
             journal.record(key, label, result, meta)
 
         return result

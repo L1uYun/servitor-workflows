@@ -87,6 +87,21 @@ On Windows, the CLI initializes stdout/stderr and child Python processes as UTF-
 
 When a turn fails, the agent boundary preserves run evidence (`failure_reason`, `run_dir`, stdout/stderr/metadata paths) instead of collapsing to a bare exception string.
 
+## Isolated write tasks
+
+For a task that modifies a Git project, make its integration evidence explicit:
+
+```python
+result = await agent("Implement the approved change, then commit it.", {
+    "cwd": r"D:\\AgentWork\\products\\audio-report",
+    "isolation": "worktree",
+    "worktree_branch": "codex/audio-report-task-slug",
+    "verify_command": ["pnpm", "verify"],
+})
+```
+
+The isolated worktree starts from a recorded base commit. Its journal entry records the branch, final HEAD, dirty state, and (when configured) the verification command and result. A clean worktree is removed after completion; a dirty worktree is retained for inspection. The controller reviews that evidence and performs the merge and any deployment separately.
+
 ## Journal
 
 Every run writes `.workflow-journal/<name>.{jsonl,events.jsonl,meta.json,result.json}` beside the workflow file by default, even when launched by absolute path from another cwd. Override with `--journal <path>`. Re-run with `--resume` to skip cached agent calls.
