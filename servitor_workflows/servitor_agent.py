@@ -28,7 +28,7 @@ from servitor.providers.utility import _hidden_process_kwargs
 from .agent_types import load_agent_type
 from .model_map import resolve_model
 from .meter import tokens_for_thread
-from .worktree import create_worktree, is_git_repo
+from .worktree import build_closure_packet, create_worktree, is_git_repo
 
 
 _SERVITOR_RUN_SCRIPT = """
@@ -291,7 +291,7 @@ async def servitor_agent(
     1:1 port of upstream codexAgent(). Returns string | parsed dict (schema) | None.
 
     opts keys: agent, model, schema, effort, system_prompt, agent_type, cwd,
-    isolation, worktree_branch, verify_command, verify_timeout_seconds, retries,
+    isolation, worktree_branch, verify_command, verify_timeout_seconds, delivery, retries,
     default_model, pinned_model, on_metrics, on_integration, on_progress.
     """
     opts = opts or {}
@@ -340,16 +340,30 @@ async def servitor_agent(
             verification = await worktree["verify"](
                 opts.get("verify_command"), opts.get("verify_timeout_seconds")
             )
-            integration = await worktree["cleanup"]()
-            if verification:
-                integration["verification"] = verification
-            if opts.get("on_integration"):
-                opts["on_integration"](integration)
             if verification and verification["exit_code"] != 0:
+                integration = await worktree["cleanup"]()
+                integration["verification"] = verification
+                if opts.get("on_integration"):
+                    opts["on_integration"](integration)
                 raise RuntimeError(
                     f"project verification failed in {integration['dir']}: "
                     f"{verification['command']} (exit {verification['exit_code']})"
                 )
+            integration = await worktree["cleanup"]()
+            if verification:
+                integration["verification"] = verification
+            delivery = await worktree["deliver"](opts.get("delivery"))
+            if delivery:
+                integration["delivery"] = delivery
+                failed = [c for c in delivery.get("commands", []) if c.get("exit_code") != 0]
+                if failed:
+                    if opts.get("on_integration"):
+                        opts["on_integration"](integration)
+                    raise RuntimeError(f"delivery failed for {delivery.get('branch')}: {failed[0].get('command')}")
+            if verification:
+                integration["closure_packet"] = build_closure_packet(integration=integration)
+            if opts.get("on_integration"):
+                opts["on_integration"](integration)
         return result
     finally:
         if worktree and integration is None:

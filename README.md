@@ -126,7 +126,36 @@ result = await agent("Implement the approved change, then commit it.", {
 })
 ```
 
-The isolated worktree starts from a recorded base commit. Its journal entry records the branch, final HEAD, dirty state, and (when configured) the verification command and result. A clean worktree is removed after completion; a dirty worktree is retained for inspection. The controller reviews that evidence and performs the merge and any deployment separately.
+The isolated worktree starts from a recorded base commit. Its journal entry records the branch, final HEAD, dirty state, and (when configured) the verification command and result. A clean worktree is removed after completion; a dirty worktree is retained for inspection.
+
+When a controller explicitly opts into delivery, the same integration evidence can include a branch push and draft PR creation after worktree verification succeeds:
+
+```python
+result = await agent("Implement the approved change, then commit it.", {
+    "cwd": r"D:\AgentWork\products\audio-report",
+    "isolation": "worktree",
+    "worktree_branch": "codex/audio-report-task-slug",
+    "verify_command": ["pnpm", "verify"],
+    "delivery": {"remote": "origin", "pr": {"create": True, "draft": True, "fill": True}},
+})
+```
+
+Use `delivery={"dry_run": True, ...}` for offline rehearsal; the journal records the exact `git push` / `gh pr create` commands without touching the network. Delivery remains controller-owned: no verification success alone is a release claim. When verification evidence exists, the integration record also emits a `neat_closure_packet` containing branch, base/head, verify result, delivery state, cleanup dry-run requirement, inherited-state reminder, and next gate so closure is an orchestrated output rather than a manual memory step.
+
+## Cross-stage state and approval gates
+
+Use `WorkflowStateMachine` when a workflow crosses planning, verification, approval, delivery, or cleanup. It records task identity, phase, artifacts/evidence links, retry/failure semantics, semantic evaluator result, and trusted human/evaluator approval state in a JSON sidecar. `advance("delivering")` and `advance("cleaning")` require confirmed approval with a trusted source plus evidence, so a shape-valid JSON result, an edited sidecar, or an unanswered `human()` checkpoint cannot silently authorize destructive cleanup.
+
+```python
+from servitor_workflows import WorkflowStateMachine
+
+state = WorkflowStateMachine(task_id="audio-report-release")
+state.add_artifact(kind="verify", evidence="pnpm verify passed")
+state.apply_evaluator_result({"control": {"verdict": "pass", "understanding": "diff and verify output inspected"}})
+state.advance("delivering")
+```
+
+The controller reviews branch/diff/HEAD/journal evidence, approval state, delivery result, and any deployment smoke before merging, cleanup, or close-and-learn.
 
 ## Journal
 
