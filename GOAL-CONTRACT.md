@@ -192,7 +192,8 @@ Implemented behavior:
 1. Deterministic default provider resolution for `servitor-workflows run`:
    - first use explicit `--agent`;
    - else use workflow/meta default if present;
-   - else choose a captured provider by stable policy: `pi`, then `codebuddy`, then `claude`, then `agy-tui`, then first captured provider.
+   - else use `pi` when captured;
+   - else leave the default unset rather than silently falling through to another local agent.
 2. The chosen provider is recorded in CLI meta sidecar, runtime default event, per-agent events, and journal metadata.
 3. `--agent`, `--model`, `--pin-model`, `--effort`, `--pin-effort` remain overrides.
 4. `README.md` and `agent-dispatch` references are updated to prefer `pi`.

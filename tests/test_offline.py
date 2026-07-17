@@ -539,6 +539,16 @@ async def test_default_agent_auto_resolves_to_pi(monkeypatch):
     assert calls[0]["agent"] == "pi"
 
 
+
+
+def test_default_agent_auto_does_not_fallback_to_non_pi(monkeypatch):
+    monkeypatch.setattr(run_workflow, "_captured_provider_names", lambda: ["codebuddy", "claude"])
+
+    agent, source = run_workflow.resolve_default_agent(None, None)
+
+    assert agent is None
+    assert source == "none"
+
 @pytest.mark.asyncio
 async def test_default_agent_precedence_explicit_then_meta_then_auto(monkeypatch):
     monkeypatch.setattr(run_workflow, "_captured_provider_names", lambda: ["pi", "codebuddy"])

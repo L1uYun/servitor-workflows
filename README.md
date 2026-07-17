@@ -1,10 +1,10 @@
 # servitor-workflows
 
-Dynamic multi-agent workflow layer on top of [servitor](https://github.com/L1uYun/servitor). Parallel fan-out, pipelines, journal-backed replay, sessionful workers, human gates, plan mode, and graceful cancel — all in Python.
+Dynamic workflow layer on top of [servitor](https://github.com/L1uYun/servitor). The default worker framework is `pi`; parallel fan-out, pipelines, journal-backed replay, sessionful workers, human gates, plan mode, and graceful cancel are orchestration features, not a requirement to route through many local agents.
 
 ## Why
 
-One `servitor run` is one agent call. Real tasks need orchestration: run several agents, pipeline stages, resume from a journal, pause for human approval, or cancel a long fan-out cleanly. servitor-workflows owns that layer; servitor stays transport-only.
+One `servitor run` is one worker call. Real tasks may need orchestration: pipeline stages, journal resume, sessionful workers, human approval, or controlled fan-out. servitor-workflows owns that layer; servitor stays transport-only, and `pi` remains the sole automatic backend unless a workflow or flag explicitly selects another agent.
 
 ## Install
 
@@ -57,7 +57,7 @@ servitor-workflows supervise <dir> --interval 5
 
 Useful `run` flags:
 
-- golden path: `--agent` / `--model` / `--plan` / `--resume` / `--fresh` / `--args` / `--budget` / `--output`
+- golden path: `--model` / `--plan` / `--resume` / `--fresh` / `--args` / `--budget` / `--output`; `--agent` is an override for non-`pi` runs
 - advanced: `--pin-model`, effort family, `--journal` / `--run-id` / `--no-journal`, `--cancel-file`
 
 ## Output modes

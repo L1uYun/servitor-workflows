@@ -65,9 +65,10 @@ def _meta_default_agent(meta: dict | None) -> str | None:
 
 
 def resolve_default_agent(explicit_agent: str | None, meta: dict | None = None) -> tuple[str | None, str]:
-    """Resolve the workflow default provider with pi-first low-friction policy.
+    """Resolve the workflow default provider with pi as the sole auto backend.
 
-    Precedence: explicit CLI/API default > workflow meta default > captured provider.
+    Precedence: explicit CLI/API default > workflow meta default > pi if captured.
+    Other local agents remain explicit overrides, not automatic substitutes.
     """
     if explicit_agent:
         return explicit_agent, "flag"
@@ -75,10 +76,9 @@ def resolve_default_agent(explicit_agent: str | None, meta: dict | None = None) 
     if meta_agent:
         return meta_agent, "workflow"
     captured = _captured_provider_names()
-    for preferred in ("pi", "codebuddy", "claude", "agy-tui"):
-        if preferred in captured:
-            return preferred, "auto"
-    return (captured[0], "auto") if captured else (None, "none")
+    if "pi" in captured:
+        return "pi", "auto"
+    return None, "none"
 
 
 async def run_workflow_file(script_path: str, options: dict | None = None) -> Any:
