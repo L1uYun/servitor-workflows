@@ -1,11 +1,1 @@
-.pytest_cache/
-*.egg-info/
-.workflow-journal/
-__pycache__/
-*.py[cod]
-*.events.jsonl
-*.meta.json
-*.result.json
-*.log
-servitor_workflows/viewer_assets/
-tests/test_viewers.py
+/target/

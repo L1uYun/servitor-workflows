@@ -1,0 +1,33 @@
+[package]
+name = "servitor-workflows"
+version = "0.1.0"
+edition = "2024"
+description = "Dynamic workflow orchestration above Servitor transport"
+license = "MIT"
+
+[lib]
+name = "servitor_workflows"
+path = "src/lib.rs"
+
+[[bin]]
+name = "servitor-workflows"
+path = "src/main.rs"
+
+[dependencies]
+boa_engine = "0.21.1"
+boa_gc = "0.21.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+futures-channel = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+servitor = { path = "../servitor" }
+sha2 = "0.10"
+thiserror = "2"
+uuid = { version = "1", features = ["v7"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"
