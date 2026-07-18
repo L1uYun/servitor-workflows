@@ -19,6 +19,8 @@ use tempfile::TempDir;
 
 struct FakeTransport {
     calls: AtomicUsize,
+    active_inspections: AtomicUsize,
+    peak_inspections: AtomicUsize,
     delay: Duration,
     records: Mutex<BTreeMap<String, RunRecord>>,
 }
@@ -27,12 +29,17 @@ impl FakeTransport {
     fn new(delay: Duration) -> Self {
         Self {
             calls: AtomicUsize::new(0),
+            active_inspections: AtomicUsize::new(0),
+            peak_inspections: AtomicUsize::new(0),
             delay,
             records: Mutex::new(BTreeMap::new()),
         }
     }
     fn count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+    fn peak_inspections(&self) -> usize {
+        self.peak_inspections.load(Ordering::SeqCst)
     }
 }
 
@@ -89,7 +96,10 @@ impl Transport for FakeTransport {
     }
 
     fn inspect(&self, run_id: &str) -> Result<RunRecord, ErrorInfo> {
+        let active = self.active_inspections.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_inspections.fetch_max(active, Ordering::SeqCst);
         thread::sleep(self.delay);
+        self.active_inspections.fetch_sub(1, Ordering::SeqCst);
         let mut records = self
             .records
             .lock()
@@ -148,7 +158,6 @@ fn dynamic_pipeline_fans_out_and_runs_concurrently() {
         return { items: found.items, results };
     "#,
     );
-    let started = Instant::now();
     let state = engine(&temp.path().join("state"), Arc::clone(&transport))
         .start(&path, Value::Null, 4, 100)
         .expect("run workflow");
@@ -159,7 +168,7 @@ fn dynamic_pipeline_fans_out_and_runs_concurrently() {
     );
     assert_eq!(transport.count(), 4);
     assert!(
-        started.elapsed() < Duration::from_millis(650),
+        transport.peak_inspections() >= 3,
         "fan-out was not concurrent"
     );
 }
@@ -262,6 +271,49 @@ fn pause_and_cancel_interrupt_active_calls() {
     assert_eq!(final_cancel.status, RunStatus::Cancelled);
 }
 
+#[test]
+fn resume_keeps_run_id_replays_journal_and_writes_report() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-resume");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(300)));
+    let path = script(
+        &temp,
+        "resume.js",
+        r#"
+        const first = await agent("FIRST");
+        const second = await agent("SECOND");
+        return { first, second };
+    "#,
+    );
+    let runner_root = root.clone();
+    let runner_transport = Arc::clone(&transport);
+    let path_copy = path.clone();
+    let runner = thread::spawn(move || {
+        engine(&runner_root, runner_transport).start(&path_copy, Value::Null, 1, 10)
+    });
+    wait_for_call_count(&transport, 2);
+    let run_id = wait_for_active_run(&root);
+    engine(&root, Arc::clone(&transport))
+        .pause(&run_id)
+        .expect("pause");
+    let paused = runner.join().expect("join").expect("paused run");
+    assert_eq!(paused.status, RunStatus::Paused);
+    assert_eq!(paused.run_id, run_id);
+    assert_eq!(transport.count(), 2);
+
+    let resumed = engine(&root, Arc::clone(&transport))
+        .resume(&run_id)
+        .expect("resume");
+    assert_eq!(resumed.status, RunStatus::Succeeded);
+    assert_eq!(resumed.run_id, run_id);
+    assert_eq!(resumed.resume_count, 1);
+    assert_eq!(transport.count(), 2, "completed calls were submitted again");
+    let report = resumed.report.expect("terminal report path");
+    let html = fs::read_to_string(report).expect("read report");
+    assert!(html.contains(&run_id));
+    assert!(html.contains("Workflow 交付汇报"));
+}
+
 fn wait_for_active_run(root: &Path) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -276,6 +328,17 @@ fn wait_for_active_run(root: &Path) -> String {
             }
         }
         assert!(Instant::now() < deadline, "run never became active");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_call_count(transport: &FakeTransport, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while transport.count() < expected {
+        assert!(
+            Instant::now() < deadline,
+            "call count never reached {expected}"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 }

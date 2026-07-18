@@ -4,7 +4,8 @@ Rust orchestration above the Rust `servitor` transport.
 
 `servitor` owns agent process submission, inspection, cancellation, and output.
 `servitor-workflows` owns dynamic workflow execution, concurrency, commands,
-human gates, persisted state, replay, pause, and cancellation.
+human gates, persisted state, replay, pause, cancellation, and the final
+reader-facing HTML delivery report.
 
 The execution contract has three primitives:
 
@@ -116,8 +117,8 @@ Output modes:
 
 `run`, `resume`, `get`, `approve`, `reject`, `pause`, and `cancel` return the
 low-noise public shape: `run_id`, `status`, and only relevant phase, active
-calls, gate, result, or error. `inspect` is the explicit detailed surface and
-adds persisted state plus owner paths.
+calls, gate, result, error, or terminal `report` path. `inspect` is the explicit
+detailed surface and adds persisted state plus owner paths.
 
 Defaults:
 
@@ -142,6 +143,7 @@ Each run owns:
 runs/<RUN_ID>/workflow.js
 runs/<RUN_ID>/state.json
 runs/<RUN_ID>/journal.jsonl
+runs/<RUN_ID>/report.html
 runs/<RUN_ID>/pause.request
 runs/<RUN_ID>/cancel.request
 ```
@@ -149,6 +151,7 @@ runs/<RUN_ID>/cancel.request
 Resume replays the same JavaScript. Stable call identity plus an occurrence
 index returns completed calls from the journal and reconnects submitted agent
 calls through their Servitor run id. The JavaScript VM itself is not serialized.
+`inspect` exposes `resume_count`; terminal HTML reports show the same count.
 
 States:
 
@@ -159,6 +162,11 @@ running | waiting_human | pausing | paused | cancelling | succeeded | failed | c
 A command completed before interruption is cached. A command interrupted with
 the controller process may execute again on resume, so side-effecting commands
 must carry their own idempotency check.
+
+Every terminal run owns a self-contained `report.html`. It is generated from
+the persisted state and journal, keeps raw detail behind progressive
+disclosure, and does not open a browser window. Resuming an older terminal run
+backfills a missing report without rerunning completed workflow calls.
 
 ## Rust SDK
 
@@ -195,3 +203,15 @@ Real example:
 ```powershell
 servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\dynamic.workflow.js
 ```
+
+Pause/resume evidence uses the original run id:
+
+```powershell
+servitor-workflows pause RUN_ID
+servitor-workflows resume RUN_ID
+servitor-workflows inspect RUN_ID
+```
+
+After the resumed run reaches a terminal state, the public result includes
+`report`. `inspect` exposes the same run's `state.json`, `journal.jsonl`,
+`workflow.js`, and `report.html` paths.

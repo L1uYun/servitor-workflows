@@ -36,6 +36,8 @@ pub struct RunState {
     pub max_parallel: usize,
     pub max_calls: usize,
     #[serde(default)]
+    pub resume_count: u32,
+    #[serde(default)]
     pub phase: Option<String>,
     #[serde(default)]
     pub active: BTreeMap<String, ActiveCall>,
@@ -47,6 +49,8 @@ pub struct RunState {
     pub result: Option<Value>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub report: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +120,8 @@ pub struct PublicRun {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<PathBuf>,
 }
 
 impl From<&RunState> for PublicRun {
@@ -128,6 +134,7 @@ impl From<&RunState> for PublicRun {
             gate: state.waiting_gate.clone(),
             result: state.result.clone(),
             error: state.error.clone(),
+            report: state.report.clone(),
         }
     }
 }

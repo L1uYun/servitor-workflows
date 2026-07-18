@@ -1,6 +1,7 @@
 use crate::agent::Transport;
 use crate::error::WorkflowError;
 use crate::model::{GateDecision, PublicRun, RunState, RunStatus};
+use crate::report;
 use crate::scheduler::{RuntimeHost, Scheduler};
 use crate::script;
 use crate::store::WorkflowStore;
@@ -68,12 +69,14 @@ impl Engine {
             args,
             max_parallel,
             max_calls,
+            resume_count: 0,
             phase: None,
             active: Default::default(),
             waiting_gate: None,
             decisions: Default::default(),
             result: None,
             error: None,
+            report: None,
         };
         self.store.create_run(&state, &script)?;
         self.execute(&state.run_id)
@@ -82,8 +85,11 @@ impl Engine {
     pub fn resume(&self, run_id: &str) -> Result<RunState, WorkflowError> {
         let state = self.store.load_state(run_id)?;
         if state.status.is_terminal() {
-            return Ok(state);
+            return self.ensure_report(state);
         }
+        self.store.update_state(run_id, |state| {
+            state.resume_count = state.resume_count.saturating_add(1);
+        })?;
         self.store.clear_pause(run_id)?;
         self.execute(run_id)
     }
@@ -132,7 +138,8 @@ impl Engine {
         if approved {
             self.execute(run_id)
         } else {
-            self.store.load_state(run_id)
+            let state = self.store.load_state(run_id)?;
+            self.ensure_report(state)
         }
     }
 
@@ -149,13 +156,18 @@ impl Engine {
 
     pub fn cancel(&self, run_id: &str) -> Result<RunState, WorkflowError> {
         self.store.request_cancel(run_id)?;
-        self.store.update_state(run_id, |state| {
+        let state = self.store.update_state(run_id, |state| {
             state.status = if state.active.is_empty() {
                 RunStatus::Cancelled
             } else {
                 RunStatus::Cancelling
             };
-        })
+        })?;
+        if state.status.is_terminal() {
+            self.ensure_report(state)
+        } else {
+            Ok(state)
+        }
     }
 
     pub fn inspect(&self, run_id: &str) -> Result<Inspection, WorkflowError> {
@@ -164,6 +176,7 @@ impl Engine {
             script_path: self.store.script_path(run_id),
             state_path: self.store.state_path(run_id),
             journal_path: self.store.journal_path(run_id),
+            report_path: self.store.report_path(run_id),
         })
     }
 
@@ -174,11 +187,13 @@ impl Engine {
             state.waiting_gate = None;
             state.result = None;
             state.error = None;
+            state.report = None;
         })?;
         if self.store.cancel_requested(run_id) {
-            return self.store.update_state(run_id, |state| {
+            let state = self.store.update_state(run_id, |state| {
                 state.status = RunStatus::Cancelled;
-            });
+            })?;
+            return self.ensure_report(state);
         }
         let source = self.store.load_script(run_id)?;
         let runtime = Arc::new(RuntimeHost {
@@ -191,10 +206,11 @@ impl Engine {
         let result = script::execute(runtime, &source, &initial.args, initial.max_calls);
         let current = self.store.load_state(run_id)?;
         if self.store.cancel_requested(run_id) {
-            return self.store.update_state(run_id, |state| {
+            let state = self.store.update_state(run_id, |state| {
                 state.status = RunStatus::Cancelled;
                 state.active.clear();
-            });
+            })?;
+            return self.ensure_report(state);
         }
         if self.store.pause_requested(run_id) {
             return self.store.update_state(run_id, |state| {
@@ -205,7 +221,7 @@ impl Engine {
         if current.status == RunStatus::WaitingHuman {
             return Ok(current);
         }
-        match result {
+        let state = match result {
             Ok(value) => self.store.update_state(run_id, |state| {
                 state.status = RunStatus::Succeeded;
                 state.result = Some(value);
@@ -217,7 +233,30 @@ impl Engine {
                 state.error = Some(error.to_string());
                 state.active.clear();
             }),
+        }?;
+        self.ensure_report(state)
+    }
+
+    fn ensure_report(&self, state: RunState) -> Result<RunState, WorkflowError> {
+        if !state.status.is_terminal() {
+            return Ok(state);
         }
+        let path = match report::write(&self.store, &state) {
+            Ok(path) => path,
+            Err(error) => {
+                return self.store.update_state(&state.run_id, |state| {
+                    state.status = RunStatus::Failed;
+                    state.error = Some(format!("report generation failed: {error}"));
+                    state.report = None;
+                });
+            }
+        };
+        if state.report.as_ref() == Some(&path) {
+            return Ok(state);
+        }
+        self.store.update_state(&state.run_id, |state| {
+            state.report = Some(path);
+        })
     }
 }
 
@@ -227,6 +266,7 @@ pub struct Inspection {
     pub script_path: PathBuf,
     pub state_path: PathBuf,
     pub journal_path: PathBuf,
+    pub report_path: PathBuf,
 }
 
 fn validate_script(script: &str) -> Result<(), WorkflowError> {

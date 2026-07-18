@@ -3,6 +3,7 @@ mod command;
 mod engine;
 mod error;
 mod model;
+mod report;
 mod scheduler;
 mod script;
 mod store;

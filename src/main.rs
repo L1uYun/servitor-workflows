@@ -129,12 +129,17 @@ fn human(value: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("error");
     let run_id = value.get("run_id").and_then(Value::as_str).unwrap_or("-");
+    let report = value
+        .get("report")
+        .and_then(Value::as_str)
+        .map(|path| format!("\nreport: {path}"))
+        .unwrap_or_default();
     if let Some(result) = value.get("result").filter(|value| !value.is_null()) {
-        format!("{status} {run_id}\n{result}")
+        format!("{status} {run_id}\n{result}{report}")
     } else if let Some(error) = value.get("error").and_then(Value::as_str) {
-        format!("{status} {run_id}\n{error}")
+        format!("{status} {run_id}\n{error}{report}")
     } else {
-        format!("{status} {run_id}")
+        format!("{status} {run_id}{report}")
     }
 }
 
