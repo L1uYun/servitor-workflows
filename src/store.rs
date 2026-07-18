@@ -42,6 +42,12 @@ impl WorkflowStore {
     pub fn journal_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("journal.jsonl")
     }
+    pub fn command_result_path(&self, run_id: &str, key: &str) -> PathBuf {
+        self.run_dir(run_id)
+            .join("commands")
+            .join(key.replace('#', "-"))
+            .join("result.json")
+    }
     pub fn run_summary_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("run-summary.html")
     }
@@ -203,3 +209,4 @@ fn default_state_root() -> PathBuf {
         std::env::temp_dir().join("servitor-workflows")
     }
 }
+

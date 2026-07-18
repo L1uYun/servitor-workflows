@@ -98,6 +98,29 @@ workflow contracts: `type`, `required`, `properties`, and `items`.
 On Windows, command children are created without a console window. Stdout and
 stderr retain a bounded 1 MiB tail each.
 
+`command()` resolves to a structured `CommandResult`:
+
+```json
+{
+  "argv": ["pwsh", "-NoProfile", "..."],
+  "cwd": "D:\\AgentWork",
+  "exitCode": 0,
+  "stdout": "...",
+  "stderr": "...",
+  "stdoutTruncated": false,
+  "stderrTruncated": false,
+  "timedOut": false,
+  "durationMs": 751
+}
+```
+
+The same object is persisted atomically to
+`state/servitor-workflows/runs/<run_id>/commands/<key>/result.json` for success,
+non-zero exit, and timeout alike. Consume these typed fields directly; do not
+re-read console output or add a "read-results" pass. `stdout`/`stderr` are
+bounded tails, not business conclusions — a worker that must hand back a machine
+verdict should write an explicit evidence JSON at an agreed path instead.
+
 ## CLI
 
 ```text

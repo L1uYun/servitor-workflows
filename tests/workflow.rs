@@ -277,6 +277,94 @@ fn command_returns_deterministic_evidence() {
 }
 
 #[test]
+fn command_result_is_structured_and_persisted() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "command.js",
+        r#"
+        const ok = await command("rustc", ["--version"], { timeoutSeconds: 30 });
+        return ok;
+    "#,
+    );
+    let state_root = temp.path().join("state-cmdresult");
+    let state = engine(&state_root, transport)
+        .start(&path, Value::Null, 1, 10)
+        .expect("command workflow");
+    assert_eq!(state.status, RunStatus::Succeeded);
+    let result = state.result.expect("result");
+    assert_eq!(result["exitCode"], 0);
+    assert_eq!(result["timedOut"], false);
+    assert_eq!(result["stdoutTruncated"], false);
+    assert_eq!(result["stderrTruncated"], false);
+    assert!(result["durationMs"].as_u64().is_some());
+    assert_eq!(result["argv"][0].as_str().unwrap_or_default(), "rustc");
+    assert!(result["cwd"].as_str().unwrap_or_default().len() > 1);
+
+    let store = WorkflowStore::new(&state_root);
+    let run_dir = store.run_dir(&state.run_id).join("commands");
+    let mut found = false;
+    for entry in fs::read_dir(&run_dir).expect("commands dir") {
+        let entry = entry.expect("entry");
+        let candidate = entry.path().join("result.json");
+        if candidate.exists() {
+            let disk: Value = serde_json::from_str(
+                &fs::read_to_string(&candidate).expect("read result.json"),
+            )
+            .expect("parse result.json");
+            assert_eq!(disk["exitCode"], 0);
+            assert_eq!(disk["timedOut"], false);
+            assert!(disk["stdout"].as_str().unwrap_or_default().contains("rustc"));
+            found = true;
+        }
+    }
+    assert!(found, "expected at least one persisted command result.json");
+}
+
+#[test]
+fn command_failure_persists_result_and_error() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "command.js",
+        r#"
+        try {
+          await command("rustc", ["--definitely-not-a-real-flag-xyz"], { timeoutSeconds: 30 });
+          return { unreachable: true };
+        } catch (error) {
+          return { caught: String(error) };
+        }
+    "#,
+    );
+    let state_root = temp.path().join("state-cmdfail");
+    let state = engine(&state_root, transport)
+        .start(&path, Value::Null, 1, 10)
+        .expect("command workflow");
+    assert_eq!(state.status, RunStatus::Succeeded);
+    let result = state.result.expect("result");
+    assert!(result["caught"].as_str().unwrap_or_default().contains("command exited"));
+
+    let store = WorkflowStore::new(&state_root);
+    let run_dir = store.run_dir(&state.run_id).join("commands");
+    let mut found = false;
+    for entry in fs::read_dir(&run_dir).expect("commands dir") {
+        let entry = entry.expect("entry");
+        let candidate = entry.path().join("result.json");
+        if candidate.exists() {
+            let disk: Value = serde_json::from_str(
+                &fs::read_to_string(&candidate).expect("read result.json"),
+            )
+            .expect("parse result.json");
+            assert_ne!(disk["exitCode"], 0);
+            found = true;
+        }
+    }
+    assert!(found, "expected persisted result.json for failed command");
+}
+
+#[test]
 fn result_report_is_validated_as_a_delivery_artifact() {
     let temp = TempDir::new().expect("tempdir");
     let report = temp.path().join("delivery.html");
@@ -482,3 +570,4 @@ fn recovers_fenced_json_from_model_prose() {
     assert_eq!(state.result, Some(json!({"summary":"ok","score":1})));
     assert_eq!(transport.count(), 1);
 }
+

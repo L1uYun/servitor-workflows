@@ -50,6 +50,26 @@ impl CommandCall {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CommandResult {
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub timed_out: bool,
+    pub duration_ms: u64,
+}
+
+impl CommandResult {
+    fn into_json(self) -> Value {
+        serde_json::to_value(self).unwrap_or_else(|_| json!({"error": "command result serialization failed"}))
+    }
+}
+
 pub(crate) fn run(
     store: &WorkflowStore,
     run_id: &str,
@@ -91,17 +111,20 @@ pub(crate) fn run(
     let stderr_path = call_dir.join("stderr.txt");
     let stdout = fs::File::create(&stdout_path).map_err(|error| error.to_string())?;
     let stderr = fs::File::create(&stderr_path).map_err(|error| error.to_string())?;
+    let resolved_cwd = resolve_cwd(default_cwd, options.cwd.as_deref());
+    let argv: Vec<String> = std::iter::once(program.clone()).chain(args.iter().cloned()).collect();
     let mut command = Command::new(&program);
     command
         .args(&args)
         .envs(&options.env)
-        .current_dir(resolve_cwd(default_cwd, options.cwd.as_deref()))
+        .current_dir(&resolved_cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     hide_window(&mut command);
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let started = Instant::now();
+    let mut timed_out = false;
     let status = loop {
         if store.cancel_requested(run_id) || store.pause_requested(run_id) {
             let _ = child.kill();
@@ -121,9 +144,10 @@ pub(crate) fn run(
             .timeout_seconds
             .is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
         {
+            timed_out = true;
             let _ = child.kill();
-            let _ = child.wait();
-            return fail(store, run_id, &key, &label, "command timed out".to_owned());
+            let status = child.wait().map_err(|error| error.to_string())?;
+            break status;
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -131,9 +155,32 @@ pub(crate) fn run(
             Err(error) => return fail(store, run_id, &key, &label, error.to_string()),
         }
     };
-    let stdout = read_tail(&stdout_path).map_err(|error| error.to_string())?;
-    let stderr = read_tail(&stderr_path).map_err(|error| error.to_string())?;
-    let result = json!({"exitCode": status.code(), "stdout": stdout, "stderr": stderr});
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let (stdout, stdout_truncated) = read_tail(&stdout_path).map_err(|error| error.to_string())?;
+    let (stderr, stderr_truncated) = read_tail(&stderr_path).map_err(|error| error.to_string())?;
+    let result = CommandResult {
+        argv,
+        cwd: resolved_cwd,
+        exit_code: status.code(),
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+        timed_out,
+        duration_ms,
+    };
+    let result_json = result.into_json();
+    write_command_result(store, run_id, &key, &result_json)?;
+    if timed_out {
+        return fail_with_result(
+            store,
+            run_id,
+            &key,
+            &label,
+            "command timed out".to_owned(),
+            result_json,
+        );
+    }
     if status.success() {
         append(
             store,
@@ -141,19 +188,58 @@ pub(crate) fn run(
             &key,
             &label,
             CallState::Succeeded,
-            Some(result.clone()),
+            Some(result_json.clone()),
             None,
         )?;
-        Ok(result)
+        Ok(result_json)
     } else {
-        fail(
+        fail_with_result(
             store,
             run_id,
             &key,
             &label,
-            format!("command exited with {:?}: {}", status.code(), stderr.trim()),
+            format!(
+                "command exited with {:?}: {}",
+                status.code(),
+                result_json["stderr"].as_str().unwrap_or_default().trim()
+            ),
+            result_json,
         )
     }
+}
+
+fn write_command_result(
+    store: &WorkflowStore,
+    run_id: &str,
+    key: &str,
+    result: &Value,
+) -> Result<(), String> {
+    let path = store.command_result_path(run_id, key);
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(result).map_err(|error| error.to_string())?;
+    fs::write(&tmp, bytes).map_err(|error| error.to_string())?;
+    fs::rename(&tmp, &path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn fail_with_result(
+    store: &WorkflowStore,
+    run_id: &str,
+    key: &str,
+    label: &str,
+    message: String,
+    result: Value,
+) -> JobResult {
+    append(
+        store,
+        run_id,
+        key,
+        label,
+        CallState::Failed,
+        Some(result),
+        Some(message.clone()),
+    )?;
+    Err(message)
 }
 
 fn fail(store: &WorkflowStore, run_id: &str, key: &str, label: &str, message: String) -> JobResult {
@@ -203,7 +289,7 @@ fn resolve_cwd(default: &Path, requested: Option<&Path>) -> PathBuf {
     }
 }
 
-fn read_tail(path: &Path) -> Result<String, WorkflowError> {
+fn read_tail(path: &Path) -> Result<(String, bool), WorkflowError> {
     let mut file = fs::File::open(path).map_err(|source| WorkflowError::Read {
         path: path.to_path_buf(),
         source,
@@ -215,7 +301,8 @@ fn read_tail(path: &Path) -> Result<String, WorkflowError> {
             source,
         })?
         .len();
-    if length > OUTPUT_LIMIT {
+    let truncated = length > OUTPUT_LIMIT;
+    if truncated {
         file.seek(SeekFrom::Start(length - OUTPUT_LIMIT))
             .map_err(|source| WorkflowError::Read {
                 path: path.to_path_buf(),
@@ -228,7 +315,7 @@ fn read_tail(path: &Path) -> Result<String, WorkflowError> {
             path: path.to_path_buf(),
             source,
         })?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
 #[cfg(windows)]
@@ -238,3 +325,6 @@ fn hide_window(command: &mut Command) {
 }
 #[cfg(not(windows))]
 fn hide_window(_command: &mut Command) {}
+
+
+
