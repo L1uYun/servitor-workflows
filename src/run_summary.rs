@@ -1,3 +1,4 @@
+//! Machine run-summary HTML only; delivery reports are skill-owned (karma #451).
 use crate::error::WorkflowError;
 use crate::model::{CallState, JournalEntry, RunState, RunStatus};
 use crate::store::WorkflowStore;

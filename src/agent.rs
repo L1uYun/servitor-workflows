@@ -231,7 +231,7 @@ pub(crate) fn run(
 fn structured_prompt(prompt: &str, schema: Option<&Value>) -> String {
     schema.map_or_else(
         || prompt.to_owned(),
-        |schema| format!("{prompt}\n\nReturn only valid JSON matching this JSON Schema:\n{schema}"),
+        |schema| format!("{prompt}\n\nReturn only valid JSON matching this JSON Schema.\nDo not wrap the JSON in Markdown fences or prose.\n{schema}"),
     )
 }
 
