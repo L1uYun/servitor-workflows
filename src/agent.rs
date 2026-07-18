@@ -1,3 +1,4 @@
+use crate::json_extract::{expect_from_schema, extract_json_value};
 use crate::model::{CallKind, CallState, JournalEntry};
 use crate::scheduler::JobResult;
 use crate::store::WorkflowStore;
@@ -126,10 +127,18 @@ pub(crate) fn run(
         match entry.state {
             CallState::Succeeded => return Ok(entry.result.clone().unwrap_or(Value::Null)),
             CallState::Failed => {
-                return Err(entry
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "cached agent failure".to_owned()));
+                if let Some(transport_run_id) = entry.transport_run_id.as_deref()
+                    && let Ok(Some(result)) =
+                        try_recover_structured(transport, transport_run_id, options.schema.as_ref())
+                {
+                    append(
+                        CallState::Succeeded,
+                        Some(result.clone()),
+                        None,
+                        Some(transport_run_id.to_owned()),
+                    )?;
+                    return Ok(result);
+                }
             }
             CallState::Submitted | CallState::Cancelled => {}
         }
@@ -180,23 +189,27 @@ pub(crate) fn run(
         match record.state {
             ServitorState::Accepted | ServitorState::Running => thread::sleep(POLL_INTERVAL),
             ServitorState::Succeeded => {
-                let text = match record.output {
-                    Some(Output::Text { text }) => text,
-                    Some(Output::Image { paths }) => paths
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    None => String::new(),
-                };
-                let result = parse_output(&text, options.schema.as_ref())?;
-                append(
-                    CallState::Succeeded,
-                    Some(result.clone()),
-                    None,
-                    Some(transport_run_id),
-                )?;
-                return Ok(result);
+                let text = output_text(record.output.as_ref());
+                match parse_output(&text, options.schema.as_ref()) {
+                    Ok(result) => {
+                        append(
+                            CallState::Succeeded,
+                            Some(result.clone()),
+                            None,
+                            Some(transport_run_id),
+                        )?;
+                        return Ok(result);
+                    }
+                    Err(error) => {
+                        append(
+                            CallState::Failed,
+                            None,
+                            Some(error.clone()),
+                            Some(transport_run_id),
+                        )?;
+                        return Err(error);
+                    }
+                }
             }
             ServitorState::Failed | ServitorState::Cancelled => {
                 let message = record
@@ -222,12 +235,42 @@ fn structured_prompt(prompt: &str, schema: Option<&Value>) -> String {
     )
 }
 
+fn try_recover_structured(
+    transport: &dyn Transport,
+    transport_run_id: &str,
+    schema: Option<&Value>,
+) -> Result<Option<Value>, String> {
+    let record = transport
+        .inspect(transport_run_id)
+        .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    if record.state != ServitorState::Succeeded {
+        return Ok(None);
+    }
+    let text = output_text(record.output.as_ref());
+    match parse_output(&text, schema) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn output_text(output: Option<&Output>) -> String {
+    match output {
+        Some(Output::Text { text }) => text.clone(),
+        Some(Output::Image { paths }) => paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => String::new(),
+    }
+}
+
 fn parse_output(text: &str, schema: Option<&Value>) -> JobResult {
     let Some(schema) = schema else {
         return Ok(Value::String(text.to_owned()));
     };
-    let value: Value =
-        serde_json::from_str(text).map_err(|error| format!("agent output is not JSON: {error}"))?;
+    let value = extract_json_value(text, expect_from_schema(Some(schema)))
+        .map_err(|error| format!("agent output is not JSON: {error}"))?;
     validate_schema(&value, schema, "$")?;
     Ok(value)
 }

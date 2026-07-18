@@ -51,7 +51,19 @@ impl Transport for FakeTransport {
             Input::Text { text } => text,
             Input::Image(_) => String::new(),
         };
-        let output = if prompt.contains("DISCOVER") {
+        let output = if prompt.contains("FENCED_JSON") {
+            "done
+
+```json
+{\"summary\":\"ok\",\"score\":1}
+```".to_owned()
+        } else if prompt.contains("RETRY_JSON") {
+            if number == 1 {
+                "not-json".to_owned()
+            } else {
+                r#"{"ok":true}"#.to_owned()
+            }
+        } else if prompt.contains("DISCOVER") {
             r#"{"items":["a","b","c"]}"#.to_owned()
         } else if prompt.contains("WORK ") {
             format!(
@@ -205,6 +217,40 @@ fn gate_replay_uses_cached_calls() {
 }
 
 #[test]
+fn resume_retries_a_failed_structured_agent_call() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-retry-agent");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "retry-agent.js",
+        r#"
+        return await agent("RETRY_JSON", {
+          schema: {
+            type: "object",
+            required: ["ok"],
+            properties: { ok: { type: "boolean" } }
+          }
+        });
+    "#,
+    );
+
+    let failed = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("failed terminal state");
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(transport.count(), 1);
+
+    let resumed = engine(&root, Arc::clone(&transport))
+        .resume(&failed.run_id)
+        .expect("resume structured call");
+    assert_eq!(resumed.status, RunStatus::Succeeded);
+    assert_eq!(resumed.resume_count, 1);
+    assert_eq!(resumed.result, Some(json!({"ok": true})));
+    assert_eq!(transport.count(), 2);
+}
+
+#[test]
 fn command_returns_deterministic_evidence() {
     let temp = TempDir::new().expect("tempdir");
     let transport = Arc::new(FakeTransport::new(Duration::ZERO));
@@ -228,6 +274,69 @@ fn command_returns_deterministic_evidence() {
             .unwrap_or_default()
             .contains("rustc")
     );
+}
+
+#[test]
+fn result_report_is_validated_as_a_delivery_artifact() {
+    let temp = TempDir::new().expect("tempdir");
+    let report = temp.path().join("delivery.html");
+    fs::write(&report, "<html>delivery</html>").expect("write delivery report");
+    let report_json = serde_json::to_string(&report).expect("serialize report path");
+    let path = script(
+        &temp,
+        "delivery.js",
+        &format!(r#"return {{ summary: "done", report: {report_json} }};"#),
+    );
+    let state = engine(
+        &temp.path().join("state-delivery"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    )
+    .start(&path, Value::Null, 1, 10)
+    .expect("delivery workflow");
+
+    assert_eq!(state.status, RunStatus::Succeeded);
+    assert_eq!(state.report.as_deref(), Some(report.as_path()));
+    assert!(state.run_summary.is_some());
+}
+
+#[test]
+fn missing_delivery_report_fails_the_run() {
+    let temp = TempDir::new().expect("tempdir");
+    let missing = temp.path().join("missing.html");
+    let missing_json = serde_json::to_string(&missing).expect("serialize missing path");
+    let path = script(
+        &temp,
+        "missing-delivery.js",
+        &format!(r#"return {{ summary: "done", report: {missing_json} }};"#),
+    );
+    let state = engine(
+        &temp.path().join("state-missing-delivery"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    )
+    .start(&path, Value::Null, 1, 10)
+    .expect("workflow terminal state");
+
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("delivery report does not exist")
+    );
+    assert!(state.report.is_none());
+    assert!(state.run_summary.is_some());
+
+    fs::write(&missing, "<html>recovered</html>").expect("write recovered report");
+    let resumed = engine(
+        &temp.path().join("state-missing-delivery"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    )
+    .resume(&state.run_id)
+    .expect("resume failed workflow");
+    assert_eq!(resumed.status, RunStatus::Succeeded);
+    assert_eq!(resumed.resume_count, 1);
+    assert_eq!(resumed.report.as_deref(), Some(missing.as_path()));
 }
 
 #[test]
@@ -272,7 +381,7 @@ fn pause_and_cancel_interrupt_active_calls() {
 }
 
 #[test]
-fn resume_keeps_run_id_replays_journal_and_writes_report() {
+fn resume_keeps_run_id_replays_journal_and_writes_run_summary() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("state-resume");
     let transport = Arc::new(FakeTransport::new(Duration::from_millis(300)));
@@ -308,10 +417,11 @@ fn resume_keeps_run_id_replays_journal_and_writes_report() {
     assert_eq!(resumed.run_id, run_id);
     assert_eq!(resumed.resume_count, 1);
     assert_eq!(transport.count(), 2, "completed calls were submitted again");
-    let report = resumed.report.expect("terminal report path");
-    let html = fs::read_to_string(report).expect("read report");
+    assert!(resumed.report.is_none());
+    let summary = resumed.run_summary.expect("terminal run summary path");
+    let html = fs::read_to_string(summary).expect("read run summary");
     assert!(html.contains(&run_id));
-    assert!(html.contains("Workflow 交付汇报"));
+    assert!(html.contains("Workflow 运行摘要"));
 }
 
 fn wait_for_active_run(root: &Path) -> String {
@@ -341,4 +451,34 @@ fn wait_for_call_count(transport: &FakeTransport, expected: usize) {
         );
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn recovers_fenced_json_from_model_prose() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-recover-json");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "recover-json.js",
+        r#"
+        return await agent("FENCED_JSON", {
+          schema: {
+            type: "object",
+            required: ["summary", "score"],
+            properties: {
+              summary: { type: "string" },
+              score: { type: "number" }
+            }
+          }
+        });
+    "#,
+    );
+
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("recover structured call");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(state.result, Some(json!({"summary":"ok","score":1})));
+    assert_eq!(transport.count(), 1);
 }

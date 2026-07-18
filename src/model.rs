@@ -51,6 +51,8 @@ pub struct RunState {
     pub error: Option<String>,
     #[serde(default)]
     pub report: Option<PathBuf>,
+    #[serde(default)]
+    pub run_summary: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

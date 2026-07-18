@@ -70,12 +70,7 @@ pub(crate) fn run(
     {
         match entry.state {
             CallState::Succeeded => return Ok(entry.result.unwrap_or(Value::Null)),
-            CallState::Failed => {
-                return Err(entry
-                    .error
-                    .unwrap_or_else(|| "cached command failure".to_owned()));
-            }
-            CallState::Submitted | CallState::Cancelled => {}
+            CallState::Failed | CallState::Submitted | CallState::Cancelled => {}
         }
     }
     append(

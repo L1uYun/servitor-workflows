@@ -42,8 +42,8 @@ impl WorkflowStore {
     pub fn journal_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("journal.jsonl")
     }
-    pub fn report_path(&self, run_id: &str) -> PathBuf {
-        self.run_dir(run_id).join("report.html")
+    pub fn run_summary_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("run-summary.html")
     }
     pub fn pause_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("pause.request")

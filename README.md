@@ -4,8 +4,9 @@ Rust orchestration above the Rust `servitor` transport.
 
 `servitor` owns agent process submission, inspection, cancellation, and output.
 `servitor-workflows` owns dynamic workflow execution, concurrency, commands,
-human gates, persisted state, replay, pause, cancellation, and the final
-reader-facing HTML delivery report.
+human gates, persisted state, replay, pause, cancellation, and machine run
+evidence. Reader-facing delivery reports are workflow outputs, not Rust-rendered
+runtime pages.
 
 The execution contract has three primitives:
 
@@ -74,7 +75,10 @@ typed `agent`, `command`, or `gate` boundary.
 }
 ```
 
-The default agent is `pi`. The runtime does not set a token budget, retry a
+The default agent is `pi`.
+
+When an agent call requests structured output, the runtime extracts JSON from free-form model text by:
+strip reasoning wrappers → prefer fenced ```json blocks → scan balanced `{...}`/`[...]` spans → trailing-comma repair → optional object/array expectation from the schema. Pure whole-text JSON still works. The runtime does not set a token budget, retry a
 provider silently, or fall back to another provider.
 
 Structured output supports the deliberately small JSON Schema subset used by
@@ -118,7 +122,8 @@ Output modes:
 `run`, `resume`, `get`, `approve`, `reject`, `pause`, and `cancel` return the
 low-noise public shape: `run_id`, `status`, and only relevant phase, active
 calls, gate, result, error, or terminal `report` path. `inspect` is the explicit
-detailed surface and adds persisted state plus owner paths.
+detailed surface and adds persisted state plus owner paths, including the
+machine `run_summary_path`.
 
 Defaults:
 
@@ -143,15 +148,18 @@ Each run owns:
 runs/<RUN_ID>/workflow.js
 runs/<RUN_ID>/state.json
 runs/<RUN_ID>/journal.jsonl
-runs/<RUN_ID>/report.html
+runs/<RUN_ID>/run-summary.html
 runs/<RUN_ID>/pause.request
 runs/<RUN_ID>/cancel.request
 ```
 
-Resume replays the same JavaScript. Stable call identity plus an occurrence
-index returns completed calls from the journal and reconnects submitted agent
-calls through their Servitor run id. The JavaScript VM itself is not serialized.
-`inspect` exposes `resume_count`; terminal HTML reports show the same count.
+Resume replays the same JavaScript for paused, interrupted, or failed runs.
+Stable call identity plus an occurrence index returns completed calls from the
+journal, reconnects submitted agent calls through their Servitor run id, and
+reruns failed calls under the same stable identity. Succeeded and cancelled runs
+remain terminal; resume only reconciles their terminal artifacts. The JavaScript
+VM itself is not serialized.
+`inspect` exposes `resume_count`; terminal run summaries show the same count.
 
 States:
 
@@ -163,10 +171,24 @@ A command completed before interruption is cached. A command interrupted with
 the controller process may execute again on resume, so side-effecting commands
 must carry their own idempotency check.
 
-Every terminal run owns a self-contained `report.html`. It is generated from
-the persisted state and journal, keeps raw detail behind progressive
-disclosure, and does not open a browser window. Resuming an older terminal run
-backfills a missing report without rerunning completed workflow calls.
+Every terminal run owns a self-contained `run-summary.html`. Rust generates it
+from persisted state and journal as machine/run evidence and never opens a
+browser window. It is not the reader-facing delivery report.
+
+A workflow may return the minimal delivery shape:
+
+```json
+{
+  "summary": "一句话结论",
+  "report": "D:\\absolute\\path\\delivery-report.html"
+}
+```
+
+The reporting stage should use `reader-centered-reporting` for the source,
+judgment, evidence, boundaries, and next action, then `l1uyun-surface` for the
+HTML display layer. Rust only accepts `report` when it is an absolute path to
+an existing non-empty file. A malformed declared report fails the run; a
+workflow that does not promise a reader report may omit `report`.
 
 ## Rust SDK
 
@@ -213,5 +235,7 @@ servitor-workflows inspect RUN_ID
 ```
 
 After the resumed run reaches a terminal state, the public result includes
-`report`. `inspect` exposes the same run's `state.json`, `journal.jsonl`,
-`workflow.js`, and `report.html` paths.
+`report` only when the workflow produced and returned a validated delivery
+artifact. `inspect` exposes the same run's `state.json`, `journal.jsonl`,
+`workflow.js`, and `run-summary.html` paths.
+

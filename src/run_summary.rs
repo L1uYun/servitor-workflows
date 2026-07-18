@@ -9,7 +9,7 @@ pub fn write(store: &WorkflowStore, state: &RunState) -> Result<PathBuf, Workflo
     let mut entries = journal.values().collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.at);
     let html = render(state, &entries)?;
-    let path = store.report_path(&state.run_id);
+    let path = store.run_summary_path(&state.run_id);
     std::fs::write(&path, html).map_err(|source| WorkflowError::Write {
         path: path.clone(),
         source,
@@ -77,7 +77,7 @@ fn render(state: &RunState, entries: &[&JournalEntry]) -> Result<String, Workflo
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Workflow 交付汇报 · {name}</title>
+<title>Workflow 运行摘要 · {name}</title>
 <style>
 :root{{--paper:#fffffb;--soft:#f4f5f2;--ink:#111;--muted:#6b6b64;--line:#d9d9d1;--strong:#202020;--accent:#315d7c;--ok:#2f5b45;--bad:#8a3d35}}
 *{{box-sizing:border-box}} body{{margin:0;background:var(--soft);color:var(--ink);font:15px/1.7 system-ui,"Segoe UI","Microsoft YaHei",sans-serif}}
@@ -95,17 +95,17 @@ details summary{{cursor:pointer;font-weight:600}} .muted{{color:var(--muted)}} a
 </style>
 </head>
 <body><div class="shell">
-<header><div class="eyebrow">Servitor Workflows · Delivery Report</div><h1>Workflow 交付汇报</h1><p class="lead">{verdict}</p>
+<header><div class="eyebrow">Servitor Workflows · Run Summary</div><h1>Workflow 运行摘要</h1><p class="lead">{verdict}</p>
 <div class="chips"><span class="chip">任务 {name}</span><span class="chip">状态 {status}</span><span class="chip">阶段 {phase}</span><span class="chip">恢复 {resume_count} 次</span><span class="chip">成功调用 {succeeded}</span><span class="chip">失败调用 {failed}</span></div></header>
 <main><div class="stack">
-<section class="card"><h2>这次交付到了哪里</h2><div class="flow"><span class="node">需求与输入</span><span class="arrow">→</span><span class="node">worker</span><span class="arrow">→</span><span class="node">test / gate</span><span class="arrow">→</span><span class="node">HTML 汇报</span></div>
-<p>当前 run 已进入 <strong>{status}</strong>，最后阶段为 <strong>{phase}</strong>。报告只呈现判断所需信息；完整结果和 journal 保留在 run 目录。</p></section>
+<section class="card"><h2>运行状态</h2><div class="flow"><span class="node">workflow</span><span class="arrow">→</span><span class="node">calls</span><span class="arrow">→</span><span class="node">terminal state</span></div>
+<p>当前 run 已进入 <strong>{status}</strong>，最后阶段为 <strong>{phase}</strong>。此页只汇总编排器事实；项目结论由 workflow 返回的交付汇报承载。</p></section>
 <section class="card"><h2>调用与检查证据</h2><div class="table-wrap"><table><thead><tr><th>步骤</th><th>标签</th><th>类型</th><th>状态</th></tr></thead><tbody>{rows}</tbody></table></div>
 <details><summary>技术标识</summary><div class="table-wrap"><table><thead><tr><th>标签</th><th>稳定键</th><th>Transport run</th></tr></thead><tbody>{technical_rows}</tbody></table></div></details></section>
 <section class="card"><h2>最终输出</h2><details><summary>展开结构化结果</summary><pre>{result}</pre></details></section>
-<section class="card"><h2>我们可能错了</h2><p>这个页面根据持久化 state 与 journal 生成。它证明编排器记录的执行结果与调用状态，不替代项目自己的测试、线上 smoke、人工验收或外部事实核查。</p><p>错误信息：<code>{error}</code></p></section>
+<section class="card"><h2>边界</h2><p>这个页面根据持久化 state 与 journal 生成。它只证明编排器记录的执行结果与调用状态，不替代项目测试、线上 smoke、人工验收、外部事实核查或面向读者的交付判断。</p><p>错误信息：<code>{error}</code></p></section>
 </div><aside class="stack"><section class="card"><h2>运行身份</h2><dl><dt>任务</dt><dd>{name}</dd><dt>Run ID</dt><dd><code>{run_id}</code></dd><dt>创建时间</dt><dd>{created}</dd><dt>更新时间</dt><dd>{updated}</dd></dl></section>
-<section class="card"><h2>证据位置</h2><dl><dt>State</dt><dd><code>state.json</code></dd><dt>Journal</dt><dd><code>journal.jsonl</code></dd><dt>Workflow</dt><dd><code>workflow.js</code></dd><dt>Report</dt><dd><code>report.html</code></dd></dl></section></aside></main>
+<section class="card"><h2>证据位置</h2><dl><dt>State</dt><dd><code>state.json</code></dd><dt>Journal</dt><dd><code>journal.jsonl</code></dd><dt>Workflow</dt><dd><code>workflow.js</code></dd><dt>Run summary</dt><dd><code>run-summary.html</code></dd></dl></section></aside></main>
 </div></body></html>"#,
         name = escape(&state.name),
         verdict = escape(verdict),

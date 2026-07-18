@@ -1,7 +1,7 @@
 use crate::agent::Transport;
 use crate::error::WorkflowError;
 use crate::model::{GateDecision, PublicRun, RunState, RunStatus};
-use crate::report;
+use crate::run_summary;
 use crate::scheduler::{RuntimeHost, Scheduler};
 use crate::script;
 use crate::store::WorkflowStore;
@@ -77,6 +77,7 @@ impl Engine {
             result: None,
             error: None,
             report: None,
+            run_summary: None,
         };
         self.store.create_run(&state, &script)?;
         self.execute(&state.run_id)
@@ -84,8 +85,8 @@ impl Engine {
 
     pub fn resume(&self, run_id: &str) -> Result<RunState, WorkflowError> {
         let state = self.store.load_state(run_id)?;
-        if state.status.is_terminal() {
-            return self.ensure_report(state);
+        if matches!(state.status, RunStatus::Succeeded | RunStatus::Cancelled) {
+            return self.ensure_terminal_artifacts(state);
         }
         self.store.update_state(run_id, |state| {
             state.resume_count = state.resume_count.saturating_add(1);
@@ -139,7 +140,7 @@ impl Engine {
             self.execute(run_id)
         } else {
             let state = self.store.load_state(run_id)?;
-            self.ensure_report(state)
+            self.ensure_terminal_artifacts(state)
         }
     }
 
@@ -164,7 +165,7 @@ impl Engine {
             };
         })?;
         if state.status.is_terminal() {
-            self.ensure_report(state)
+            self.ensure_terminal_artifacts(state)
         } else {
             Ok(state)
         }
@@ -176,7 +177,7 @@ impl Engine {
             script_path: self.store.script_path(run_id),
             state_path: self.store.state_path(run_id),
             journal_path: self.store.journal_path(run_id),
-            report_path: self.store.report_path(run_id),
+            run_summary_path: self.store.run_summary_path(run_id),
         })
     }
 
@@ -188,12 +189,13 @@ impl Engine {
             state.result = None;
             state.error = None;
             state.report = None;
+            state.run_summary = None;
         })?;
         if self.store.cancel_requested(run_id) {
             let state = self.store.update_state(run_id, |state| {
                 state.status = RunStatus::Cancelled;
             })?;
-            return self.ensure_report(state);
+            return self.ensure_terminal_artifacts(state);
         }
         let source = self.store.load_script(run_id)?;
         let runtime = Arc::new(RuntimeHost {
@@ -210,7 +212,7 @@ impl Engine {
                 state.status = RunStatus::Cancelled;
                 state.active.clear();
             })?;
-            return self.ensure_report(state);
+            return self.ensure_terminal_artifacts(state);
         }
         if self.store.pause_requested(run_id) {
             return self.store.update_state(run_id, |state| {
@@ -222,40 +224,65 @@ impl Engine {
             return Ok(current);
         }
         let state = match result {
-            Ok(value) => self.store.update_state(run_id, |state| {
-                state.status = RunStatus::Succeeded;
-                state.result = Some(value);
-                state.error = None;
-                state.active.clear();
-            }),
+            Ok(value) => match delivery_report(&value) {
+                Ok(report) => self.store.update_state(run_id, |state| {
+                    state.status = RunStatus::Succeeded;
+                    state.result = Some(value);
+                    state.error = None;
+                    state.report = report;
+                    state.active.clear();
+                }),
+                Err(error) => self.store.update_state(run_id, |state| {
+                    state.status = RunStatus::Failed;
+                    state.result = Some(value);
+                    state.error = Some(error.to_string());
+                    state.report = None;
+                    state.active.clear();
+                }),
+            },
             Err(error) => self.store.update_state(run_id, |state| {
                 state.status = RunStatus::Failed;
                 state.error = Some(error.to_string());
                 state.active.clear();
             }),
         }?;
-        self.ensure_report(state)
+        self.ensure_terminal_artifacts(state)
     }
 
-    fn ensure_report(&self, state: RunState) -> Result<RunState, WorkflowError> {
+    fn ensure_terminal_artifacts(&self, state: RunState) -> Result<RunState, WorkflowError> {
         if !state.status.is_terminal() {
             return Ok(state);
         }
-        let path = match report::write(&self.store, &state) {
+        let report = if state.status == RunStatus::Succeeded {
+            match state.result.as_ref().map(delivery_report).transpose() {
+                Ok(report) => report.flatten(),
+                Err(error) => {
+                    return self.store.update_state(&state.run_id, |state| {
+                        state.status = RunStatus::Failed;
+                        state.error = Some(error.to_string());
+                        state.report = None;
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let path = match run_summary::write(&self.store, &state) {
             Ok(path) => path,
             Err(error) => {
                 return self.store.update_state(&state.run_id, |state| {
                     state.status = RunStatus::Failed;
-                    state.error = Some(format!("report generation failed: {error}"));
-                    state.report = None;
+                    state.error = Some(format!("run summary generation failed: {error}"));
+                    state.run_summary = None;
                 });
             }
         };
-        if state.report.as_ref() == Some(&path) {
+        if state.report == report && state.run_summary.as_ref() == Some(&path) {
             return Ok(state);
         }
         self.store.update_state(&state.run_id, |state| {
-            state.report = Some(path);
+            state.report = report;
+            state.run_summary = Some(path);
         })
     }
 }
@@ -266,7 +293,36 @@ pub struct Inspection {
     pub script_path: PathBuf,
     pub state_path: PathBuf,
     pub journal_path: PathBuf,
-    pub report_path: PathBuf,
+    pub run_summary_path: PathBuf,
+}
+
+fn delivery_report(value: &Value) -> Result<Option<PathBuf>, WorkflowError> {
+    let Some(raw) = value.get("report") else {
+        return Ok(None);
+    };
+    let path = raw.as_str().map(PathBuf::from).ok_or_else(|| {
+        WorkflowError::InvalidOperation(
+            "delivery report must be an absolute path string".to_owned(),
+        )
+    })?;
+    if !path.is_absolute() {
+        return Err(WorkflowError::InvalidOperation(
+            "delivery report path must be absolute".to_owned(),
+        ));
+    }
+    let metadata = std::fs::metadata(&path).map_err(|_| {
+        WorkflowError::InvalidOperation(format!(
+            "delivery report does not exist: {}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(WorkflowError::InvalidOperation(format!(
+            "delivery report is not a non-empty file: {}",
+            path.display()
+        )));
+    }
+    Ok(Some(path))
 }
 
 fn validate_script(script: &str) -> Result<(), WorkflowError> {
