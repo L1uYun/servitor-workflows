@@ -320,24 +320,14 @@ async fn host_supersede(
         (js_string_arg(args, 0, context)?, host)
     };
     let options: SupersedeOptions = serde_json::from_str(&options_json).map_err(native_error)?;
-    if options.reason.trim().is_empty() {
-        return Err(JsNativeError::error()
-            .with_message("supersede reason is required")
-            .into());
-    }
     host.runtime
         .store
-        .update_state(&host.runtime.run_id, |state| {
-            state.status = RunStatus::Superseded;
-            state.active.clear();
-            state.waiting_gate = None;
-            state.supersede = Some(crate::model::SupersedeInfo {
-                reason: options.reason.clone(),
-                evidence: options.evidence.clone(),
-                new_contract: options.new_contract.clone(),
-                decided_at: chrono::Utc::now(),
-            });
-        })
+        .mark_superseded(
+            &host.runtime.run_id,
+            options.reason.clone(),
+            options.evidence.clone(),
+            options.new_contract.clone(),
+        )
         .map_err(native_error)?;
     Err(JsNativeError::error()
         .with_message(format!("workflow superseded: {}", options.reason))

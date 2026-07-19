@@ -1,6 +1,6 @@
 use crate::agent::Transport;
 use crate::error::WorkflowError;
-use crate::model::{GateDecision, PublicRun, RunState, RunStatus, SupersedeInfo};
+use crate::model::{GateDecision, PublicRun, RunState, RunStatus};
 use crate::run_summary;
 use crate::scheduler::{RuntimeHost, Scheduler};
 use crate::script;
@@ -179,23 +179,9 @@ impl Engine {
         evidence: Option<String>,
         new_contract: Option<String>,
     ) -> Result<RunState, WorkflowError> {
-        if reason.trim().is_empty() {
-            return Err(WorkflowError::InvalidOperation(
-                "supersede reason is required".to_owned(),
-            ));
-        }
-        self.store.request_cancel(run_id)?;
-        let state = self.store.update_state(run_id, |state| {
-            state.status = RunStatus::Superseded;
-            state.active.clear();
-            state.waiting_gate = None;
-            state.supersede = Some(SupersedeInfo {
-                reason: reason.clone(),
-                evidence,
-                new_contract,
-                decided_at: Utc::now(),
-            });
-        })?;
+        let state = self
+            .store
+            .mark_superseded(run_id, reason, evidence, new_contract)?;
         self.ensure_terminal_artifacts(state)
     }
 
@@ -235,6 +221,9 @@ impl Engine {
         });
         let result = script::execute(runtime, &source, &initial.args, initial.max_calls);
         let current = self.store.load_state(run_id)?;
+        if current.status == RunStatus::Superseded {
+            return self.ensure_terminal_artifacts(current);
+        }
         if self.store.cancel_requested(run_id) {
             let state = self.store.update_state(run_id, |state| {
                 state.status = RunStatus::Cancelled;
@@ -250,9 +239,6 @@ impl Engine {
         }
         if current.status == RunStatus::WaitingHuman {
             return Ok(current);
-        }
-        if current.status == RunStatus::Superseded {
-            return self.ensure_terminal_artifacts(current);
         }
         let state = match result {
             Ok(value) => match delivery_report(&value) {
@@ -271,16 +257,11 @@ impl Engine {
                     state.active.clear();
                 }),
             },
-            Err(error) => {
-                if current.status == RunStatus::Superseded {
-                    return self.ensure_terminal_artifacts(current);
-                }
-                self.store.update_state(run_id, |state| {
-                    state.status = RunStatus::Failed;
-                    state.error = Some(error.to_string());
-                    state.active.clear();
-                })
-            }
+            Err(error) => self.store.update_state(run_id, |state| {
+                state.status = RunStatus::Failed;
+                state.error = Some(error.to_string());
+                state.active.clear();
+            }),
         }?;
         self.ensure_terminal_artifacts(state)
     }

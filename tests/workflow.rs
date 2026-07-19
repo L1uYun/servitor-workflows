@@ -629,3 +629,25 @@ fn supersede_cli_records_state() {
     assert_eq!(info.evidence.as_deref(), Some("ev.md"));
 }
 
+#[test]
+fn supersede_wins_over_late_ok_return() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "supersede-late-ok.js",
+        r#"
+        phase("work");
+        try {
+          await supersede({ reason: "redirect" });
+        } catch (_) {}
+        return { late: "ok" };
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), transport)
+        .start(&path, Value::Null, 1, 10)
+        .expect("workflow");
+    assert_eq!(state.status, RunStatus::Superseded);
+    assert!(state.supersede.is_some());
+}
+

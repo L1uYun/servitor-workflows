@@ -1,5 +1,5 @@
 use crate::error::WorkflowError;
-use crate::model::{JournalEntry, RunState};
+use crate::model::{JournalEntry, RunState, RunStatus};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -154,6 +154,32 @@ impl WorkflowStore {
             index.insert(entry.key.clone(), entry);
         }
         Ok(index)
+    }
+
+    pub fn mark_superseded(
+        &self,
+        run_id: &str,
+        reason: String,
+        evidence: Option<String>,
+        new_contract: Option<String>,
+    ) -> Result<RunState, WorkflowError> {
+        if reason.trim().is_empty() {
+            return Err(WorkflowError::InvalidOperation(
+                "supersede reason is required".to_owned(),
+            ));
+        }
+        self.request_cancel(run_id)?;
+        self.update_state(run_id, |state| {
+            state.status = RunStatus::Superseded;
+            state.active.clear();
+            state.waiting_gate = None;
+            state.supersede = Some(crate::model::SupersedeInfo {
+                reason,
+                evidence,
+                new_contract,
+                decided_at: chrono::Utc::now(),
+            });
+        })
     }
 
     pub fn request_pause(&self, run_id: &str) -> Result<(), WorkflowError> {
