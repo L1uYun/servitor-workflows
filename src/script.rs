@@ -23,6 +23,8 @@ globalThis.command = async (program, argv = [], options = {}) =>
   JSON.parse(await __command(String(program), JSON.stringify(argv), JSON.stringify(options)));
 globalThis.gate = async (question, options = {}) =>
   JSON.parse(await __gate(String(question), JSON.stringify(options)));
+globalThis.supersede = async options =>
+  JSON.parse(await __supersede(JSON.stringify(options || {})));
 globalThis.phase = name => __phase(String(name));
 globalThis.parallel = promises => Promise.all(promises);
 globalThis.pipeline = (items, worker) => Promise.all(Array.from(items, worker));
@@ -125,6 +127,13 @@ fn execute_vm(
             js_string!("__gate"),
             2,
             NativeFunction::from_async_fn(host_gate),
+        )
+        .map_err(js_error)?;
+    context
+        .register_global_builtin_callable(
+            js_string!("__supersede"),
+            1,
+            NativeFunction::from_async_fn(host_supersede),
         )
         .map_err(js_error)?;
     context
@@ -284,6 +293,54 @@ async fn host_gate(
         .map_err(native_error)?;
     Err(JsNativeError::error()
         .with_message("workflow is waiting for human input")
+        .into())
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SupersedeOptions {
+    reason: String,
+    #[serde(default)]
+    evidence: Option<String>,
+    #[serde(default)]
+    new_contract: Option<String>,
+}
+
+async fn host_supersede(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &RefCell<&mut Context>,
+) -> JsResult<JsValue> {
+    let (options_json, host) = {
+        let context = &mut context.borrow_mut();
+        let host = context
+            .get_data::<HostState>()
+            .cloned()
+            .ok_or_else(|| JsNativeError::error().with_message("workflow host is missing"))?;
+        (js_string_arg(args, 0, context)?, host)
+    };
+    let options: SupersedeOptions = serde_json::from_str(&options_json).map_err(native_error)?;
+    if options.reason.trim().is_empty() {
+        return Err(JsNativeError::error()
+            .with_message("supersede reason is required")
+            .into());
+    }
+    host.runtime
+        .store
+        .update_state(&host.runtime.run_id, |state| {
+            state.status = RunStatus::Superseded;
+            state.active.clear();
+            state.waiting_gate = None;
+            state.supersede = Some(crate::model::SupersedeInfo {
+                reason: options.reason.clone(),
+                evidence: options.evidence.clone(),
+                new_contract: options.new_contract.clone(),
+                decided_at: chrono::Utc::now(),
+            });
+        })
+        .map_err(native_error)?;
+    Err(JsNativeError::error()
+        .with_message(format!("workflow superseded: {}", options.reason))
         .into())
 }
 

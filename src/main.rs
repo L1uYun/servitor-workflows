@@ -57,6 +57,15 @@ enum Command {
     Cancel {
         run_id: String,
     },
+    Supersede {
+        run_id: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        evidence: Option<String>,
+        #[arg(long)]
+        new_contract: Option<String>,
+    },
     Inspect {
         run_id: String,
     },
@@ -84,6 +93,14 @@ fn main() {
             .and_then(public_value),
         Command::Pause { run_id } => engine.pause(&run_id).and_then(public_value),
         Command::Cancel { run_id } => engine.cancel(&run_id).and_then(public_value),
+        Command::Supersede {
+            run_id,
+            reason,
+            evidence,
+            new_contract,
+        } => engine
+            .supersede(&run_id, reason, evidence, new_contract)
+            .and_then(public_value),
         Command::Inspect { run_id } => engine.inspect(&run_id).and_then(to_value),
     };
     let (value, code) = match result {

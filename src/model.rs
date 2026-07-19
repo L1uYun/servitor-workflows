@@ -15,11 +15,12 @@ pub enum RunStatus {
     Succeeded,
     Failed,
     Cancelled,
+    Superseded,
 }
 
 impl RunStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled | Self::Superseded)
     }
 }
 
@@ -44,6 +45,8 @@ pub struct RunState {
     #[serde(default)]
     pub waiting_gate: Option<GateRequest>,
     #[serde(default)]
+    pub supersede: Option<SupersedeInfo>,
+    #[serde(default)]
     pub decisions: BTreeMap<String, GateDecision>,
     #[serde(default)]
     pub result: Option<Value>,
@@ -53,6 +56,14 @@ pub struct RunState {
     pub report: Option<PathBuf>,
     #[serde(default)]
     pub run_summary: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupersedeInfo {
+    pub reason: String,
+    pub evidence: Option<String>,
+    pub new_contract: Option<String>,
+    pub decided_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +130,8 @@ pub struct PublicRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersede: Option<SupersedeInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -134,6 +147,7 @@ impl From<&RunState> for PublicRun {
             phase: state.phase.clone(),
             active: state.active.clone(),
             gate: state.waiting_gate.clone(),
+            supersede: state.supersede.clone(),
             result: state.result.clone(),
             error: state.error.clone(),
             report: state.report.clone(),

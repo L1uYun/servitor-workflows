@@ -135,6 +135,7 @@ fn status_name(status: &RunStatus) -> &'static str {
         RunStatus::Succeeded => "succeeded",
         RunStatus::Failed => "failed",
         RunStatus::Cancelled => "cancelled",
+        RunStatus::Superseded => "superseded",
     }
 }
 

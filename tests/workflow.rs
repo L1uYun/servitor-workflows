@@ -571,3 +571,61 @@ fn recovers_fenced_json_from_model_prose() {
     assert_eq!(transport.count(), 1);
 }
 
+#[test]
+fn supersede_marks_terminal_and_records_contract() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "supersede.js",
+        r#"
+        phase("work");
+        const r = await command("rustc", ["--version"], { timeoutSeconds: 30 });
+        if (r.exitCode === 0) {
+          await supersede({
+            reason: "evidence shows direction changed",
+            evidence: "results.json",
+            newContract: "use non-oracle gold",
+          });
+        }
+        return { unreachable: true };
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), transport)
+        .start(&path, Value::Null, 1, 10)
+        .expect("supersede workflow");
+    assert_eq!(state.status, RunStatus::Superseded);
+    let info = state.supersede.expect("supersede info");
+    assert_eq!(info.reason, "evidence shows direction changed");
+    assert_eq!(info.evidence.as_deref(), Some("results.json"));
+    assert_eq!(info.new_contract.as_deref(), Some("use non-oracle gold"));
+}
+
+#[test]
+fn supersede_cli_records_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "supersede-cli.js",
+        r#"
+        phase("work");
+        await new Promise(() => {});
+    "#,
+    );
+    let engine = engine(&temp.path().join("state"), transport);
+    let state = engine.start(&path, Value::Null, 1, 10).expect("start");
+    let after = engine
+        .supersede(
+            &state.run_id,
+            "manual redirect".to_owned(),
+            Some("ev.md".to_owned()),
+            None,
+        )
+        .expect("supersede");
+    assert_eq!(after.status, RunStatus::Superseded);
+    let info = after.supersede.expect("info");
+    assert_eq!(info.reason, "manual redirect");
+    assert_eq!(info.evidence.as_deref(), Some("ev.md"));
+}
+
