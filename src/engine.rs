@@ -105,10 +105,11 @@ impl Engine {
         run_id: &str,
         approved: bool,
         reason: String,
+        value: Option<Value>,
     ) -> Result<RunState, WorkflowError> {
-        if reason.trim().is_empty() {
+        if reason.trim().is_empty() && value.is_none() {
             return Err(WorkflowError::InvalidOperation(
-                "decision reason is required".to_owned(),
+                "decision reason or value is required".to_owned(),
             ));
         }
         let state = self.store.load_state(run_id)?;
@@ -127,6 +128,7 @@ impl Engine {
                     approved,
                     reason: reason.clone(),
                     decided_at: Utc::now(),
+                    value,
                 },
             );
             state.waiting_gate = None;

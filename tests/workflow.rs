@@ -206,7 +206,7 @@ fn gate_replay_uses_cached_calls() {
     assert_eq!(first.status, RunStatus::WaitingHuman);
     assert_eq!(transport.count(), 1);
     let completed = engine(&root, Arc::clone(&transport))
-        .approve(&first.run_id, true, "evidence accepted".to_owned())
+        .approve(&first.run_id, true, "evidence accepted".to_owned(), None)
         .expect("approve");
     assert_eq!(completed.status, RunStatus::Succeeded);
     assert_eq!(transport.count(), 2, "completed call was submitted again");
@@ -649,5 +649,94 @@ fn supersede_wins_over_late_ok_return() {
         .expect("workflow");
     assert_eq!(state.status, RunStatus::Superseded);
     assert!(state.supersede.is_some());
+}
+
+#[test]
+fn retry_succeeds_after_transient_failure() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    // attempt 1 fails, attempt 2 succeeds (rustc --version always succeeds,
+    // so drive failure via a bad flag on attempt 1 only)
+    let path = script(
+        &temp,
+        "retry.js",
+        r#"
+        const r = await retry(async (attempt) => {
+          if (attempt === 1) {
+            const bad = await command("rustc", ["--nope-xyz"], { timeoutSeconds: 30 });
+            if (bad.exitCode !== 0) { throw new Error("transient: " + bad.exitCode); }
+          }
+          return await command("rustc", ["--version"], { timeoutSeconds: 30 });
+        }, { maxAttempts: 3, delayMs: 1 });
+        return { exitCode: r.exitCode };
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), transport)
+        .start(&path, Value::Null, 1, 10)
+        .expect("retry workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(state.result, Some(json!({"exitCode": 0})));
+}
+
+#[test]
+fn retry_fail_fast_on_non_retryable() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "retry-nr.js",
+        r#"
+        let calls = 0;
+        try {
+          await retry(async () => {
+            calls++;
+            throw new Error("validation: bad input");
+          }, { maxAttempts: 3, delayMs: 1, nonRetryable: ["validation"] });
+        } catch (e) {
+          return { calls, msg: String(e) };
+        }
+        return { calls, msg: "no-throw" };
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), transport)
+        .start(&path, Value::Null, 1, 10)
+        .expect("workflow");
+    assert_eq!(state.status, RunStatus::Succeeded);
+    // fail-fast: only 1 attempt despite maxAttempts=3
+    assert_eq!(state.result.as_ref().unwrap()["calls"], json!(1));
+}
+
+#[test]
+fn gate_returns_injected_value() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "gate-value.js",
+        r#"
+        const fixed = await gate("give the correct contractPath", {
+          expect: "value",
+          current: { contractPath: "old.md" },
+          hint: "should be under surveys/",
+        });
+        return { path: fixed.value ? fixed.value.contractPath : fixed.contractPath };
+    "#,
+    );
+    let engine = engine(&temp.path().join("state"), transport);
+    let waiting = engine.start(&path, Value::Null, 1, 10).expect("start");
+    assert_eq!(waiting.status, RunStatus::WaitingHuman);
+    let gate_req = waiting.waiting_gate.expect("gate");
+    assert_eq!(gate_req.expect.as_deref(), Some("value"));
+    // inject corrected value via approve --value channel
+    let resumed = engine
+        .approve(
+            &waiting.run_id,
+            true,
+            "corrected".to_owned(),
+            Some(json!({"contractPath": "surveys/new.md"})),
+        )
+        .expect("approve with value");
+    assert_eq!(resumed.status, RunStatus::Succeeded, "{:?}", resumed.error);
+    assert_eq!(resumed.result, Some(json!({"path": "surveys/new.md"})));
 }
 

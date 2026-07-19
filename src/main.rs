@@ -45,6 +45,8 @@ enum Command {
         run_id: String,
         #[arg(long)]
         reason: String,
+        #[arg(long)]
+        value: Option<String>,
     },
     Reject {
         run_id: String,
@@ -85,11 +87,27 @@ fn main() {
             .and_then(public_value),
         Command::Resume { run_id } => engine.resume(&run_id).and_then(public_value),
         Command::Get { run_id } => engine.get(&run_id).and_then(to_value),
-        Command::Approve { run_id, reason } => {
-            engine.approve(&run_id, true, reason).and_then(public_value)
+        Command::Approve {
+            run_id,
+            reason,
+            value,
+        } => {
+            let parsed = match value {
+                Some(raw) => match serde_json::from_str(&raw) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!("invalid --value JSON: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                None => None,
+            };
+            engine
+                .approve(&run_id, true, reason, parsed)
+                .and_then(public_value)
         }
         Command::Reject { run_id, reason } => engine
-            .approve(&run_id, false, reason)
+            .approve(&run_id, false, reason, None)
             .and_then(public_value),
         Command::Pause { run_id } => engine.pause(&run_id).and_then(public_value),
         Command::Cancel { run_id } => engine.cancel(&run_id).and_then(public_value),

@@ -28,6 +28,36 @@ globalThis.supersede = async options =>
 globalThis.phase = name => __phase(String(name));
 globalThis.parallel = promises => Promise.all(promises);
 globalThis.pipeline = (items, worker) => Promise.all(Array.from(items, worker));
+globalThis.retry = async (fn, options = {}) => {
+  const maxAttempts = options.maxAttempts ?? 3;
+  const delayMs = options.delayMs ?? 1000;
+  const backoff = options.backoff ?? 1;
+  const wallMs = options.wallTimeSeconds != null ? options.wallTimeSeconds * 1000 : null;
+  const nonRetryable = options.nonRetryable ?? [];
+  const started = Date.now();
+  let lastError;
+  let delay = delayMs;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (wallMs != null && Date.now() - started >= wallMs) {
+      throw new Error(`retry wall-time exceeded after ${attempt - 1} attempts`);
+    }
+    try {
+      return await fn(attempt);
+    } catch (error) {
+      lastError = error;
+      const text = String(error && error.message ? error.message : error);
+      if (nonRetryable.some(marker => text.includes(marker))) {
+        throw error;
+      }
+      if (attempt < maxAttempts) {
+        const until = Date.now() + delay;
+        while (Date.now() < until) {}
+        delay = Math.round(delay * backoff);
+      }
+    }
+  }
+  throw lastError;
+};
 "#;
 const VM_STACK_SIZE: usize = 8 * 1024 * 1024;
 
@@ -70,10 +100,16 @@ impl HostState {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GateOptions {
     #[serde(default)]
     label: Option<String>,
+    #[serde(default)]
+    expect: Option<String>,
+    #[serde(default)]
+    current: Option<Value>,
+    #[serde(default)]
+    hint: Option<String>,
 }
 
 pub fn execute(
@@ -266,7 +302,7 @@ async fn host_gate(
         )
     };
     let options: GateOptions = serde_json::from_str(&options_json).map_err(native_error)?;
-    let label = options.label.unwrap_or_else(|| question.clone());
+    let label = options.label.clone().unwrap_or_else(|| question.clone());
     let input = json!({"question": question, "label": label});
     let key = host.key("gate", &input).map_err(native_error)?;
     let state = host
@@ -275,7 +311,11 @@ async fn host_gate(
         .load_state(&host.runtime.run_id)
         .map_err(native_error)?;
     if let Some(decision) = state.decisions.get(&key) {
-        let result = json!({"approved": decision.approved, "reason": decision.reason});
+        let result = json!({
+            "approved": decision.approved,
+            "reason": decision.reason,
+            "value": decision.value,
+        });
         return Ok(JsValue::from(js_string!(
             serde_json::to_string(&result).map_err(native_error)?
         )));
@@ -288,6 +328,9 @@ async fn host_gate(
                 key,
                 label,
                 question,
+                expect: options.expect.clone(),
+                current: options.current.clone(),
+                hint: options.hint.clone(),
             });
         })
         .map_err(native_error)?;

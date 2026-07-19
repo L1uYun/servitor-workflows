@@ -78,13 +78,21 @@ pub struct GateRequest {
     pub key: String,
     pub label: String,
     pub question: String,
+    #[serde(default)]
+    pub expect: Option<String>,
+    #[serde(default)]
+    pub current: Option<Value>,
+    #[serde(default)]
+    pub hint: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct GateDecision {
     pub approved: bool,
     pub reason: String,
     pub decided_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
