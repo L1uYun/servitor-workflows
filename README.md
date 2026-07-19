@@ -55,6 +55,8 @@ gate(question, options?)
 phase(name)
 parallel(promises)
 pipeline(items, worker)
+retry(fn, options?)
+supersede(options)
 ```
 
 JavaScript has no direct filesystem or process API. External work crosses the
@@ -121,16 +123,59 @@ re-read console output or add a "read-results" pass. `stdout`/`stderr` are
 bounded tails, not business conclusions — a worker that must hand back a machine
 verdict should write an explicit evidence JSON at an agreed path instead.
 
+## Control flow primitives
+
+`retry(fn, options?)` — bounded retry around any `agent`/`command` thunk. Each
+attempt is a separate journaled call (attempt number is part of the journal key),
+so deterministic replay still holds: a succeeded attempt is skipped on resume, a
+failed one re-runs. Options:
+
+```javascript
+await retry(() => command("pwsh", ["-File", "flaky.ps1"]), {
+  maxAttempts: 3,          // fixed attempt cap
+  delayMs: 2000,           // first backoff delay
+  backoff: 2,              // multiplier (1 = fixed interval)
+  wallTimeSeconds: 60,     // total elapsed cap (SLA), stops even if attempts remain
+  nonRetryable: ["validation"], // fail fast when error text matches; no retry
+});
+```
+
+`gate(question, options?)` — pause for a human decision. Beyond yes/no, a gate
+can carry an injected value for the human-corrects-input case:
+
+```javascript
+const fixed = await gate("give the correct contractPath", {
+  expect: "value",                    // ask for a JSON value, not a yes/no
+  current: { contractPath: "old.md" },
+  hint: "should be under surveys/",
+});
+await command("pwsh", ["-File", "check.ps1", fixed.value.contractPath]);
+```
+
+The run parks at `waiting_human` with `expect`/`current`/`hint` in
+`waiting_gate`. Collecting the value (a chat answer, a local decision page) is
+the controller's job; inject it with `approve RUN_ID --reason TEXT --value
+'{"contractPath":"surveys/new.md"}'`. `get` returns the stored value.
+
+`supersede(options)` — mark the whole run terminal as `superseded` (distinct
+from `failed`/`cancelled`) when the direction itself is wrong, recording
+`{reason, evidence?, newContract?}` into state. The controller reads `get` →
+`status=superseded`, writes the supersede-chain note, and starts a new run whose
+readiness gate skips already-produced artifacts. This is continue-as-new, never
+in-place script edits. CLI equivalent: `supersede RUN_ID --reason TEXT
+[--evidence PATH] [--new-contract TEXT]`.
+
 ## CLI
 
 ```text
 servitor-workflows run WORKFLOW.js [--args JSON] [--max-parallel N] [--max-calls N]
 servitor-workflows resume RUN_ID
 servitor-workflows get RUN_ID
-servitor-workflows approve RUN_ID --reason TEXT
+servitor-workflows approve RUN_ID --reason TEXT [--value JSON]
 servitor-workflows reject RUN_ID --reason TEXT
 servitor-workflows pause RUN_ID
 servitor-workflows cancel RUN_ID
+servitor-workflows supersede RUN_ID --reason TEXT [--evidence PATH] [--new-contract TEXT]
 servitor-workflows inspect RUN_ID
 ```
 
