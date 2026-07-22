@@ -7,6 +7,8 @@
 //! 3. scan string-aware balanced `{...}` / `[...]` spans
 //! 4. parse candidates, with a single trailing-comma repair pass
 //! 5. optionally require object or array when the contract says so
+//! 6. when a schema is provided, select among candidates by schema validity
+//!    (last valid wins — final-answer convention; no provider-specific branches)
 
 use serde_json::Value;
 
@@ -17,13 +19,20 @@ pub enum Expect {
     Array,
 }
 
-pub fn extract_json_value(text: &str, expect: Expect) -> Result<Value, String> {
+/// Enumerate parseable JSON values in discovery order (deduped by text).
+///
+/// Discovery order: whole cleaned text, fenced blocks (+ nested spans), then
+/// document-order balanced spans. Shape filtering uses `expect` only.
+pub fn extract_json_values(text: &str, expect: Expect) -> Result<Vec<Value>, String> {
     if text.trim().is_empty() {
         return Err("empty agent output".to_owned());
     }
 
     let cleaned = strip_reasoning(text);
     let mut candidates: Vec<String> = Vec::new();
+
+    // Whole-text first so a pure JSON body still wins when it is the only candidate.
+    candidates.push(cleaned.trim().to_owned());
 
     let fences = fenced_blocks(&cleaned);
     candidates.extend(fences.iter().cloned());
@@ -32,23 +41,96 @@ pub fn extract_json_value(text: &str, expect: Expect) -> Result<Value, String> {
     }
     candidates.extend(balanced_spans(&cleaned));
 
-    // Direct whole-text attempt first among equals if it already looks clean.
-    candidates.insert(0, cleaned.trim().to_owned());
-
     let mut last_error = "no JSON value could be extracted".to_owned();
     let mut seen = std::collections::BTreeSet::new();
+    let mut values = Vec::new();
     for candidate in candidates {
         let key = candidate.trim().to_owned();
         if key.is_empty() || !seen.insert(key.clone()) {
             continue;
         }
         match parse_candidate(&key) {
-            Ok(value) if matches_expect(&value, expect) => return Ok(value),
+            Ok(value) if matches_expect(&value, expect) => values.push(value),
             Ok(_) => last_error = format!("JSON found but expected {expect:?}"),
             Err(error) => last_error = error,
         }
     }
-    Err(last_error)
+    if values.is_empty() {
+        Err(last_error)
+    } else {
+        Ok(values)
+    }
+}
+
+/// First shape-matching JSON value (no schema). Prefer
+/// [`extract_json_value_for_schema`] when a schema contract exists.
+pub fn extract_json_value(text: &str, expect: Expect) -> Result<Value, String> {
+    extract_json_values(text, expect).map(|mut values| values.remove(0))
+}
+
+/// Schema-aware extraction: schema is a **selection** criterion among candidates,
+/// not a post-filter on the first shape match.
+///
+/// General rule (model-agnostic): among shape-matching candidates, keep those
+/// that validate against `schema`; if several remain, take the **last** (final
+/// answer convention for free-form agent text). No provider-specific branches.
+pub fn extract_json_value_for_schema(text: &str, schema: &Value) -> Result<Value, String> {
+    let expect = expect_from_schema(Some(schema));
+    let candidates = extract_json_values(text, expect)?;
+    let mut last_error = "no schema-valid JSON candidate".to_owned();
+    let mut last_ok: Option<Value> = None;
+    for value in candidates {
+        match validate_value_against_schema(&value, schema, "$") {
+            Ok(()) => last_ok = Some(value),
+            Err(error) => last_error = error,
+        }
+    }
+    last_ok.ok_or(last_error)
+}
+
+/// Minimal JSON Schema check used for candidate selection (type/required/properties/items).
+pub fn validate_value_against_schema(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
+    if let Some(expected) = schema.get("type").and_then(Value::as_str) {
+        let matches = match expected {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "number" => value.is_number(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            other => return Err(format!("unsupported schema type {other}")),
+        };
+        if !matches {
+            return Err(format!("{path} must be {expected}"));
+        }
+    }
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("{path} must be an object"))?;
+        for name in required.iter().filter_map(Value::as_str) {
+            if !object.contains_key(name) {
+                return Err(format!("{path}.{name} is required"));
+            }
+        }
+    }
+    if let (Some(object), Some(properties)) = (
+        value.as_object(),
+        schema.get("properties").and_then(Value::as_object),
+    ) {
+        for (name, child_schema) in properties {
+            if let Some(child) = object.get(name) {
+                validate_value_against_schema(child, child_schema, &format!("{path}.{name}"))?;
+            }
+        }
+    }
+    if let (Some(items), Some(item_schema)) = (value.as_array(), schema.get("items")) {
+        for (index, item) in items.iter().enumerate() {
+            validate_value_against_schema(item, item_schema, &format!("{path}[{index}]"))?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_candidate(candidate: &str) -> Result<Value, String> {
@@ -314,5 +396,50 @@ mod tests {
         let text = r#"[1,2,3]"#;
         let err = extract_json_value(text, Expect::Object).unwrap_err();
         assert!(err.contains("expected Object"));
+    }
+
+    #[test]
+    fn schema_selects_last_valid_among_multiple_objects() {
+        // Intermediate protocol/tool JSON is common in free-form agent transcripts.
+        // Schema must select among candidates, not fail on the first object.
+        let text = r#"progress {"type":"task_update","id":1}
+still working {"status":"partial"}
+{"summary":"done","evidence":"D:/tmp/evidence.json"}
+"#;
+        let schema = json!({
+            "type": "object",
+            "required": ["summary"],
+            "properties": {
+                "summary": {"type": "string"},
+                "evidence": {"type": "string"}
+            }
+        });
+        let value = extract_json_value_for_schema(text, &schema).expect("schema extract");
+        assert_eq!(value["summary"], "done");
+        assert_eq!(value["evidence"], "D:/tmp/evidence.json");
+    }
+
+    #[test]
+    fn schema_rejects_when_no_candidate_valid() {
+        let text = r#"{"type":"task_update","id":1} {"status":"partial"}"#;
+        let schema = json!({
+            "type": "object",
+            "required": ["summary"],
+            "properties": { "summary": {"type": "string"} }
+        });
+        let err = extract_json_value_for_schema(text, &schema).unwrap_err();
+        assert!(err.contains("summary") || err.contains("required"), "err={err}");
+    }
+
+    #[test]
+    fn schema_prefers_last_when_multiple_valid() {
+        let text = r#"{"summary":"first"} trailing {"summary":"second","evidence":"e"}"#;
+        let schema = json!({
+            "type": "object",
+            "required": ["summary"],
+            "properties": { "summary": {"type": "string"} }
+        });
+        let value = extract_json_value_for_schema(text, &schema).expect("schema extract");
+        assert_eq!(value["summary"], "second");
     }
 }

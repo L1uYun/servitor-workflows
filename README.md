@@ -80,8 +80,8 @@ typed `agent`, `command`, or `gate` boundary.
 The default agent is `pi`.
 
 When an agent call requests structured output, the runtime extracts JSON from free-form model text by:
-strip reasoning wrappers → prefer fenced ```json blocks → scan balanced `{...}`/`[...]` spans → trailing-comma repair → optional object/array expectation from the schema. Pure whole-text JSON still works. The runtime does not set a token budget, retry a
-provider silently, or fall back to another provider.
+strip reasoning wrappers → collect candidates (whole text, fenced ```json, balanced `{...}`/`[...]` spans) → trailing-comma repair → shape filter from schema `type` → **schema-valid selection** (required/properties/items): if several candidates validate, take the **last** (final-answer convention). Schema is a selection criterion among candidates, not only a post-check on the first shape match. Pure whole-text JSON still works. The runtime does not set a token budget, retry a
+provider silently, or fall back to another provider. No provider-specific prose strippers.
 
 Structured output supports the deliberately small JSON Schema subset used by
 workflow contracts: `type`, `required`, `properties`, and `items`.

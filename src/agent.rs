@@ -1,4 +1,4 @@
-use crate::json_extract::{expect_from_schema, extract_json_value};
+use crate::json_extract::extract_json_value_for_schema;
 use crate::model::{CallKind, CallState, JournalEntry};
 use crate::scheduler::JobResult;
 use crate::store::WorkflowStore;
@@ -269,54 +269,10 @@ fn parse_output(text: &str, schema: Option<&Value>) -> JobResult {
     let Some(schema) = schema else {
         return Ok(Value::String(text.to_owned()));
     };
-    let value = extract_json_value(text, expect_from_schema(Some(schema)))
-        .map_err(|error| format!("agent output is not JSON: {error}"))?;
-    validate_schema(&value, schema, "$")?;
-    Ok(value)
-}
-
-fn validate_schema(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
-    if let Some(expected) = schema.get("type").and_then(Value::as_str) {
-        let matches = match expected {
-            "object" => value.is_object(),
-            "array" => value.is_array(),
-            "string" => value.is_string(),
-            "number" => value.is_number(),
-            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-            "boolean" => value.is_boolean(),
-            "null" => value.is_null(),
-            other => return Err(format!("unsupported schema type {other}")),
-        };
-        if !matches {
-            return Err(format!("{path} must be {expected}"));
-        }
-    }
-    if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        let object = value
-            .as_object()
-            .ok_or_else(|| format!("{path} must be an object"))?;
-        for name in required.iter().filter_map(Value::as_str) {
-            if !object.contains_key(name) {
-                return Err(format!("{path}.{name} is required"));
-            }
-        }
-    }
-    if let (Some(object), Some(properties)) = (
-        value.as_object(),
-        schema.get("properties").and_then(Value::as_object),
-    ) {
-        for (name, child_schema) in properties {
-            if let Some(child) = object.get(name) {
-                validate_schema(child, child_schema, &format!("{path}.{name}"))?;
-            }
-        }
-    }
-    if let (Some(items), Some(item_schema)) = (value.as_array(), schema.get("items")) {
-        for (index, item) in items.iter().enumerate() {
-            validate_schema(item, item_schema, &format!("{path}[{index}]"))?;
-        }
-    }
-    Ok(())
+    // Schema participates in candidate selection (last schema-valid value),
+    // not only as a post-check on the first shape match.
+    extract_json_value_for_schema(text, schema)
+        .map_err(|error| format!("agent output is not JSON: {error}"))
 }
 
 fn resolve_cwd(default: &Path, requested: Option<&Path>) -> PathBuf {
