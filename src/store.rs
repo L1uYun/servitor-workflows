@@ -92,6 +92,10 @@ impl WorkflowStore {
     }
 
     pub fn save_state(&self, state: &RunState) -> Result<(), WorkflowError> {
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("state write lock poisoned".to_owned()))?;
         let bytes = serde_json::to_vec_pretty(state)?;
         self.write(&self.state_path(&state.run_id), &bytes)
     }
@@ -192,6 +196,17 @@ impl WorkflowStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(source) => Err(WorkflowError::Write {
                 path: self.pause_path(run_id),
+                source,
+            }),
+        }
+    }
+
+    pub fn clear_cancel(&self, run_id: &str) -> Result<(), WorkflowError> {
+        match fs::remove_file(self.cancel_path(run_id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(WorkflowError::Write {
+                path: self.cancel_path(run_id),
                 source,
             }),
         }

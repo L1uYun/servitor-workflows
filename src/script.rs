@@ -50,8 +50,7 @@ globalThis.retry = async (fn, options = {}) => {
         throw error;
       }
       if (attempt < maxAttempts) {
-        const until = Date.now() + delay;
-        while (Date.now() < until) {}
+        await __sleep(delay);
         delay = Math.round(delay * backoff);
       }
     }
@@ -210,6 +209,13 @@ fn execute_vm(
             js_string!("__phase"),
             1,
             NativeFunction::from_fn_ptr(host_phase),
+        )
+        .map_err(js_error)?;
+    context
+        .register_global_builtin_callable(
+            js_string!("__sleep"),
+            1,
+            NativeFunction::from_fn_ptr(host_sleep),
         )
         .map_err(js_error)?;
     context
@@ -426,6 +432,23 @@ fn host_phase(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         .map_err(native_error)?;
     Ok(JsValue::undefined())
 }
+
+fn host_sleep(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let ms = args
+        .get_or_undefined(0)
+        .to_number(context)
+        .unwrap_or(0.0)
+        .max(0.0) as u64;
+    // Cap single sleep to 60s to avoid runaway host stalls from bad scripts.
+    let ms = ms.min(60_000);
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+    Ok(JsValue::undefined())
+}
+
 
 fn js_string_arg(args: &[JsValue], index: usize, context: &mut Context) -> JsResult<String> {
     Ok(args

@@ -278,13 +278,16 @@ impl Engine {
                 state.status = RunStatus::Cancelled;
                 state.active.clear();
             })?;
+            let _ = self.store.clear_cancel(run_id);
             return self.ensure_terminal_artifacts(state);
         }
         if self.store.pause_requested(run_id) {
-            return self.store.update_state(run_id, |state| {
+            let state = self.store.update_state(run_id, |state| {
                 state.status = RunStatus::Paused;
                 state.active.clear();
-            });
+            })?;
+            self.store.clear_pause(run_id)?;
+            return Ok(state);
         }
         if current.status == RunStatus::WaitingHuman {
             return Ok(current);

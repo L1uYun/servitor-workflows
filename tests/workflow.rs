@@ -449,6 +449,10 @@ fn pause_and_cancel_interrupt_active_calls() {
     ));
     let final_pause = runner.join().expect("join").expect("runner result");
     assert_eq!(final_pause.status, RunStatus::Paused);
+    assert!(
+        !root.join("runs").join(&run_id).join("pause.request").exists(),
+        "pause.request must be cleared after pause terminalizes"
+    );
 
     let second_root = temp.path().join("state-2");
     let runner_root = second_root.clone();
@@ -466,6 +470,14 @@ fn pause_and_cancel_interrupt_active_calls() {
     ));
     let final_cancel = runner.join().expect("join").expect("runner result");
     assert_eq!(final_cancel.status, RunStatus::Cancelled);
+    assert!(
+        !second_root
+            .join("runs")
+            .join(&second_id)
+            .join("cancel.request")
+            .exists(),
+        "cancel.request must be cleared after cancel terminalizes"
+    );
 }
 
 #[test]

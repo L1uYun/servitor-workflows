@@ -189,8 +189,7 @@ pub(crate) fn run(
         match record.state {
             ServitorState::Accepted | ServitorState::Running => thread::sleep(POLL_INTERVAL),
             ServitorState::Succeeded => {
-                let text = output_text(record.output.as_ref());
-                match parse_output(&text, options.schema.as_ref()) {
+                match materialize_output(record.output.as_ref(), options.schema.as_ref()) {
                     Ok(result) => {
                         append(
                             CallState::Succeeded,
@@ -246,11 +245,21 @@ fn try_recover_structured(
     if record.state != ServitorState::Succeeded {
         return Ok(None);
     }
-    let text = output_text(record.output.as_ref());
-    match parse_output(&text, schema) {
+    match materialize_output(record.output.as_ref(), schema) {
         Ok(value) => Ok(Some(value)),
         Err(_) => Ok(None),
     }
+}
+
+fn materialize_output(output: Option<&Output>, schema: Option<&Value>) -> JobResult {
+    if matches!(output, Some(Output::Image { .. })) && schema.is_some() {
+        return Err(
+            "agent produced image output but a JSON schema was requested; use text agent output"
+                .to_owned(),
+        );
+    }
+    let text = output_text(output);
+    parse_output(&text, schema)
 }
 
 fn output_text(output: Option<&Output>) -> String {
@@ -282,3 +291,31 @@ fn resolve_cwd(default: &Path, requested: Option<&Path>) -> PathBuf {
         None => default.to_path_buf(),
     }
 }
+
+#[cfg(test)]
+mod materialize_tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    #[test]
+    fn image_output_with_schema_is_rejected() {
+        let schema = json!({"type":"object"});
+        let output = Output::Image {
+            paths: vec![PathBuf::from("x.png")],
+        };
+        let err = materialize_output(Some(&output), Some(&schema)).unwrap_err();
+        assert!(err.contains("image output"), "{err}");
+    }
+
+    #[test]
+    fn text_json_with_schema_passes() {
+        let schema = json!({"type":"object","required":["ok"]});
+        let output = Output::Text {
+            text: r#"{"ok":true}"#.into(),
+        };
+        let value = materialize_output(Some(&output), Some(&schema)).unwrap();
+        assert_eq!(value["ok"], true);
+    }
+}
+
