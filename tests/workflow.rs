@@ -765,3 +765,37 @@ fn resume_does_not_rerun_superseded_run() {
         "resume must not re-execute superseded runs"
     );
 }
+
+#[test]
+fn max_calls_budget_persists_across_resume() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    // max_calls=1: first agent consumes budget; second must fail.
+    let path = script(
+        &temp,
+        "max-calls.js",
+        r#"
+        await agent("ONE");
+        await agent("TWO");
+        return { ok: true };
+    "#,
+    );
+    let engine = engine(&temp.path().join("state"), Arc::clone(&transport));
+    let failed = engine
+        .start(&path, Value::Null, 1, 1)
+        .expect("start with tiny max_calls");
+    assert_eq!(failed.status, RunStatus::Failed, "{:?}", failed.error);
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("max_calls"),
+        "{:?}",
+        failed.error
+    );
+    // Resume must not grant a fresh budget of 1 that lets TWO run.
+    let resumed = engine.resume(&failed.run_id).expect("resume");
+    assert_eq!(resumed.status, RunStatus::Failed, "{:?}", resumed.error);
+    assert_eq!(transport.count(), 1, "second agent must not be submitted");
+}

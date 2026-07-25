@@ -87,6 +87,18 @@ impl HostState {
         let occurrence = occurrences.entry(identity).or_default();
         let key = call_key(kind, input, *occurrence);
         *occurrence += 1;
+
+        // Replay of journaled keys is free. New keys consume the shared max_calls
+        // budget that already includes prior journal entries at VM start.
+        let journal = self
+            .runtime
+            .store
+            .journal_index(&self.runtime.run_id)
+            .map_err(|error| error.to_string())?;
+        if journal.contains_key(&key) {
+            return Ok(key);
+        }
+
         let mut calls = self
             .calls
             .lock()
@@ -138,10 +150,15 @@ fn execute_vm(
     max_calls: usize,
 ) -> Result<Value, WorkflowError> {
     let mut context = Context::default();
+    let journal_used = runtime
+        .store
+        .journal_index(&runtime.run_id)
+        .map(|index| index.len())
+        .unwrap_or(0);
     context.insert_data(HostState {
         runtime,
         occurrences: Arc::new(Mutex::new(BTreeMap::new())),
-        calls: Arc::new(Mutex::new(0)),
+        calls: Arc::new(Mutex::new(journal_used)),
         max_calls,
     });
     context

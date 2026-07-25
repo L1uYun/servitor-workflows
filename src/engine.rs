@@ -101,6 +101,49 @@ impl Engine {
         Ok(PublicRun::from(&self.store.load_state(run_id)?))
     }
 
+    pub fn list(
+        &self,
+        limit: usize,
+        status_filter: Option<&str>,
+    ) -> Result<serde_json::Value, WorkflowError> {
+        let limit = limit.max(1);
+        let ids = self.store.list_run_ids()?;
+        let total = ids.len();
+        let mut runs = Vec::new();
+        for run_id in ids {
+            let state = match self.store.load_state(&run_id) {
+                Ok(state) => state,
+                Err(_) => continue,
+            };
+            if let Some(filter) = status_filter {
+                let status = match state.status {
+                    RunStatus::Running => "running",
+                    RunStatus::WaitingHuman => "waiting_human",
+                    RunStatus::Pausing => "pausing",
+                    RunStatus::Paused => "paused",
+                    RunStatus::Cancelling => "cancelling",
+                    RunStatus::Succeeded => "succeeded",
+                    RunStatus::Failed => "failed",
+                    RunStatus::Cancelled => "cancelled",
+                    RunStatus::Superseded => "superseded",
+                };
+                if status != filter {
+                    continue;
+                }
+            }
+            runs.push(PublicRun::from(&state));
+        }
+        let truncated = runs.len() > limit;
+        runs.truncate(limit);
+        Ok(serde_json::json!({
+            "runs": runs,
+            "count": runs.len(),
+            "limit": limit,
+            "truncated": truncated,
+            "total": total,
+        }))
+    }
+
     pub fn approve(
         &self,
         run_id: &str,

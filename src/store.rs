@@ -207,6 +207,38 @@ impl WorkflowStore {
         self.cancel_path(run_id).exists()
     }
 
+    pub fn list_run_ids(&self) -> Result<Vec<String>, WorkflowError> {
+        let dir = self.root.join("runs");
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(|source| WorkflowError::Read {
+            path: dir.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| WorkflowError::Read {
+                path: dir.clone(),
+                source,
+            })?;
+            if !entry
+                .file_type()
+                .map_err(|source| WorkflowError::Read {
+                    path: dir.clone(),
+                    source,
+                })?
+                .is_dir()
+            {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let modified = entry.metadata().and_then(|meta| meta.modified()).ok();
+            entries.push((modified, name));
+        }
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(entries.into_iter().map(|(_, name)| name).collect())
+    }
+
     fn assert_run(&self, run_id: &str) -> Result<(), WorkflowError> {
         if self.run_dir(run_id).is_dir() {
             Ok(())

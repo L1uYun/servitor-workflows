@@ -173,12 +173,14 @@ in-place script edits. CLI equivalent: `supersede RUN_ID --reason TEXT
 servitor-workflows run WORKFLOW.js [--args JSON] [--max-parallel N] [--max-calls N]
 servitor-workflows resume RUN_ID
 servitor-workflows get RUN_ID
+servitor-workflows list [--limit N] [--status STATUS]
 servitor-workflows approve RUN_ID --reason TEXT [--value JSON]
 servitor-workflows reject RUN_ID --reason TEXT
-servitor-workflows pause RUN_ID
-servitor-workflows cancel RUN_ID
-servitor-workflows supersede RUN_ID --reason TEXT [--evidence PATH] [--new-contract TEXT]
+servitor-workflows pause RUN_ID [--dry-run]
+servitor-workflows cancel RUN_ID [--dry-run]
+servitor-workflows supersede RUN_ID --reason TEXT [--evidence PATH] [--new-contract TEXT] [--dry-run]
 servitor-workflows inspect RUN_ID
+servitor-workflows schema
 ```
 
 Output modes:
@@ -189,11 +191,15 @@ Output modes:
 --output quiet   exit status only
 ```
 
-`run`, `resume`, `get`, `approve`, `reject`, `pause`, and `cancel` return the
+Exit codes: `0` ok, `1` runtime/terminal failure, `2` invalid input, `3` not found. Errors use the same envelope on stdout.
+
+`run`, `resume`, `get`, `approve`, `reject`, `pause`, `cancel`, and `supersede` return the
 low-noise public shape: `run_id`, `status`, and only relevant phase, active
-calls, gate, result, error, or terminal `report` path. `inspect` is the explicit
+calls, gate, result, error, or terminal `report` path. `list` returns `{runs,count,limit,truncated,total}`. `inspect` is the explicit
 detailed surface and adds persisted state plus owner paths, including the
 machine `run_summary_path`.
+
+Resume policy: `succeeded|cancelled|superseded` block re-exec; `failed` remains resumable for recovery. `max_calls` budget seeds from journal size so resume does not grant a fresh budget; replaying journaled keys is free.
 
 Defaults:
 
