@@ -11,7 +11,7 @@ mod store;
 
 pub use agent::{ServitorTransport, Transport};
 pub use engine::{Engine, Inspection};
-pub use error::WorkflowError;
+pub use error::{ErrorPayload, WorkflowError};
 pub use model::{PublicRun, RunState, RunStatus};
 pub use store::WorkflowStore;
 

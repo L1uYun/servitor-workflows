@@ -20,7 +20,19 @@ pub enum RunStatus {
 
 impl RunStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled | Self::Superseded)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Superseded
+        )
+    }
+
+    /// Statuses that must not re-execute on `resume`.
+    /// `Failed` stays resumable so journaled recovery can retry intentionally.
+    pub fn blocks_resume_rerun(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Cancelled | Self::Superseded
+        )
     }
 }
 
@@ -145,6 +157,8 @@ pub struct PublicRun {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_summary: Option<PathBuf>,
 }
 
 impl From<&RunState> for PublicRun {
@@ -159,6 +173,7 @@ impl From<&RunState> for PublicRun {
             result: state.result.clone(),
             error: state.error.clone(),
             report: state.report.clone(),
+            run_summary: state.run_summary.clone(),
         }
     }
 }

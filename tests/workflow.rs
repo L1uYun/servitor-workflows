@@ -740,3 +740,28 @@ fn gate_returns_injected_value() {
     assert_eq!(resumed.result, Some(json!({"path": "surveys/new.md"})));
 }
 
+
+#[test]
+fn resume_does_not_rerun_superseded_run() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "supersede-resume.js",
+        r#"
+        phase("work");
+        await supersede({ reason: "redirect", newContract: "next.md" });
+        return { unreachable: true };
+    "#,
+    );
+    let engine = engine(&temp.path().join("state"), transport);
+    let state = engine.start(&path, Value::Null, 1, 10).expect("start");
+    assert_eq!(state.status, RunStatus::Superseded);
+    let before = state.resume_count;
+    let resumed = engine.resume(&state.run_id).expect("resume superseded");
+    assert_eq!(resumed.status, RunStatus::Superseded);
+    assert_eq!(
+        resumed.resume_count, before,
+        "resume must not re-execute superseded runs"
+    );
+}

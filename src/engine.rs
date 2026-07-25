@@ -86,7 +86,8 @@ impl Engine {
 
     pub fn resume(&self, run_id: &str) -> Result<RunState, WorkflowError> {
         let state = self.store.load_state(run_id)?;
-        if matches!(state.status, RunStatus::Succeeded | RunStatus::Cancelled) {
+        // Succeeded/Cancelled/Superseded must not re-execute. Failed remains resumable.
+        if state.status.blocks_resume_rerun() {
             return self.ensure_terminal_artifacts(state);
         }
         self.store.update_state(run_id, |state| {
