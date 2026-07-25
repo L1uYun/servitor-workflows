@@ -11,7 +11,7 @@ use boa_gc::{Finalize, Trace};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -69,6 +69,9 @@ struct HostState {
     occurrences: Arc<Mutex<BTreeMap<String, usize>>>,
     #[unsafe_ignore_trace]
     calls: Arc<Mutex<usize>>,
+    /// Snapshot of journal keys at VM start plus keys completed in this process.
+    #[unsafe_ignore_trace]
+    journal_keys: Arc<Mutex<BTreeSet<String>>>,
     max_calls: usize,
 }
 
@@ -90,13 +93,15 @@ impl HostState {
 
         // Replay of journaled keys is free. New keys consume the shared max_calls
         // budget that already includes prior journal entries at VM start.
-        let journal = self
-            .runtime
-            .store
-            .journal_index(&self.runtime.run_id)
-            .map_err(|error| error.to_string())?;
-        if journal.contains_key(&key) {
-            return Ok(key);
+        // Budget counts every host key (agent/command/gate), not agent-only.
+        {
+            let journal_keys = self
+                .journal_keys
+                .lock()
+                .map_err(|_| "journal key lock poisoned".to_owned())?;
+            if journal_keys.contains(&key) {
+                return Ok(key);
+            }
         }
 
         let mut calls = self
@@ -108,6 +113,15 @@ impl HostState {
             return Err(format!("workflow exceeded max_calls={}", self.max_calls));
         }
         Ok(key)
+    }
+
+    fn remember_journal_key(&self, key: &str) -> Result<(), String> {
+        let mut journal_keys = self
+            .journal_keys
+            .lock()
+            .map_err(|_| "journal key lock poisoned".to_owned())?;
+        journal_keys.insert(key.to_owned());
+        Ok(())
     }
 }
 
@@ -150,15 +164,17 @@ fn execute_vm(
     max_calls: usize,
 ) -> Result<Value, WorkflowError> {
     let mut context = Context::default();
-    let journal_used = runtime
+    let journal_index = runtime
         .store
         .journal_index(&runtime.run_id)
-        .map(|index| index.len())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let journal_used = journal_index.len();
+    let journal_keys: BTreeSet<String> = journal_index.into_keys().collect();
     context.insert_data(HostState {
         runtime,
         occurrences: Arc::new(Mutex::new(BTreeMap::new())),
         calls: Arc::new(Mutex::new(journal_used)),
+        journal_keys: Arc::new(Mutex::new(journal_keys)),
         max_calls,
     });
     context
@@ -259,11 +275,12 @@ async fn host_agent(
     let options: AgentOptions = serde_json::from_str(&options_json).map_err(native_error)?;
     let input = json!({"prompt": prompt, "options": options});
     let key = host.key("agent", &input).map_err(native_error)?;
-    let receiver = host.runtime.agent(key, prompt, options);
+    let receiver = host.runtime.agent(key.clone(), prompt, options);
     let result = receiver
         .await
         .map_err(|_| native_error("agent worker dropped"))?
         .map_err(native_error)?;
+    host.remember_journal_key(&key).map_err(native_error)?;
     Ok(JsValue::from(js_string!(
         serde_json::to_string(&result).map_err(native_error)?
     )))
@@ -291,11 +308,12 @@ async fn host_command(
     let options: CommandOptions = serde_json::from_str(&options_json).map_err(native_error)?;
     let input = json!({"program": program, "args": argv, "options": options});
     let key = host.key("command", &input).map_err(native_error)?;
-    let receiver = host.runtime.command(key, program, argv, options);
+    let receiver = host.runtime.command(key.clone(), program, argv, options);
     let result = receiver
         .await
         .map_err(|_| native_error("command worker dropped"))?
         .map_err(native_error)?;
+    host.remember_journal_key(&key).map_err(native_error)?;
     Ok(JsValue::from(js_string!(
         serde_json::to_string(&result).map_err(native_error)?
     )))

@@ -110,6 +110,7 @@ impl Engine {
         let ids = self.store.list_run_ids()?;
         let total = ids.len();
         let mut runs = Vec::new();
+        let mut truncated = false;
         for run_id in ids {
             let state = match self.store.load_state(&run_id) {
                 Ok(state) => state,
@@ -131,10 +132,12 @@ impl Engine {
                     continue;
                 }
             }
+            if runs.len() >= limit {
+                truncated = true;
+                break;
+            }
             runs.push(PublicRun::from(&state));
         }
-        let truncated = runs.len() > limit;
-        runs.truncate(limit);
         Ok(serde_json::json!({
             "runs": runs,
             "count": runs.len(),

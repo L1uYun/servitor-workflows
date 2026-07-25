@@ -120,6 +120,17 @@ fn meta() -> Meta {
     }
 }
 
+fn clap_error_message(err: &clap::Error) -> String {
+    // Prefer a single-line reason; full usage stays in --help/schema.
+    let raw = err.to_string();
+    raw.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("invalid arguments")
+        .trim_start_matches("error: ")
+        .to_owned()
+}
+
 fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -134,7 +145,7 @@ fn main() {
                         meta: meta(),
                         error: Some(ErrorPayload {
                             code: "invalid_arguments".into(),
-                            message: err.to_string().trim().to_owned(),
+                            message: clap_error_message(&err),
                             remediation: "Run `servitor-workflows --help` or `servitor-workflows schema`.".into(),
                         }),
                     };
@@ -268,10 +279,7 @@ fn main() {
         Command::Inspect { run_id } => engine.inspect(&run_id).and_then(to_value),
         Command::Schema => Ok(schema_value()),
         Command::Completions { shell } => {
-            let mut cmd = Cli::command();
-            let name = cmd.get_name().to_owned();
-            generate(shell, &mut cmd, name, &mut std::io::stdout());
-            std::process::exit(0);
+            emit_completions(shell);
         }
     };
 
@@ -398,7 +406,7 @@ fn schema_value() -> Value {
         "resume_policy": {
             "rerun_blocked": ["succeeded", "cancelled", "superseded"],
             "rerun_allowed": ["failed", "paused", "waiting_human", "running", "pausing", "cancelling"],
-            "max_calls": "journaled keys consume budget across resume; replay is free"
+            "max_calls": "budget counts agent+command+gate keys; journaled keys free on replay; seeded from journal size at VM start"
         },
         "examples": [
             "servitor-workflows run path/to/workflow.js --args null",
@@ -455,6 +463,13 @@ fn human(value: &Value) -> String {
     }
 }
 
+fn emit_completions(shell: Shell) -> ! {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_owned();
+    generate(shell, &mut cmd, name, &mut std::io::stdout());
+    std::process::exit(0);
+}
+
 fn terminal_exit_code(value: &Value) -> i32 {
     // Preview payloads include current status for agents; they are not terminal results.
     if value.get("dry_run").and_then(Value::as_bool) == Some(true) {
@@ -471,4 +486,37 @@ fn default_parallelism() -> usize {
         .map(usize::from)
         .unwrap_or(1)
         .min(16)
+}
+
+
+#[cfg(test)]
+mod cli_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn dry_run_payload_does_not_inherit_terminal_exit() {
+        let value = json!({
+            "dry_run": true,
+            "status": "failed",
+            "would_cancel": false
+        });
+        assert_eq!(terminal_exit_code(&value), 0);
+    }
+
+    #[test]
+    fn failed_status_without_dry_run_is_terminal_failure() {
+        let value = json!({"status": "failed"});
+        assert_eq!(terminal_exit_code(&value), 1);
+    }
+
+    #[test]
+    fn clap_error_message_is_compact() {
+        let err = match Cli::try_parse_from(["servitor-workflows", "nope"]) {
+            Ok(_) => panic!("expected parse failure"),
+            Err(err) => err,
+        };
+        let message = clap_error_message(&err);
+        assert!(!message.contains("Usage:"));
+    }
 }
