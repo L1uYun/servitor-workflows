@@ -1,6 +1,7 @@
 # servitor-workflows
 
-CLI responses use the agent-native envelope {ok,data,meta,error}; run servitor-workflows schema for contracts.
+CLI responses use the agent-native envelope {ok,data,meta,error}; run servitor-workflows schema
+servitor-workflows completions powershell for contracts.
 
 Rust orchestration above the Rust `servitor` transport.
 

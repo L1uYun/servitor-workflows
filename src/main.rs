@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 use serde::Serialize;
 use serde_json::Value;
 use servitor_workflows::{ErrorPayload, PublicRun, RunState, WorkflowError, default_engine};
@@ -14,6 +15,9 @@ use std::path::PathBuf;
 struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = OutputMode::Json)]
     output: OutputMode,
+    /// Refuse any interactive prompt path (already the default; kept for agent contracts).
+    #[arg(long, global = true, env = "SERVITOR_WORKFLOWS_NO_INTERACTIVE", default_value_t = false)]
+    no_interactive: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -86,6 +90,11 @@ enum Command {
         run_id: String,
     },
     Schema,
+    /// Emit shell completions for bash/zsh/fish/powershell/elvish.
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 #[derive(Serialize)]
@@ -112,7 +121,30 @@ fn meta() -> Meta {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            use clap::error::ErrorKind;
+            match err.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => err.exit(),
+                _ => {
+                    let envelope = Envelope {
+                        ok: false,
+                        data: None,
+                        meta: meta(),
+                        error: Some(ErrorPayload {
+                            code: "invalid_arguments".into(),
+                            message: err.to_string().trim().to_owned(),
+                            remediation: "Run `servitor-workflows --help` or `servitor-workflows schema`.".into(),
+                        }),
+                    };
+                    let _ = emit_json(&envelope);
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
+    let _ = cli.no_interactive;
     let engine = default_engine();
     let result = match cli.command {
         Command::Run {
@@ -235,6 +267,12 @@ fn main() {
         }
         Command::Inspect { run_id } => engine.inspect(&run_id).and_then(to_value),
         Command::Schema => Ok(schema_value()),
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_owned();
+            generate(shell, &mut cmd, name, &mut std::io::stdout());
+            std::process::exit(0);
+        }
     };
 
     let (envelope, code) = match result {
@@ -350,7 +388,7 @@ fn schema_value() -> Value {
             }
         },
         "commands": [
-            "run", "resume", "get", "list", "approve", "reject", "pause", "cancel", "supersede", "inspect", "schema"
+            "run", "resume", "get", "list", "approve", "reject", "pause", "cancel", "supersede", "inspect", "schema", "completions"
         ],
         "public_run": {
             "run_id": "string",
@@ -366,7 +404,8 @@ fn schema_value() -> Value {
             "servitor-workflows run path/to/workflow.js --args null",
             "servitor-workflows list --limit 20 --status failed",
             "servitor-workflows cancel RUN_ID --dry-run",
-            "servitor-workflows schema"
+            "servitor-workflows schema",
+            "servitor-workflows completions powershell"
         ]
     })
 }

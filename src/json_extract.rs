@@ -64,6 +64,8 @@ pub fn extract_json_values(text: &str, expect: Expect) -> Result<Vec<Value>, Str
 
 /// First shape-matching JSON value (no schema). Prefer
 /// [`extract_json_value_for_schema`] when a schema contract exists.
+/// Test-only helper; production paths use schema-aware selection.
+#[cfg(test)]
 pub fn extract_json_value(text: &str, expect: Expect) -> Result<Value, String> {
     extract_json_values(text, expect).map(|mut values| values.remove(0))
 }
