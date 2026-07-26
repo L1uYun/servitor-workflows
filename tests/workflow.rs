@@ -854,7 +854,7 @@ fn waiting_human_writes_run_summary() {
     let path = script(
         &temp,
         "waiting-summary.js",
-        r#"const decision = await gate("ship it?", { label: "ship", expect: "approval", hint: "check evidence" }); return decision;"#,
+        r#"const decision = await gate("ship it?", { label: "ship", expect: "approval", current: { contract: "<script>alert(1)</script>", nested: ["<&>"] }, hint: "check evidence" }); return decision;"#,
     );
     let engine = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)));
     let waiting = engine.start(&path, Value::Null, 1, 10).expect("start");
@@ -863,13 +863,52 @@ fn waiting_human_writes_run_summary() {
     let html = fs::read_to_string(&waiting_summary).expect("read waiting summary");
     assert!(html.contains("<h2>等待人工审批</h2>"));
     assert!(html.contains("ship it?"));
+    assert!(html.contains("<dt>期望</dt><dd>approval</dd>"));
+    assert!(html.contains("<dt>当前值</dt><dd><pre>{\n  &quot;contract&quot;: &quot;&lt;script&gt;alert(1)&lt;/script&gt;&quot;,\n  &quot;nested&quot;: [\n    &quot;&lt;&amp;&gt;&quot;\n  ]\n}</pre></dd>"));
+    assert!(!html.contains("<script>alert(1)</script>"));
     assert!(html.contains("执行暂停，等待人工闸门审批"));
+    let persisted = engine
+        .store()
+        .load_state(&waiting.run_id)
+        .expect("load persisted waiting state");
+    assert_eq!(persisted.status, RunStatus::WaitingHuman);
+    assert_eq!(persisted.run_summary.as_ref(), Some(&waiting_summary));
     let completed = engine
         .approve(&waiting.run_id, true, "approved".to_owned(), None)
         .expect("approve");
     let html = fs::read_to_string(completed.run_summary.expect("terminal summary"))
         .expect("read terminal summary");
     assert!(!html.contains("<h2>等待人工审批</h2>"));
+}
+
+#[test]
+fn waiting_human_summary_write_failure_is_propagated_without_changing_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-waiting-summary-failure");
+    let path = script(
+        &temp,
+        "waiting-summary-failure.js",
+        r#"return await gate("ship it?", { label: "ship" });"#,
+    );
+    let engine = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)));
+    let prepared = engine
+        .prepare(&path, Value::Null, 1, 10)
+        .expect("prepare waiting workflow");
+    let summary_path = engine.store().run_summary_path(&prepared.run_id);
+    fs::create_dir(&summary_path).expect("block summary file with directory");
+
+    let error = engine
+        .execute_existing(&prepared.run_id)
+        .expect_err("summary write failure must be returned");
+    assert_eq!(error.payload().code, "write_failed");
+    assert!(error.to_string().contains("run-summary.html"));
+    let persisted = engine
+        .store()
+        .load_state(&prepared.run_id)
+        .expect("load waiting state after failure");
+    assert_eq!(persisted.status, RunStatus::WaitingHuman);
+    assert!(persisted.waiting_gate.is_some());
+    assert!(persisted.run_summary.is_none());
 }
 
 #[test]

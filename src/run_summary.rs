@@ -85,21 +85,30 @@ fn render(state: &RunState, entries: &[&JournalEntry]) -> Result<String, Workflo
     let tokens_chip = total_tokens.map_or_else(String::new, |total| {
         format!("<span class=\"chip\">Tokens {total}</span>")
     });
-    let gate_card = state.waiting_gate.as_ref().map_or_else(String::new, |gate| {
+    let gate_card = if let Some(gate) = state.waiting_gate.as_ref() {
         let expect_row = gate.expect.as_deref().map_or_else(String::new, |expect| {
             format!("<dt>期望</dt><dd>{}</dd>", escape(expect))
         });
+        let current_row = match gate.current.as_ref() {
+            Some(current) => format!(
+                "<dt>当前值</dt><dd><pre>{}</pre></dd>",
+                escape(&serde_json::to_string_pretty(current)?)
+            ),
+            None => String::new(),
+        };
         let hint_row = gate.hint.as_deref().map_or_else(String::new, |hint| {
             format!("<dt>提示</dt><dd>{}</dd>", escape(hint))
         });
         format!(
-            "<section class=\"card\"><h2>等待人工审批</h2><dl><dt>闸门</dt><dd>{}</dd><dt>问题</dt><dd>{}</dd>{expect_row}{hint_row}</dl><p>处理命令：<code>servitor-workflows approve {} --reason &quot;...&quot;</code> 或 <code>servitor-workflows reject {} --reason &quot;...&quot;</code></p></section>",
+            "<section class=\"card\"><h2>等待人工审批</h2><dl><dt>闸门</dt><dd>{}</dd><dt>问题</dt><dd>{}</dd>{expect_row}{current_row}{hint_row}</dl><p>处理命令：<code>servitor-workflows approve {} --reason &quot;...&quot;</code> 或 <code>servitor-workflows reject {} --reason &quot;...&quot;</code></p></section>",
             escape(&gate.label),
             escape(&gate.question),
             escape(&state.run_id),
             escape(&state.run_id),
         )
-    });
+    } else {
+        String::new()
+    };
 
     Ok(format!(
         r#"<!doctype html>

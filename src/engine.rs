@@ -326,7 +326,7 @@ impl Engine {
             return Ok(state);
         }
         if current.status == RunStatus::WaitingHuman {
-            return Ok(self.refresh_waiting_summary(current));
+            return self.refresh_waiting_summary(current);
         }
         let state = match result {
             Ok(value) => match delivery_report(&value) {
@@ -360,14 +360,10 @@ impl Engine {
         }
     }
 
-    fn refresh_waiting_summary(&self, state: RunState) -> RunState {
-        match run_summary::write(&self.store, &state) {
-            Ok(path) => self
-                .store
-                .update_state(&state.run_id, |state| state.run_summary = Some(path))
-                .unwrap_or(state),
-            Err(_) => state,
-        }
+    fn refresh_waiting_summary(&self, state: RunState) -> Result<RunState, WorkflowError> {
+        let path = run_summary::write(&self.store, &state)?;
+        self.store
+            .update_state(&state.run_id, |state| state.run_summary = Some(path))
     }
 
     fn ensure_terminal_artifacts(&self, state: RunState) -> Result<RunState, WorkflowError> {
