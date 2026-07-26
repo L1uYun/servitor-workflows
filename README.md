@@ -65,6 +65,15 @@ supersede(options)
 JavaScript has no direct filesystem or process API. External work crosses the
 typed `agent`, `command`, or `gate` boundary.
 
+### Determinism
+
+Journal replay assumes the script produces the same call inputs on every
+execution, so the common nondeterminism sources throw a `TypeError` inside
+workflow scripts: `Date.now()`, `Math.random()`, argless `new Date()`, and
+`Date()` called as a function. Pass timestamps and randomness in via `args`
+(e.g. `args.startedAt`) and stamp wall-clock times after the workflow returns.
+`new Date(explicitValue)`, `Date.parse(...)`, and `Date.UTC(...)` stay legal.
+
 ### Agent options
 
 ```javascript
@@ -131,7 +140,8 @@ verdict should write an explicit evidence JSON at an agreed path instead.
 `retry(fn, options?)` — bounded retry around any `agent`/`command` thunk. Each
 attempt is a separate journaled call (attempt number is part of the journal key),
 so deterministic replay still holds: a succeeded attempt is skipped on resume, a
-failed one re-runs. Options:
+failed one re-runs. `retry()` wall-time bookkeeping uses a hidden host clock
+exempt from the determinism ban because it never feeds call keys. Options:
 
 ```javascript
 await retry(() => command("pwsh", ["-File", "flaky.ps1"]), {

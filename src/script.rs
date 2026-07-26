@@ -74,35 +74,72 @@ globalThis.pipeline = (items, ...stages) => {
 // does not duplicate narration. log() returns undefined and never throws; a
 // write failure is swallowed, never propagated into the script.
 globalThis.log = message => { try { __log(String(message == null ? '' : message)); } catch (e) {} };
-globalThis.retry = async (fn, options = {}) => {
-  const maxAttempts = options.maxAttempts ?? 3;
-  const delayMs = options.delayMs ?? 1000;
-  const backoff = options.backoff ?? 1;
-  const wallMs = options.wallTimeSeconds != null ? options.wallTimeSeconds * 1000 : null;
-  const nonRetryable = options.nonRetryable ?? [];
-  const started = Date.now();
-  let lastError;
-  let delay = delayMs;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (wallMs != null && Date.now() - started >= wallMs) {
-      throw new Error(`retry wall-time exceeded after ${attempt - 1} attempts`);
-    }
-    try {
-      return await fn(attempt);
-    } catch (error) {
-      lastError = error;
-      const text = String(error && error.message ? error.message : error);
-      if (nonRetryable.some(marker => text.includes(marker))) {
-        throw error;
+globalThis.retry = (() => {
+  // Captured native clock: exempt from the determinism guard below because it
+  // never feeds call keys — it only bounds wall-time inside retry().
+  const __nowMs = Date.now.bind(Date);
+  return async (fn, options = {}) => {
+    const maxAttempts = options.maxAttempts ?? 3;
+    const delayMs = options.delayMs ?? 1000;
+    const backoff = options.backoff ?? 1;
+    const wallMs = options.wallTimeSeconds != null ? options.wallTimeSeconds * 1000 : null;
+    const nonRetryable = options.nonRetryable ?? [];
+    const started = __nowMs();
+    let lastError;
+    let delay = delayMs;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (wallMs != null && __nowMs() - started >= wallMs) {
+        throw new Error(`retry wall-time exceeded after ${attempt - 1} attempts`);
       }
-      if (attempt < maxAttempts) {
-        await __sleep(delay);
-        delay = Math.round(delay * backoff);
+      try {
+        return await fn(attempt);
+      } catch (error) {
+        lastError = error;
+        const text = String(error && error.message ? error.message : error);
+        if (nonRetryable.some(marker => text.includes(marker))) {
+          throw error;
+        }
+        if (attempt < maxAttempts) {
+          await __sleep(delay);
+          delay = Math.round(delay * backoff);
+        }
       }
     }
+    throw lastError;
+  };
+})();
+// Determinism guard — MUST stay the FINAL block of BOOTSTRAP. Prelude helpers
+// that legitimately need the native clock (retry above) capture it before the
+// swap; anything defined after this point sees GuardedDate. Later prelude
+// additions go BEFORE this block. Wall-clock or random values flowing into
+// agent/command/gate inputs change call keys on journal-replay resume and
+// re-execute paid work, so the common nondeterminism sources throw. This is an
+// anti-footgun, not a security sandbox: a determined script can still reach
+// nondeterminism; deterministic PRNGs seeded from args stay fine.
+(() => {
+  const NativeDate = Date;
+  const TAIL = " Pass timestamps in via args (e.g. args.startedAt) and stamp wall-clock times after the workflow returns; new Date(explicitValue) stays legal.";
+  function GuardedDate(...a) {
+    if (new.target === undefined) {
+      throw new TypeError("Date() called as a function is nondeterministic and breaks journal-replay resume." + TAIL);
+    }
+    if (a.length === 0) {
+      throw new TypeError("new Date() without arguments is nondeterministic and breaks journal-replay resume." + TAIL);
+    }
+    return new NativeDate(...a);
   }
-  throw lastError;
-};
+  GuardedDate.prototype = NativeDate.prototype;
+  NativeDate.prototype.constructor = GuardedDate; // close the `(new Date(0)).constructor` escape
+  GuardedDate.parse = NativeDate.parse;           // deterministic statics stay legal
+  GuardedDate.UTC = NativeDate.UTC;
+  GuardedDate.now = () => {
+    throw new TypeError("Date.now() is nondeterministic and breaks journal-replay resume." + TAIL);
+  };
+  globalThis.Date = GuardedDate;
+  Math.random = () => {
+    throw new TypeError("Math.random() is nondeterministic and breaks journal-replay resume. Pass any needed randomness in via args or compute it outside the workflow.");
+  };
+})();
 "#;
 const VM_STACK_SIZE: usize = 8 * 1024 * 1024;
 

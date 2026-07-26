@@ -869,6 +869,168 @@ fn negotiate_two_body_reaches_accept_after_revise() {
 
 
 #[test]
+fn date_now_fails_fast_with_actionable_error() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "date-now.js",
+        r#"
+        const t = Date.now();
+        await agent("SHOULD_NOT_RUN");
+        return { t };
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("terminal state");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Date.now() is nondeterministic and breaks journal-replay resume"),
+        "{:?}",
+        state.error
+    );
+    assert_eq!(
+        transport.count(),
+        0,
+        "banned call must throw before any paid submission"
+    );
+}
+
+#[test]
+fn math_random_fails_fast() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(&temp, "math-random.js", "return { r: Math.random() };\n");
+    let state = engine(&temp.path().join("state"), transport)
+        .start(&path, Value::Null, 1, 10)
+        .expect("terminal state");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Math.random() is nondeterministic and breaks journal-replay resume"),
+        "{:?}",
+        state.error
+    );
+}
+
+#[test]
+fn argless_new_date_throws_and_explicit_date_survives() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "date-guard.js",
+        r#"
+        let caughtArgless = "";
+        try { new Date(); } catch (e) { caughtArgless = String(e); }
+        let caughtFn = "";
+        try { Date(0); } catch (e) { caughtFn = String(e); }
+        let caughtCtor = "";
+        try { new (new Date(0)).constructor(); } catch (e) { caughtCtor = String(e); }
+        return {
+          caughtArgless,
+          caughtFn,
+          caughtCtor,
+          iso: new Date(1700000000000).toISOString(),
+          parsed: Date.parse("2020-01-02T03:04:05Z"),
+          utc: Date.UTC(2020, 0, 2),
+          inst: (new Date(0) instanceof Date),
+        };
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), transport)
+        .start(&path, Value::Null, 1, 10)
+        .expect("workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let result = state.result.expect("result");
+    assert!(
+        result["caughtArgless"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("new Date() without arguments"),
+        "{:?}",
+        result["caughtArgless"]
+    );
+    assert!(
+        result["caughtFn"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Date() called as a function"),
+        "{:?}",
+        result["caughtFn"]
+    );
+    assert!(
+        result["caughtCtor"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("without arguments"),
+        "constructor escape must stay closed: {:?}",
+        result["caughtCtor"]
+    );
+    assert_eq!(result["iso"], "2023-11-14T22:13:20.000Z");
+    assert_eq!(result["parsed"], json!(1577934245000i64));
+    assert_eq!(result["utc"], json!(1577923200000i64));
+    assert_eq!(result["inst"], true);
+}
+
+#[test]
+fn retry_wall_time_bookkeeping_works_under_guard() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "retry-wall.js",
+        r#"
+        try {
+          await retry(async () => { throw new Error("boom"); },
+            { maxAttempts: 5, delayMs: 1, wallTimeSeconds: 0 });
+        } catch (e) {
+          return { msg: String(e) };
+        }
+        return { msg: "no-throw" };
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), transport)
+        .start(&path, Value::Null, 1, 10)
+        .expect("workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    // Proves the reworked clock path: a broken rework would surface the
+    // Date.now guard TypeError here instead of the wall-time message.
+    assert!(
+        state.result.as_ref().unwrap()["msg"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("retry wall-time exceeded"),
+        "{:?}",
+        state.result
+    );
+}
+
+#[test]
+fn check_still_passes_scripts_that_textually_mention_banned_apis() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let eng = engine(&temp.path().join("state-check-banned"), transport);
+    let path = script(
+        &temp,
+        "check-banned.js",
+        "const t = Date.now();\nreturn { t };\n",
+    );
+    let value = eng
+        .check(&path)
+        .expect("guard is runtime-only; parse preflight must stay unaffected");
+    assert_eq!(value["check"], "ok");
+}
+
+#[test]
 fn check_rejects_syntax_errors_and_module_only_syntax_without_creating_runs() {
     use servitor_workflows::WorkflowError;
     let temp = TempDir::new().expect("tempdir");
