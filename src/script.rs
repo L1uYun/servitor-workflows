@@ -12,6 +12,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -26,8 +28,52 @@ globalThis.gate = async (question, options = {}) =>
 globalThis.supersede = async options =>
   JSON.parse(await __supersede(JSON.stringify(options || {})));
 globalThis.phase = name => __phase(String(name));
-globalThis.parallel = promises => Promise.all(promises);
-globalThis.pipeline = (items, worker) => Promise.all(Array.from(items, worker));
+// parallel(entries) never rejects. Each entry may be a thunk (() => ...) or an
+// already-created promise; thunks are invoked at parallel entry. A failed or
+// throwing entry resolves to null in place; siblings are unaffected. Result
+// order matches input order. (Backward-compatible except reject-on-first-failure
+// becomes null-in-place — the accepted behavior break for this slice.)
+globalThis.parallel = entries => {
+  const arr = Array.from(entries);
+  return Promise.all(arr.map(entry => {
+    let p;
+    try {
+      p = typeof entry === 'function' ? entry() : entry;
+    } catch (e) {
+      return Promise.resolve(null);
+    }
+    return Promise.resolve(p).then(v => v, () => null);
+  }));
+};
+// pipeline(items, ...stages) runs each item through every stage in order,
+// independently per item — no cross-item barrier between stages. Each stage
+// callback receives (prevResult, originalItem, index). A stage that throws
+// (or rejects) drops only its own item to null and skips that item's remaining
+// stages. pipeline never rejects. The degenerate pipeline(items, worker) call
+// is the N=1 case and produces the same results as before (minus reject).
+globalThis.pipeline = (items, ...stages) => {
+  const arr = Array.from(items);
+  const fns = stages.filter(s => typeof s === 'function');
+  return Promise.all(arr.map((item, idx) => (async () => {
+    let cur = item;
+    for (let s = 0; s < fns.length; s++) {
+      try {
+        cur = await fns[s](cur, item, idx);
+      } catch (e) {
+        return null;
+      }
+    }
+    return cur;
+  })()));
+};
+// log(message) streams narration to workflow.log in the run record dir via the
+// __log host function. It never becomes a journal entry. Resume idempotency is
+// occurrence-based: on VM start the host counts lines already in workflow.log,
+// and the first N log() calls of a re-executed script are skipped (same
+// determinism assumption journal replay already relies on), so a resumed run
+// does not duplicate narration. log() returns undefined and never throws; a
+// write failure is swallowed, never propagated into the script.
+globalThis.log = message => { try { __log(String(message == null ? '' : message)); } catch (e) {} };
 globalThis.retry = async (fn, options = {}) => {
   const maxAttempts = options.maxAttempts ?? 3;
   const delayMs = options.delayMs ?? 1000;
@@ -71,6 +117,12 @@ struct HostState {
     /// Snapshot of journal keys at VM start plus keys completed in this process.
     #[unsafe_ignore_trace]
     journal_keys: Arc<Mutex<BTreeSet<String>>>,
+    /// log() resume idempotency: (lines already in workflow.log at VM start,
+    /// log() calls seen in this execution). Lazily initialized on first __log.
+    /// A re-executed script skips its first `existing` calls instead of
+    /// re-appending them — occurrence-based, like journal replay.
+    #[unsafe_ignore_trace]
+    log_replay: Arc<Mutex<Option<(usize, usize)>>>,
     max_calls: usize,
 }
 
@@ -192,6 +244,7 @@ fn execute_vm(
         occurrences: Arc::new(Mutex::new(BTreeMap::new())),
         calls: Arc::new(Mutex::new(journal_used)),
         journal_keys: Arc::new(Mutex::new(journal_keys)),
+        log_replay: Arc::new(Mutex::new(None)),
         max_calls,
     });
     context
@@ -234,6 +287,13 @@ fn execute_vm(
             js_string!("__sleep"),
             1,
             NativeFunction::from_fn_ptr(host_sleep),
+        )
+        .map_err(js_error)?;
+    context
+        .register_global_builtin_callable(
+            js_string!("__log"),
+            1,
+            NativeFunction::from_fn_ptr(host_log),
         )
         .map_err(js_error)?;
     context
@@ -461,6 +521,50 @@ fn host_sleep(
     // Cap single sleep to 60s to avoid runaway host stalls from bad scripts.
     let ms = ms.min(60_000);
     std::thread::sleep(std::time::Duration::from_millis(ms));
+    Ok(JsValue::undefined())
+}
+
+// __log appends a timestamped plain-text line to workflow.log in the run record
+// dir. Narration must NOT enter the journal (journal entries replay on resume)
+// and must not touch RunState.phase. It is intentionally infallible from the
+// script's perspective: any IO failure is swallowed and never propagated, so a
+// log() write failure can never break the workflow.
+fn host_log(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let host = context.get_data::<HostState>().cloned();
+    let message = match js_string_arg(args, 0, context) {
+        Ok(text) => text,
+        Err(_) => return Ok(JsValue::undefined()),
+    };
+    if let Some(host) = host {
+        let dir = host.runtime.store.run_dir(&host.runtime.run_id);
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("workflow.log");
+        // Resume idempotency: a resumed run re-executes the script from the
+        // top, so log() calls that already appended a line in a previous
+        // execution must not append again. Deterministic scripts (the same
+        // assumption journal replay relies on) emit log() calls in the same
+        // order, so skipping the first `existing` occurrences — where
+        // `existing` is the line count of workflow.log at VM start — makes
+        // replayed calls no-ops while new calls append as normal.
+        {
+            let mut replay = host.log_replay.lock().expect("log replay lock");
+            let (existing, calls) = replay.get_or_insert_with(|| {
+                let existing = std::fs::read_to_string(&path)
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0);
+                (existing, 0)
+            });
+            *calls += 1;
+            if *calls <= *existing {
+                return Ok(JsValue::undefined());
+            }
+        }
+        let line = format!("[{}] {}\n", chrono::Utc::now().to_rfc3339(), message);
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.sync_data();
+        }
+    }
     Ok(JsValue::undefined())
 }
 
