@@ -172,13 +172,14 @@ in-place script edits. CLI equivalent: `supersede RUN_ID --reason TEXT
 
 ```text
 servitor-workflows run WORKFLOW.js [--args JSON] [--max-parallel N] [--max-calls N]
+servitor-workflows check WORKFLOW.js
 servitor-workflows resume RUN_ID
 servitor-workflows get RUN_ID
 servitor-workflows list [--limit N] [--status STATUS]
 servitor-workflows approve RUN_ID --reason TEXT [--value JSON]
 servitor-workflows reject RUN_ID --reason TEXT
 servitor-workflows pause RUN_ID [--dry-run]
-servitor-workflows cancel RUN_ID [--dry-run]
+servitor-workflows cancel RUN_ID --reason TEXT [--dry-run]
 servitor-workflows supersede RUN_ID --reason TEXT [--evidence PATH] [--new-contract TEXT] [--dry-run]
 servitor-workflows inspect RUN_ID
 servitor-workflows schema
@@ -193,6 +194,12 @@ Output modes:
 ```
 
 Exit codes: `0` ok, `1` runtime/terminal failure, `2` invalid input, `3` not found. Errors use the same envelope on stdout.
+
+`check` validates a workflow without running it: the meta declaration plus a
+parse of the script under the exact engine wrap (Script goal symbol, async IIFE).
+`run` performs the same validation and refuses an unparseable script with exit
+`2` before creating a run directory. `cancel` requires `--reason`; the text is
+recorded in `state.json` as `error: "cancelled: <reason>"` for audit.
 
 `run`, `resume`, `get`, `approve`, `reject`, `pause`, `cancel`, and `supersede` return the
 low-noise public shape: `run_id`, `status`, and only relevant phase, active

@@ -137,6 +137,24 @@ struct GateOptions {
     hint: Option<String>,
 }
 
+fn wrap_script(script: &str) -> String {
+    let body = script.replacen("export const meta", "const meta", 1);
+    format!(
+        "(async () => {{ const __result = await (async () => {{ {body} }})(); return JSON.stringify(__result ?? null); }})()"
+    )
+}
+
+/// Parse the workflow exactly as `execute` would run it, without executing.
+/// Catches plain syntax errors and module-only syntax (e.g. `import.meta`)
+/// that would otherwise kill the run before its first phase.
+pub fn parse_check(script: &str) -> Result<(), WorkflowError> {
+    let mut context = Context::default();
+    let wrapped = wrap_script(script);
+    boa_engine::Script::parse(Source::from_bytes(&wrapped), None, &mut context)
+        .map(|_| ())
+        .map_err(|error| WorkflowError::InvalidWorkflow(error.to_string()))
+}
+
 pub fn execute(
     runtime: Arc<RuntimeHost>,
     script: &str,
@@ -230,10 +248,7 @@ fn execute_vm(
         .eval(Source::from_bytes(BOOTSTRAP))
         .map_err(js_error)?;
 
-    let body = script.replacen("export const meta", "const meta", 1);
-    let wrapped = format!(
-        "(async () => {{ const __result = await (async () => {{ {body} }})(); return JSON.stringify(__result ?? null); }})()"
-    );
+    let wrapped = wrap_script(script);
     let value = context
         .eval(Source::from_bytes(&wrapped))
         .map_err(js_error)?;

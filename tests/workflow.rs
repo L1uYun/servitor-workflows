@@ -480,7 +480,7 @@ fn pause_and_cancel_interrupt_active_calls() {
     });
     let second_id = wait_for_active_run(&second_root);
     let cancelling = engine(&second_root, Arc::clone(&transport))
-        .cancel(&second_id)
+        .cancel(&second_id, "test cancel audit reason".to_owned())
         .expect("cancel");
     assert!(matches!(
         cancelling.status,
@@ -488,6 +488,11 @@ fn pause_and_cancel_interrupt_active_calls() {
     ));
     let final_cancel = runner.join().expect("join").expect("runner result");
     assert_eq!(final_cancel.status, RunStatus::Cancelled);
+    assert_eq!(
+        final_cancel.error.as_deref(),
+        Some("cancelled: test cancel audit reason"),
+        "cancel reason must survive into terminal state.json"
+    );
     assert!(
         !second_root
             .join("runs")
@@ -862,3 +867,38 @@ fn negotiate_two_body_reaches_accept_after_revise() {
 }
 
 
+
+#[test]
+fn check_rejects_syntax_errors_and_module_only_syntax_without_creating_runs() {
+    use servitor_workflows::WorkflowError;
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(5)));
+    let root = temp.path().join("state-check");
+    let eng = engine(&root, Arc::clone(&transport));
+
+    let good = script(&temp, "good.js", "return { done: true };\n");
+    let value = eng.check(&good).expect("good script parses");
+    assert_eq!(value["check"], "ok");
+
+    for (name, body) in [
+        ("assign.js", "1 = 2;\nreturn {};\n"),
+        ("importmeta.js", "let x = import.meta.path;\nreturn {};\n"),
+        ("decl.js", "const a\n  b = 1;\nreturn {};\n"),
+    ] {
+        let bad = script(&temp, name, body);
+        let err = eng.check(&bad).expect_err("bad script must fail check");
+        assert!(
+            matches!(err, WorkflowError::InvalidWorkflow(_)),
+            "{name}: expected InvalidWorkflow, got {err:?}"
+        );
+        let err = eng
+            .start(&bad, Value::Null, 1, 10)
+            .expect_err("start must refuse unparseable script");
+        assert!(matches!(err, WorkflowError::InvalidWorkflow(_)));
+    }
+    let runs = root.join("runs");
+    let leftover = std::fs::read_dir(&runs)
+        .map(|it| it.count())
+        .unwrap_or(0);
+    assert_eq!(leftover, 0, "refused scripts must not leave run directories");
+}

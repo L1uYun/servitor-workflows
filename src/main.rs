@@ -10,7 +10,7 @@ use std::path::PathBuf;
     name = "servitor-workflows",
     version,
     about = "Run dynamic agent workflows",
-    after_help = "Examples:\n  servitor-workflows run workflow.js --args '{\"x\":1}'\n  servitor-workflows get RUN_ID\n  servitor-workflows list --limit 20 --status failed\n  servitor-workflows resume RUN_ID\n  servitor-workflows cancel RUN_ID --dry-run\n  servitor-workflows schema\n\nExit codes: 0 ok, 1 runtime/terminal failure, 2 invalid input, 3 not found"
+    after_help = "Examples:\n  servitor-workflows check workflow.js\n  servitor-workflows run workflow.js --args '{\"x\":1}'\n  servitor-workflows get RUN_ID\n  servitor-workflows list --limit 20 --status failed\n  servitor-workflows resume RUN_ID\n  servitor-workflows cancel RUN_ID --reason 'superseded by new contract' --dry-run\n  servitor-workflows schema\n\nExit codes: 0 ok, 1 runtime/terminal failure, 2 invalid input, 3 not found"
 )]
 struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = OutputMode::Json)]
@@ -39,6 +39,10 @@ enum Command {
         max_parallel: usize,
         #[arg(long, default_value_t = 1000)]
         max_calls: usize,
+    },
+    /// Validate a workflow script (meta + engine-wrap parse) without running it.
+    Check {
+        workflow: PathBuf,
     },
     Resume {
         run_id: String,
@@ -72,6 +76,9 @@ enum Command {
     },
     Cancel {
         run_id: String,
+        /// Why this run is being cancelled; recorded in state.json for audit.
+        #[arg(long)]
+        reason: String,
         #[arg(long)]
         dry_run: bool,
     },
@@ -225,13 +232,19 @@ fn main() {
                 engine.pause(&run_id).and_then(public_value)
             }
         }
-        Command::Cancel { run_id, dry_run } => {
+        Command::Check { workflow } => engine.check(&workflow),
+        Command::Cancel {
+            run_id,
+            reason,
+            dry_run,
+        } => {
             if dry_run {
                 engine.get(&run_id).and_then(|run| {
                     to_value(serde_json::json!({
                         "dry_run": true,
                         "run_id": run.run_id,
                         "status": run.status,
+                        "reason": reason,
                         "would_cancel": !matches!(
                             run.status,
                             servitor_workflows::RunStatus::Succeeded
@@ -242,7 +255,7 @@ fn main() {
                     }))
                 })
             } else {
-                engine.cancel(&run_id).and_then(public_value)
+                engine.cancel(&run_id, reason).and_then(public_value)
             }
         }
         Command::Supersede {
@@ -396,7 +409,7 @@ fn schema_value() -> Value {
             }
         },
         "commands": [
-            "run", "resume", "get", "list", "approve", "reject", "pause", "cancel", "supersede", "inspect", "schema", "completions"
+            "run", "check", "resume", "get", "list", "approve", "reject", "pause", "cancel", "supersede", "inspect", "schema", "completions"
         ],
         "public_run": {
             "run_id": "string",
@@ -409,9 +422,10 @@ fn schema_value() -> Value {
             "max_calls": "budget counts agent+command+gate keys; journaled keys free on replay; seeded from journal size at VM start"
         },
         "examples": [
+            "servitor-workflows check path/to/workflow.js",
             "servitor-workflows run path/to/workflow.js --args null",
             "servitor-workflows list --limit 20 --status failed",
-            "servitor-workflows cancel RUN_ID --dry-run",
+            "servitor-workflows cancel RUN_ID --reason 'why' --dry-run",
             "servitor-workflows schema",
             "servitor-workflows completions powershell"
         ]

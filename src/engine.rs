@@ -205,9 +205,24 @@ impl Engine {
         })
     }
 
-    pub fn cancel(&self, run_id: &str) -> Result<RunState, WorkflowError> {
+    /// Validate a workflow script without creating a run: same emptiness/meta
+    /// checks and the same engine-wrap parse that `start` performs.
+    pub fn check(&self, path: &Path) -> Result<Value, WorkflowError> {
+        let script = std::fs::read_to_string(path).map_err(|source| WorkflowError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        validate_script(&script)?;
+        Ok(serde_json::json!({
+            "check": "ok",
+            "workflow": path.display().to_string(),
+        }))
+    }
+
+    pub fn cancel(&self, run_id: &str, reason: String) -> Result<RunState, WorkflowError> {
         self.store.request_cancel(run_id)?;
         let state = self.store.update_state(run_id, |state| {
+            state.error = Some(format!("cancelled: {reason}"));
             state.status = if state.active.is_empty() {
                 RunStatus::Cancelled
             } else {
@@ -403,5 +418,5 @@ fn validate_script(script: &str) -> Result<(), WorkflowError> {
             "script must declare `export const meta`".to_owned(),
         ));
     }
-    Ok(())
+    script::parse_check(script)
 }
