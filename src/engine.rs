@@ -35,6 +35,17 @@ impl Engine {
         max_parallel: usize,
         max_calls: usize,
     ) -> Result<RunState, WorkflowError> {
+        let state = self.prepare(path, args, max_parallel, max_calls)?;
+        self.execute_existing(&state.run_id)
+    }
+
+    pub fn prepare(
+        &self,
+        path: &Path,
+        args: Value,
+        max_parallel: usize,
+        max_calls: usize,
+    ) -> Result<RunState, WorkflowError> {
         if max_parallel == 0 || max_calls == 0 {
             return Err(WorkflowError::InvalidOperation(
                 "limits must be positive".to_owned(),
@@ -54,9 +65,10 @@ impl Engine {
                 source,
             })?;
         let now = Utc::now();
+        let run_id = Uuid::now_v7().to_string();
         let state = RunState {
             version: 1,
-            run_id: Uuid::now_v7().to_string(),
+            run_id: run_id.clone(),
             name: path
                 .file_stem()
                 .and_then(|name| name.to_str())
@@ -79,9 +91,15 @@ impl Engine {
             error: None,
             report: None,
             run_summary: None,
+            journal_path: self.store.journal_path(&run_id),
         };
         self.store.create_run(&state, &script)?;
-        self.execute(&state.run_id)
+        Ok(state)
+    }
+
+    pub fn execute_existing(&self, run_id: &str) -> Result<RunState, WorkflowError> {
+        self.store.load_state(run_id)?;
+        self.execute(run_id)
     }
 
     pub fn resume(&self, run_id: &str) -> Result<RunState, WorkflowError> {
@@ -98,7 +116,9 @@ impl Engine {
     }
 
     pub fn get(&self, run_id: &str) -> Result<PublicRun, WorkflowError> {
-        Ok(PublicRun::from(&self.store.load_state(run_id)?))
+        let mut state = self.store.load_state(run_id)?;
+        self.populate_journal_path(&mut state);
+        Ok(PublicRun::from(&state))
     }
 
     pub fn list(
@@ -112,10 +132,11 @@ impl Engine {
         let mut runs = Vec::new();
         let mut truncated = false;
         for run_id in ids {
-            let state = match self.store.load_state(&run_id) {
+            let mut state = match self.store.load_state(&run_id) {
                 Ok(state) => state,
                 Err(_) => continue,
             };
+            self.populate_journal_path(&mut state);
             if let Some(filter) = status_filter {
                 let status = match state.status {
                     RunStatus::Running => "running",
@@ -331,6 +352,12 @@ impl Engine {
             }),
         }?;
         self.ensure_terminal_artifacts(state)
+    }
+
+    fn populate_journal_path(&self, state: &mut RunState) {
+        if state.journal_path.as_os_str().is_empty() {
+            state.journal_path = self.store.journal_path(&state.run_id);
+        }
     }
 
     fn refresh_waiting_summary(&self, state: RunState) -> RunState {

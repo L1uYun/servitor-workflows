@@ -282,4 +282,3 @@ fn default_state_root() -> PathBuf {
         std::env::temp_dir().join("servitor-workflows")
     }
 }
-

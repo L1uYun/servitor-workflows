@@ -9,6 +9,7 @@ use servitor_workflows::{Engine, RunStatus, Transport, WorkflowStore};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -1353,6 +1354,137 @@ fn check_still_passes_scripts_that_textually_mention_banned_apis() {
         .check(&path)
         .expect("guard is runtime-only; parse preflight must stay unaffected");
     assert_eq!(value["check"], "ok");
+}
+
+fn cli(root: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_servitor-workflows"))
+        .args(args)
+        .env("SERVITOR_WORKFLOWS_STATE_ROOT", root)
+        .output()
+        .expect("run workflow CLI")
+}
+
+fn cli_json(output: &std::process::Output) -> Value {
+    serde_json::from_slice(&output.stdout).expect("CLI JSON envelope")
+}
+
+#[test]
+fn detached_run_reuses_one_record_and_waits_for_success() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-detach");
+    let path = script(
+        &temp,
+        "detached.js",
+        r#"const delayed = await command("pwsh", ["-NoProfile", "-Command", "Start-Sleep -Milliseconds 800"], { timeoutSeconds: 10 });
+        return { ok: delayed.exitCode === 0 };"#,
+    );
+    let started = Instant::now();
+    let mut process = Command::new(env!("CARGO_BIN_EXE_servitor-workflows"))
+        .args(["run", path.to_str().expect("workflow path"), "--detach"])
+        .env("SERVITOR_WORKFLOWS_STATE_ROOT", &root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn detach probe");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process.try_wait().expect("poll detach probe").is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        process.try_wait().expect("poll detach probe").is_some(),
+        "detach parent did not exit promptly"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "detach took {:?}",
+        started.elapsed()
+    );
+    let detached = cli(&root, &["list", "--limit", "1"]);
+    let listed = cli_json(&detached);
+    let run_id = listed["data"]["runs"][0]["run_id"]
+        .as_str()
+        .expect("run id");
+    assert!(
+        listed["data"]["runs"][0]["journal_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("journal.jsonl"))
+    );
+    let waited = cli(&root, &["get", run_id, "--wait", "--timeout-seconds", "10"]);
+    assert!(waited.status.success(), "{:?}", waited);
+    assert_eq!(cli_json(&waited)["data"]["status"], "succeeded");
+    assert!(root.join("runs").join(run_id).join("state.json").is_file());
+    assert!(
+        root.join("runs")
+            .join(run_id)
+            .join("run-summary.html")
+            .is_file()
+    );
+    assert_eq!(
+        fs::read_dir(root.join("runs")).expect("runs dir").count(),
+        1,
+        "detached child must not create a second run"
+    );
+}
+
+#[test]
+fn wait_reports_human_failure_and_timeout_contracts() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-wait");
+
+    let gate_path = script(&temp, "gate-wait.js", "return await gate(\"ship?\");");
+    let gate_run = cli(&root, &["run", gate_path.to_str().unwrap(), "--detach"]);
+    let gate_id = cli_json(&gate_run)["data"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let waiting = cli(
+        &root,
+        &["get", &gate_id, "--wait", "--timeout-seconds", "10"],
+    );
+    assert_eq!(waiting.status.code(), Some(3));
+    assert_eq!(cli_json(&waiting)["error"]["code"], "waiting_human");
+
+    let failed_path = script(
+        &temp,
+        "failed-wait.js",
+        "throw new Error(\"expected failure\");",
+    );
+    let failed_run = cli(&root, &["run", failed_path.to_str().unwrap(), "--detach"]);
+    let failed_id = cli_json(&failed_run)["data"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let failed = cli(
+        &root,
+        &["get", &failed_id, "--wait", "--timeout-seconds", "10"],
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    let failed_json = cli_json(&failed);
+    assert_eq!(failed_json["error"]["code"], "terminal_failed");
+    assert!(
+        failed_json["error"]["remediation"]
+            .as_str()
+            .is_some_and(|text| text.contains(&format!("servitor-workflows resume {failed_id}")))
+    );
+    assert!(failed_json["data"]["journal_path"].is_string());
+
+    let slow_path = script(
+        &temp,
+        "timeout-wait.js",
+        r#"await command("pwsh", ["-NoProfile", "-Command", "Start-Sleep -Seconds 3"], { timeoutSeconds: 10 }); return true;"#,
+    );
+    let slow_root = temp.path().join("state-timeout");
+    let slow_engine = engine(&slow_root, Arc::new(FakeTransport::new(Duration::ZERO)));
+    let prepared = slow_engine
+        .prepare(&slow_path, Value::Null, 1, 10)
+        .expect("prepare running run");
+    let timed_out = cli(
+        &slow_root,
+        &["get", &prepared.run_id, "--wait", "--timeout-seconds", "0"],
+    );
+    assert_eq!(timed_out.status.code(), Some(4));
+    assert_eq!(cli_json(&timed_out)["error"]["code"], "wait_timeout");
 }
 
 #[test]

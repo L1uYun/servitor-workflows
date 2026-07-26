@@ -91,7 +91,11 @@ pub fn extract_json_value_for_schema(text: &str, schema: &Value) -> Result<Value
 }
 
 /// Minimal JSON Schema check used for candidate selection (type/required/properties/items).
-pub fn validate_value_against_schema(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
+pub fn validate_value_against_schema(
+    value: &Value,
+    schema: &Value,
+    path: &str,
+) -> Result<(), String> {
     if let Some(expected) = schema.get("type").and_then(Value::as_str) {
         let matches = match expected {
             "object" => value.is_object(),
@@ -430,7 +434,10 @@ still working {"status":"partial"}
             "properties": { "summary": {"type": "string"} }
         });
         let err = extract_json_value_for_schema(text, &schema).unwrap_err();
-        assert!(err.contains("summary") || err.contains("required"), "err={err}");
+        assert!(
+            err.contains("summary") || err.contains("required"),
+            "err={err}"
+        );
     }
 
     #[test]

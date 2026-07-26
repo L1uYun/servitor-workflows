@@ -184,10 +184,10 @@ in-place script edits. CLI equivalent: `supersede RUN_ID --reason TEXT
 ## CLI
 
 ```text
-servitor-workflows run WORKFLOW.js [--args JSON] [--max-parallel N] [--max-calls N]
+servitor-workflows run WORKFLOW.js [--args JSON] [--max-parallel N] [--max-calls N] [--detach]
 servitor-workflows check WORKFLOW.js
 servitor-workflows resume RUN_ID
-servitor-workflows get RUN_ID
+servitor-workflows get RUN_ID [--wait [--timeout-seconds N]]
 servitor-workflows list [--limit N] [--status STATUS]
 servitor-workflows approve RUN_ID --reason TEXT [--value JSON]
 servitor-workflows reject RUN_ID --reason TEXT
@@ -206,7 +206,13 @@ Output modes:
 --output quiet   exit status only
 ```
 
-Exit codes: `0` ok, `1` runtime/terminal failure, `2` invalid input, `3` not found. Errors use the same envelope on stdout.
+Exit codes: `0` ok, `1` runtime/terminal failure, `2` invalid input, `3` not found or `get --wait` reached `waiting_human`, `4` wait timeout. Errors use the same envelope on stdout.
+
+`run --detach` performs the same validation, creates one run record, starts a
+console-detached child against that existing record, and immediately returns its
+`run_id` and `journal_path`. It never creates a second workflow run. Use `get
+RUN_ID --wait` to poll every 500 ms until success, terminal failure, cancellation,
+supersession, or `waiting_human`; add `--timeout-seconds N` to bound the wait.
 
 `check` validates a workflow without running it: the meta declaration plus a
 parse of the script under the exact engine wrap (Script goal symbol, async IIFE).
@@ -215,7 +221,7 @@ parse of the script under the exact engine wrap (Script goal symbol, async IIFE)
 recorded in `state.json` as `error: "cancelled: <reason>"` for audit.
 
 `run`, `resume`, `get`, `approve`, `reject`, `pause`, `cancel`, and `supersede` return the
-low-noise public shape: `run_id`, `status`, and only relevant phase, active
+low-noise public shape: `run_id`, `status`, `journal_path`, and only relevant phase, active
 calls, gate, result, error, or terminal `report` path. `list` returns `{runs,count,limit,truncated,total}`. `inspect` is the explicit
 detailed surface and adds persisted state plus owner paths, including the
 machine `run_summary_path`.

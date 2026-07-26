@@ -65,6 +65,8 @@ pub struct RunState {
     pub report: Option<PathBuf>,
     #[serde(default)]
     pub run_summary: Option<PathBuf>,
+    #[serde(default)]
+    pub journal_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,6 +175,7 @@ pub struct PublicRun {
     pub report: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_summary: Option<PathBuf>,
+    pub journal_path: PathBuf,
 }
 
 impl From<&RunState> for PublicRun {
@@ -188,6 +191,7 @@ impl From<&RunState> for PublicRun {
             error: state.error.clone(),
             report: state.report.clone(),
             run_summary: state.run_summary.clone(),
+            journal_path: state.journal_path.clone(),
         }
     }
 }
