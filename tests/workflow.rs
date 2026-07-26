@@ -65,6 +65,24 @@ impl Transport for FakeTransport {
             }
         } else if prompt.contains("DISCOVER") {
             r#"{"items":["a","b","c"]}"#.to_owned()
+        } else if prompt.contains("NEGOTIATE_PROPOSE") {
+            if prompt.contains("ROUND=1") {
+                r#"{"proposal":"use canary A","assumptions":["local only"],"confidence":0.6}"#
+                    .to_owned()
+            } else {
+                r#"{"proposal":"use canary A fixed","assumptions":["local only","timeout 30s"],"confidence":0.85}"#
+                    .to_owned()
+            }
+        } else if prompt.contains("NEGOTIATE_REVIEW") {
+            if prompt.contains("ROUND=1") {
+                r#"{"verdict":"revise","critique":"missing timeout","must_fix":["add timeout bound"]}"#
+                    .to_owned()
+            } else {
+                r#"{"verdict":"accept","critique":"addressed","must_fix":[]}"#.to_owned()
+            }
+        } else if prompt.contains("NEGOTIATE_SYNTH") {
+            r#"{"accepted":true,"decision":"use canary A fixed","rationale":"reviewer accepted after revise","open_issues":[]}"#
+                .to_owned()
         } else if prompt.contains("WORK ") {
             format!(
                 "{}-ok",
@@ -811,3 +829,36 @@ fn max_calls_budget_persists_across_resume() {
     assert_eq!(resumed.status, RunStatus::Failed, "{:?}", resumed.error);
     assert_eq!(transport.count(), 1, "second agent must not be submitted");
 }
+
+#[test]
+fn negotiate_two_body_reaches_accept_after_revise() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(5)));
+    let path = temp.path().join("negotiate.js");
+    fs::write(
+        &path,
+        fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/negotiate-2body.workflow.js"),
+        )
+        .expect("read example"),
+    )
+    .expect("copy example");
+    let state = engine(&temp.path().join("state-negotiate"), Arc::clone(&transport))
+        .start(
+            &path,
+            json!({"topic":"local canary","maxRounds":2,"timeoutSeconds":30}),
+            2,
+            20,
+        )
+        .expect("run negotiation");
+    assert_eq!(state.status, RunStatus::Succeeded);
+    let result = state.result.expect("result");
+    assert_eq!(result["protocol"], "negotiate-2body.v1");
+    assert_eq!(result["stopReason"], "reviewer_accept");
+    assert_eq!(result["rounds"], 2);
+    assert_eq!(result["decision"]["accepted"], true);
+    assert_eq!(result["decision"]["decision"], "use canary A fixed");
+    assert_eq!(transport.count(), 5, "2 propose + 2 review + 1 synth");
+}
+
+

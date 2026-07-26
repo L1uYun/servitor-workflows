@@ -301,6 +301,10 @@ Real example:
 
 ```powershell
 servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\dynamic.workflow.js
+
+# Two-body negotiation canary (C6 script composition; see docs/multi-agent-negotiation.md)
+servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\negotiate-2body.workflow.js `
+  --args '{"topic":"pick a 30s local canary","maxRounds":2}'
 ```
 
 Pause/resume evidence uses the original run id:
@@ -326,4 +330,5 @@ Human-facing delivery HTML must be produced in the workflow reporting stage with
 ## Structured output (karma #449/#447)
 
 `schema` is a prompt-level contract, not a provider-native structured channel. The prompt still asks for bare JSON; extraction also recovers fenced/balanced JSON from free-form model text (strip reasoning → fenced blocks → balanced spans → trailing-comma repair → expected shape). Prefer literal smoke inputs (`INPUT_JSON={...}`) and evaluator `VERDICT=...` lines when a binary decision is required.
+
 
