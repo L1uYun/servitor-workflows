@@ -56,7 +56,8 @@ impl Transport for FakeTransport {
 
 ```json
 {\"summary\":\"ok\",\"score\":1}
-```".to_owned()
+```"
+            .to_owned()
         } else if prompt.contains("RETRY_JSON") {
             if number == 1 {
                 "not-json".to_owned()
@@ -140,6 +141,10 @@ impl Transport for FakeTransport {
         if record.state == ServitorState::Running {
             record.state = ServitorState::Succeeded;
             record.finished_at = Some(Utc::now());
+            record
+                .diagnostics
+                .provider
+                .insert("usage".to_owned(), json!({"input": 100, "output": 20}));
         }
         Ok(record.clone())
     }
@@ -327,13 +332,17 @@ fn command_result_is_structured_and_persisted() {
         let entry = entry.expect("entry");
         let candidate = entry.path().join("result.json");
         if candidate.exists() {
-            let disk: Value = serde_json::from_str(
-                &fs::read_to_string(&candidate).expect("read result.json"),
-            )
-            .expect("parse result.json");
+            let disk: Value =
+                serde_json::from_str(&fs::read_to_string(&candidate).expect("read result.json"))
+                    .expect("parse result.json");
             assert_eq!(disk["exitCode"], 0);
             assert_eq!(disk["timedOut"], false);
-            assert!(disk["stdout"].as_str().unwrap_or_default().contains("rustc"));
+            assert!(
+                disk["stdout"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("rustc")
+            );
             found = true;
         }
     }
@@ -362,7 +371,12 @@ fn command_failure_persists_result_and_error() {
         .expect("command workflow");
     assert_eq!(state.status, RunStatus::Succeeded);
     let result = state.result.expect("result");
-    assert!(result["caught"].as_str().unwrap_or_default().contains("command exited"));
+    assert!(
+        result["caught"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("command exited")
+    );
 
     let store = WorkflowStore::new(&state_root);
     let run_dir = store.run_dir(&state.run_id).join("commands");
@@ -371,10 +385,9 @@ fn command_failure_persists_result_and_error() {
         let entry = entry.expect("entry");
         let candidate = entry.path().join("result.json");
         if candidate.exists() {
-            let disk: Value = serde_json::from_str(
-                &fs::read_to_string(&candidate).expect("read result.json"),
-            )
-            .expect("parse result.json");
+            let disk: Value =
+                serde_json::from_str(&fs::read_to_string(&candidate).expect("read result.json"))
+                    .expect("parse result.json");
             assert_ne!(disk["exitCode"], 0);
             found = true;
         }
@@ -468,7 +481,11 @@ fn pause_and_cancel_interrupt_active_calls() {
     let final_pause = runner.join().expect("join").expect("runner result");
     assert_eq!(final_pause.status, RunStatus::Paused);
     assert!(
-        !root.join("runs").join(&run_id).join("pause.request").exists(),
+        !root
+            .join("runs")
+            .join(&run_id)
+            .join("pause.request")
+            .exists(),
         "pause.request must be cleared after pause terminalizes"
     );
 
@@ -545,6 +562,159 @@ fn resume_keeps_run_id_replays_journal_and_writes_run_summary() {
     let html = fs::read_to_string(summary).expect("read run summary");
     assert!(html.contains(&run_id));
     assert!(html.contains("Workflow 运行摘要"));
+}
+
+#[test]
+fn agent_journal_records_phase_duration_and_usage() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-agent-observability");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(5)));
+    let path = script(
+        &temp,
+        "agent-observability.js",
+        r#"phase("collect"); const a = await agent("hello"); return { done: a };"#,
+    );
+    let state = engine(&root, transport)
+        .start(&path, Value::Null, 1, 10)
+        .expect("agent workflow");
+    let lines = fs::read_to_string(WorkflowStore::new(&root).journal_path(&state.run_id))
+        .expect("read journal");
+    let entries = lines
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("journal value"))
+        .collect::<Vec<_>>();
+    let submitted = entries
+        .iter()
+        .find(|entry| entry["state"] == "submitted")
+        .expect("submitted entry");
+    assert_eq!(submitted["phase"], "collect");
+    assert!(submitted.get("duration_ms").is_none());
+    let succeeded = entries
+        .iter()
+        .find(|entry| entry["state"] == "succeeded")
+        .expect("succeeded entry");
+    assert_eq!(succeeded["phase"], "collect");
+    assert!(succeeded["duration_ms"].as_u64().is_some());
+    assert_eq!(succeeded["usage"], json!({"input": 100, "output": 20}));
+}
+
+#[test]
+fn command_journal_records_phase_and_duration() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-command-observability");
+    let path = script(
+        &temp,
+        "command-observability.js",
+        r#"phase("build"); return await command("rustc", ["--version"]);"#,
+    );
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 10)
+        .expect("command workflow");
+    let lines = fs::read_to_string(WorkflowStore::new(&root).journal_path(&state.run_id))
+        .expect("read journal");
+    let succeeded = lines
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("journal value"))
+        .find(|entry| entry["state"] == "succeeded")
+        .expect("succeeded entry");
+    assert_eq!(succeeded["phase"], "build");
+    assert!(succeeded["duration_ms"].as_u64().is_some());
+    assert!(succeeded.get("usage").is_none());
+}
+
+#[test]
+fn waiting_human_writes_run_summary() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-waiting-summary");
+    let path = script(
+        &temp,
+        "waiting-summary.js",
+        r#"const decision = await gate("ship it?", { label: "ship", expect: "approval", hint: "check evidence" }); return decision;"#,
+    );
+    let engine = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)));
+    let waiting = engine.start(&path, Value::Null, 1, 10).expect("start");
+    assert_eq!(waiting.status, RunStatus::WaitingHuman);
+    let waiting_summary = waiting.run_summary.expect("waiting summary");
+    let html = fs::read_to_string(&waiting_summary).expect("read waiting summary");
+    assert!(html.contains("<h2>等待人工审批</h2>"));
+    assert!(html.contains("ship it?"));
+    assert!(html.contains("执行暂停，等待人工闸门审批"));
+    let completed = engine
+        .approve(&waiting.run_id, true, "approved".to_owned(), None)
+        .expect("approve");
+    let html = fs::read_to_string(completed.run_summary.expect("terminal summary"))
+        .expect("read terminal summary");
+    assert!(!html.contains("<h2>等待人工审批</h2>"));
+}
+
+#[test]
+fn run_summary_has_phase_duration_token_columns_and_chip() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-summary-observability");
+    let path = script(
+        &temp,
+        "summary-observability.js",
+        r#"phase("collect"); return await agent("hello");"#,
+    );
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 10)
+        .expect("agent workflow");
+    let html = fs::read_to_string(state.run_summary.expect("summary")).expect("read summary");
+    assert!(html.contains("<th>阶段</th>"));
+    assert!(html.contains("<th>耗时</th>"));
+    assert!(html.contains("<th>Tokens</th>"));
+    assert!(html.contains(">collect</td>"));
+    assert!(html.contains("<span class=\"chip\">Tokens 120</span>"));
+
+    let command_path = script(
+        &temp,
+        "summary-no-usage.js",
+        r#"return await command("rustc", ["--version"]);"#,
+    );
+    let command_state = engine(
+        &temp.path().join("state-summary-no-usage"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    )
+    .start(&command_path, Value::Null, 1, 10)
+    .expect("command workflow");
+    let html =
+        fs::read_to_string(command_state.run_summary.expect("summary")).expect("read summary");
+    assert!(!html.contains("<span class=\"chip\">Tokens "));
+}
+
+#[test]
+fn resume_replays_journal_lines_without_new_fields() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-old-journal-resume");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "old-journal-resume.js",
+        r#"phase("collect"); const a = await agent("one"); const b = await agent("two"); return { a, b };"#,
+    );
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("workflow");
+    let journal_path = WorkflowStore::new(&root).journal_path(&state.run_id);
+    let stripped = fs::read_to_string(&journal_path)
+        .expect("read journal")
+        .lines()
+        .map(|line| {
+            let mut value: Value = serde_json::from_str(line).expect("journal value");
+            let object = value.as_object_mut().expect("journal object");
+            object.remove("phase");
+            object.remove("duration_ms");
+            object.remove("usage");
+            serde_json::to_string(&value).expect("serialize journal value")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&journal_path, format!("{stripped}\n")).expect("rewrite old journal");
+    let resumed = engine(&root, Arc::clone(&transport))
+        .resume(&state.run_id)
+        .expect("resume completed run");
+    assert_eq!(resumed.status, RunStatus::Succeeded);
+    assert_eq!(transport.count(), 2);
 }
 
 fn wait_for_active_run(root: &Path) -> String {
@@ -775,7 +945,6 @@ fn gate_returns_injected_value() {
     assert_eq!(resumed.result, Some(json!({"path": "surveys/new.md"})));
 }
 
-
 #[test]
 fn resume_does_not_rerun_superseded_run() {
     let temp = TempDir::new().expect("tempdir");
@@ -821,11 +990,7 @@ fn max_calls_budget_persists_across_resume() {
         .expect("start with tiny max_calls");
     assert_eq!(failed.status, RunStatus::Failed, "{:?}", failed.error);
     assert!(
-        failed
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("max_calls"),
+        failed.error.as_deref().unwrap_or("").contains("max_calls"),
         "{:?}",
         failed.error
     );
@@ -865,8 +1030,6 @@ fn negotiate_two_body_reaches_accept_after_revise() {
     assert_eq!(result["decision"]["decision"], "use canary A fixed");
     assert_eq!(transport.count(), 5, "2 propose + 2 review + 1 synth");
 }
-
-
 
 #[test]
 fn date_now_fails_fast_with_actionable_error() {
@@ -1059,8 +1222,9 @@ fn check_rejects_syntax_errors_and_module_only_syntax_without_creating_runs() {
         assert!(matches!(err, WorkflowError::InvalidWorkflow(_)));
     }
     let runs = root.join("runs");
-    let leftover = std::fs::read_dir(&runs)
-        .map(|it| it.count())
-        .unwrap_or(0);
-    assert_eq!(leftover, 0, "refused scripts must not leave run directories");
+    let leftover = std::fs::read_dir(&runs).map(|it| it.count()).unwrap_or(0);
+    assert_eq!(
+        leftover, 0,
+        "refused scripts must not leave run directories"
+    );
 }

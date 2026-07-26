@@ -29,10 +29,7 @@ impl RunStatus {
     /// Statuses that must not re-execute on `resume`.
     /// `Failed` stays resumable so journaled recovery can retry intentionally.
     pub fn blocks_resume_rerun(&self) -> bool {
-        matches!(
-            self,
-            Self::Succeeded | Self::Cancelled | Self::Superseded
-        )
+        matches!(self, Self::Succeeded | Self::Cancelled | Self::Superseded)
     }
 }
 
@@ -128,6 +125,12 @@ pub struct JournalEntry {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,5 +178,43 @@ impl From<&RunState> for PublicRun {
             report: state.report.clone(),
             run_summary: state.run_summary.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn old_journal_entry_deserializes_without_observability_fields() {
+        let entry: JournalEntry = serde_json::from_str(
+            r#"{"at":"2026-01-01T00:00:00Z","key":"k","kind":"agent","state":"succeeded","label":"l"}"#,
+        )
+        .expect("deserialize old journal entry");
+        assert_eq!(entry.phase, None);
+        assert_eq!(entry.duration_ms, None);
+        assert_eq!(entry.usage, None);
+    }
+
+    #[test]
+    fn absent_observability_fields_are_not_serialized() {
+        let entry = JournalEntry {
+            at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            key: "k".to_owned(),
+            kind: CallKind::Agent,
+            state: CallState::Succeeded,
+            label: "l".to_owned(),
+            result: None,
+            error: None,
+            transport_run_id: None,
+            phase: None,
+            duration_ms: None,
+            usage: None,
+        };
+        let value = serde_json::to_value(entry).expect("serialize journal entry");
+        assert!(value.get("phase").is_none());
+        assert!(value.get("duration_ms").is_none());
+        assert!(value.get("usage").is_none());
     }
 }

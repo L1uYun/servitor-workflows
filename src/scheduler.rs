@@ -74,8 +74,9 @@ impl RuntimeHost {
         key: String,
         prompt: String,
         options: AgentOptions,
+        phase: Option<String>,
     ) -> oneshot::Receiver<JobResult> {
-        let call = AgentCall::new(key, prompt, options);
+        let call = AgentCall::new(key, prompt, options, phase);
         let active_key = call.key.clone();
         let active_label = call.label.clone();
         let run_id = self.run_id.clone();
@@ -100,8 +101,9 @@ impl RuntimeHost {
         program: String,
         args: Vec<String>,
         options: CommandOptions,
+        phase: Option<String>,
     ) -> oneshot::Receiver<JobResult> {
-        let call = CommandCall::new(key, program, args, options);
+        let call = CommandCall::new(key, program, args, options, phase);
         let active_key = call.key.clone();
         let active_label = call.label.clone();
         let run_id = self.run_id.clone();

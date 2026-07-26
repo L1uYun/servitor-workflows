@@ -35,10 +35,17 @@ pub(crate) struct CommandCall {
     program: String,
     args: Vec<String>,
     options: CommandOptions,
+    pub phase: Option<String>,
 }
 
 impl CommandCall {
-    pub fn new(key: String, program: String, args: Vec<String>, options: CommandOptions) -> Self {
+    pub fn new(
+        key: String,
+        program: String,
+        args: Vec<String>,
+        options: CommandOptions,
+        phase: Option<String>,
+    ) -> Self {
         let label = options.label.clone().unwrap_or_else(|| key.clone());
         Self {
             key,
@@ -46,6 +53,7 @@ impl CommandCall {
             program,
             args,
             options,
+            phase,
         }
     }
 }
@@ -66,7 +74,8 @@ pub(crate) struct CommandResult {
 
 impl CommandResult {
     fn into_json(self) -> Value {
-        serde_json::to_value(self).unwrap_or_else(|_| json!({"error": "command result serialization failed"}))
+        serde_json::to_value(self)
+            .unwrap_or_else(|_| json!({"error": "command result serialization failed"}))
     }
 }
 
@@ -82,6 +91,7 @@ pub(crate) fn run(
         program,
         args,
         options,
+        phase,
     } = call;
     if let Some(entry) = store
         .journal_index(run_id)
@@ -101,6 +111,8 @@ pub(crate) fn run(
         CallState::Submitted,
         None,
         None,
+        phase.clone(),
+        None,
     )?;
     let call_dir = store
         .run_dir(run_id)
@@ -112,7 +124,9 @@ pub(crate) fn run(
     let stdout = fs::File::create(&stdout_path).map_err(|error| error.to_string())?;
     let stderr = fs::File::create(&stderr_path).map_err(|error| error.to_string())?;
     let resolved_cwd = resolve_cwd(default_cwd, options.cwd.as_deref());
-    let argv: Vec<String> = std::iter::once(program.clone()).chain(args.iter().cloned()).collect();
+    let argv: Vec<String> = std::iter::once(program.clone())
+        .chain(args.iter().cloned())
+        .collect();
     let mut command = Command::new(&program);
     command
         .args(&args)
@@ -137,6 +151,8 @@ pub(crate) fn run(
                 CallState::Cancelled,
                 None,
                 Some("interrupted".to_owned()),
+                phase.clone(),
+                None,
             )?;
             return Err("workflow interrupted".to_owned());
         }
@@ -152,7 +168,16 @@ pub(crate) fn run(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(POLL_INTERVAL),
-            Err(error) => return fail(store, run_id, &key, &label, error.to_string()),
+            Err(error) => {
+                return fail(
+                    store,
+                    run_id,
+                    &key,
+                    &label,
+                    error.to_string(),
+                    phase.clone(),
+                );
+            }
         }
     };
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -179,6 +204,8 @@ pub(crate) fn run(
             &label,
             "command timed out".to_owned(),
             result_json,
+            phase.clone(),
+            Some(duration_ms),
         );
     }
     if status.success() {
@@ -190,6 +217,8 @@ pub(crate) fn run(
             CallState::Succeeded,
             Some(result_json.clone()),
             None,
+            phase.clone(),
+            Some(duration_ms),
         )?;
         Ok(result_json)
     } else {
@@ -204,6 +233,8 @@ pub(crate) fn run(
                 result_json["stderr"].as_str().unwrap_or_default().trim()
             ),
             result_json,
+            phase.clone(),
+            Some(duration_ms),
         )
     }
 }
@@ -229,6 +260,8 @@ fn fail_with_result(
     label: &str,
     message: String,
     result: Value,
+    phase: Option<String>,
+    duration_ms: Option<u64>,
 ) -> JobResult {
     append(
         store,
@@ -238,11 +271,20 @@ fn fail_with_result(
         CallState::Failed,
         Some(result),
         Some(message.clone()),
+        phase,
+        duration_ms,
     )?;
     Err(message)
 }
 
-fn fail(store: &WorkflowStore, run_id: &str, key: &str, label: &str, message: String) -> JobResult {
+fn fail(
+    store: &WorkflowStore,
+    run_id: &str,
+    key: &str,
+    label: &str,
+    message: String,
+    phase: Option<String>,
+) -> JobResult {
     append(
         store,
         run_id,
@@ -251,6 +293,8 @@ fn fail(store: &WorkflowStore, run_id: &str, key: &str, label: &str, message: St
         CallState::Failed,
         None,
         Some(message.clone()),
+        phase,
+        None,
     )?;
     Err(message)
 }
@@ -263,6 +307,8 @@ fn append(
     state: CallState,
     result: Option<Value>,
     error: Option<String>,
+    phase: Option<String>,
+    duration_ms: Option<u64>,
 ) -> Result<(), String> {
     store
         .append(
@@ -276,6 +322,9 @@ fn append(
                 result,
                 error,
                 transport_run_id: None,
+                phase,
+                duration_ms,
+                usage: None,
             },
         )
         .map_err(|error| error.to_string())
@@ -325,6 +374,3 @@ fn hide_window(command: &mut Command) {
 }
 #[cfg(not(windows))]
 fn hide_window(_command: &mut Command) {}
-
-
-

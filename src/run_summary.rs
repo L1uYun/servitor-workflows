@@ -2,6 +2,7 @@
 use crate::error::WorkflowError;
 use crate::model::{CallState, JournalEntry, RunState, RunStatus};
 use crate::store::WorkflowStore;
+use serde_json::Value;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -37,6 +38,7 @@ fn render(state: &RunState, entries: &[&JournalEntry]) -> Result<String, Workflo
         RunStatus::Succeeded => "执行成功",
         RunStatus::Failed => "执行失败，需要处理错误后继续",
         RunStatus::Cancelled => "执行已取消",
+        RunStatus::WaitingHuman => "执行暂停，等待人工闸门审批",
         _ => "执行尚未结束",
     };
     let phase = state.phase.as_deref().unwrap_or("未声明");
@@ -48,11 +50,14 @@ fn render(state: &RunState, entries: &[&JournalEntry]) -> Result<String, Workflo
         let transport = entry.transport_run_id.as_deref().unwrap_or("—");
         write!(
             rows,
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             index + 1,
             escape(&entry.label),
             escape(call_kind(entry)),
             escape(call_state(entry)),
+            escape(entry.phase.as_deref().unwrap_or("—")),
+            format_duration(entry.duration_ms),
+            usage_tokens(entry.usage.as_ref()).map_or_else(|| "—".to_owned(), |n| n.to_string()),
         )
         .map_err(|_| WorkflowError::Invariant("failed to render report row".to_owned()))?;
         write!(
@@ -66,11 +71,35 @@ fn render(state: &RunState, entries: &[&JournalEntry]) -> Result<String, Workflo
     }
     if rows.is_empty() {
         rows.push_str(
-            "<tr><td colspan=\"4\" class=\"muted\">这个 workflow 没有外部调用。</td></tr>",
+            "<tr><td colspan=\"7\" class=\"muted\">这个 workflow 没有外部调用。</td></tr>",
         );
         technical_rows
             .push_str("<tr><td colspan=\"3\" class=\"muted\">没有技术调用标识。</td></tr>");
     }
+    let total_tokens = entries
+        .iter()
+        .filter_map(|entry| usage_tokens(entry.usage.as_ref()))
+        .fold(None::<u64>, |acc, n| {
+            Some(acc.unwrap_or(0).saturating_add(n))
+        });
+    let tokens_chip = total_tokens.map_or_else(String::new, |total| {
+        format!("<span class=\"chip\">Tokens {total}</span>")
+    });
+    let gate_card = state.waiting_gate.as_ref().map_or_else(String::new, |gate| {
+        let expect_row = gate.expect.as_deref().map_or_else(String::new, |expect| {
+            format!("<dt>期望</dt><dd>{}</dd>", escape(expect))
+        });
+        let hint_row = gate.hint.as_deref().map_or_else(String::new, |hint| {
+            format!("<dt>提示</dt><dd>{}</dd>", escape(hint))
+        });
+        format!(
+            "<section class=\"card\"><h2>等待人工审批</h2><dl><dt>闸门</dt><dd>{}</dd><dt>问题</dt><dd>{}</dd>{expect_row}{hint_row}</dl><p>处理命令：<code>servitor-workflows approve {} --reason &quot;...&quot;</code> 或 <code>servitor-workflows reject {} --reason &quot;...&quot;</code></p></section>",
+            escape(&gate.label),
+            escape(&gate.question),
+            escape(&state.run_id),
+            escape(&state.run_id),
+        )
+    });
 
     Ok(format!(
         r#"<!doctype html>
@@ -97,11 +126,11 @@ details summary{{cursor:pointer;font-weight:600}} .muted{{color:var(--muted)}} a
 </head>
 <body><div class="shell">
 <header><div class="eyebrow">Servitor Workflows · Run Summary</div><h1>Workflow 运行摘要</h1><p class="lead">{verdict}</p>
-<div class="chips"><span class="chip">任务 {name}</span><span class="chip">状态 {status}</span><span class="chip">阶段 {phase}</span><span class="chip">恢复 {resume_count} 次</span><span class="chip">成功调用 {succeeded}</span><span class="chip">失败调用 {failed}</span></div></header>
+<div class="chips"><span class="chip">任务 {name}</span><span class="chip">状态 {status}</span><span class="chip">阶段 {phase}</span><span class="chip">恢复 {resume_count} 次</span><span class="chip">成功调用 {succeeded}</span><span class="chip">失败调用 {failed}</span>{tokens_chip}</div></header>
 <main><div class="stack">
-<section class="card"><h2>运行状态</h2><div class="flow"><span class="node">workflow</span><span class="arrow">→</span><span class="node">calls</span><span class="arrow">→</span><span class="node">terminal state</span></div>
+{gate_card}<section class="card"><h2>运行状态</h2><div class="flow"><span class="node">workflow</span><span class="arrow">→</span><span class="node">calls</span><span class="arrow">→</span><span class="node">terminal state</span></div>
 <p>当前 run 已进入 <strong>{status}</strong>，最后阶段为 <strong>{phase}</strong>。此页只汇总编排器事实；项目结论由 workflow 返回的交付汇报承载。</p></section>
-<section class="card"><h2>调用与检查证据</h2><div class="table-wrap"><table><thead><tr><th>步骤</th><th>标签</th><th>类型</th><th>状态</th></tr></thead><tbody>{rows}</tbody></table></div>
+<section class="card"><h2>调用与检查证据</h2><div class="table-wrap"><table><thead><tr><th>步骤</th><th>标签</th><th>类型</th><th>状态</th><th>阶段</th><th>耗时</th><th>Tokens</th></tr></thead><tbody>{rows}</tbody></table></div>
 <details><summary>技术标识</summary><div class="table-wrap"><table><thead><tr><th>标签</th><th>稳定键</th><th>Transport run</th></tr></thead><tbody>{technical_rows}</tbody></table></div></details></section>
 <section class="card"><h2>最终输出</h2><details><summary>展开结构化结果</summary><pre>{result}</pre></details></section>
 <section class="card"><h2>边界</h2><p>这个页面根据持久化 state 与 journal 生成。它只证明编排器记录的执行结果与调用状态，不替代项目测试、线上 smoke、人工验收、外部事实核查或面向读者的交付判断。</p><p>错误信息：<code>{error}</code></p></section>
@@ -115,6 +144,8 @@ details summary{{cursor:pointer;font-weight:600}} .muted{{color:var(--muted)}} a
         resume_count = state.resume_count,
         succeeded = succeeded,
         failed = failed,
+        tokens_chip = tokens_chip,
+        gate_card = gate_card,
         rows = rows,
         technical_rows = technical_rows,
         result = escape(&result_json),
@@ -156,6 +187,37 @@ fn call_state(entry: &JournalEntry) -> &'static str {
     }
 }
 
+fn format_duration(ms: Option<u64>) -> String {
+    match ms {
+        Some(ms) if ms >= 1000 => format!("{:.1}s", ms as f64 / 1000.0),
+        Some(ms) => format!("{ms}ms"),
+        None => "—".to_owned(),
+    }
+}
+
+fn usage_tokens(usage: Option<&Value>) -> Option<u64> {
+    let usage = usage?.as_object()?;
+    for key in ["total_tokens", "totalTokens", "total"] {
+        if let Some(total) = usage.get(key).and_then(Value::as_u64) {
+            return Some(total);
+        }
+    }
+    for (input, output) in [
+        ("input", "output"),
+        ("input_tokens", "output_tokens"),
+        ("prompt_tokens", "completion_tokens"),
+        ("inputTokens", "outputTokens"),
+    ] {
+        if let (Some(input), Some(output)) = (
+            usage.get(input).and_then(Value::as_u64),
+            usage.get(output).and_then(Value::as_u64),
+        ) {
+            return Some(input.saturating_add(output));
+        }
+    }
+    None
+}
+
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -166,10 +228,34 @@ fn escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::escape;
+    use super::{escape, format_duration, usage_tokens};
+    use serde_json::json;
 
     #[test]
     fn html_escape_covers_markup_and_quotes() {
         assert_eq!(escape("<a x='1'>&\""), "&lt;a x=&#39;1&#39;&gt;&amp;&quot;");
+    }
+
+    #[test]
+    fn usage_tokens_supports_provider_shapes() {
+        assert_eq!(usage_tokens(Some(&json!({"total_tokens": 42}))), Some(42));
+        assert_eq!(usage_tokens(Some(&json!({"totalTokens": 42}))), Some(42));
+        assert_eq!(
+            usage_tokens(Some(&json!({"input": 100, "output": 20}))),
+            Some(120)
+        );
+        assert_eq!(
+            usage_tokens(Some(&json!({"input_tokens": 1, "output_tokens": 2}))),
+            Some(3)
+        );
+        assert_eq!(usage_tokens(Some(&json!({"weird": true}))), None);
+        assert_eq!(usage_tokens(None), None);
+    }
+
+    #[test]
+    fn duration_format_is_compact() {
+        assert_eq!(format_duration(Some(250)), "250ms");
+        assert_eq!(format_duration(Some(12_340)), "12.3s");
+        assert_eq!(format_duration(None), "—");
     }
 }

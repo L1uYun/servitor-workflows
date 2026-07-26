@@ -160,6 +160,8 @@ struct HostState {
     /// re-appending them — occurrence-based, like journal replay.
     #[unsafe_ignore_trace]
     log_replay: Arc<Mutex<Option<(usize, usize)>>>,
+    #[unsafe_ignore_trace]
+    phase: Arc<Mutex<Option<String>>>,
     max_calls: usize,
 }
 
@@ -276,12 +278,18 @@ fn execute_vm(
         .unwrap_or_default();
     let journal_used = journal_index.len();
     let journal_keys: BTreeSet<String> = journal_index.into_keys().collect();
+    let initial_phase = runtime
+        .store
+        .load_state(&runtime.run_id)
+        .ok()
+        .and_then(|state| state.phase);
     context.insert_data(HostState {
         runtime,
         occurrences: Arc::new(Mutex::new(BTreeMap::new())),
         calls: Arc::new(Mutex::new(journal_used)),
         journal_keys: Arc::new(Mutex::new(journal_keys)),
         log_replay: Arc::new(Mutex::new(None)),
+        phase: Arc::new(Mutex::new(initial_phase)),
         max_calls,
     });
     context
@@ -393,7 +401,12 @@ async fn host_agent(
     let options: AgentOptions = serde_json::from_str(&options_json).map_err(native_error)?;
     let input = json!({"prompt": prompt, "options": options});
     let key = host.key("agent", &input).map_err(native_error)?;
-    let receiver = host.runtime.agent(key.clone(), prompt, options);
+    let phase = host
+        .phase
+        .lock()
+        .map_err(|_| native_error("phase lock poisoned"))?
+        .clone();
+    let receiver = host.runtime.agent(key.clone(), prompt, options, phase);
     let result = receiver
         .await
         .map_err(|_| native_error("agent worker dropped"))?
@@ -426,7 +439,14 @@ async fn host_command(
     let options: CommandOptions = serde_json::from_str(&options_json).map_err(native_error)?;
     let input = json!({"program": program, "args": argv, "options": options});
     let key = host.key("command", &input).map_err(native_error)?;
-    let receiver = host.runtime.command(key.clone(), program, argv, options);
+    let phase = host
+        .phase
+        .lock()
+        .map_err(|_| native_error("phase lock poisoned"))?
+        .clone();
+    let receiver = host
+        .runtime
+        .command(key.clone(), program, argv, options, phase);
     let result = receiver
         .await
         .map_err(|_| native_error("command worker dropped"))?
@@ -536,20 +556,21 @@ fn host_phase(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         .get_data::<HostState>()
         .cloned()
         .ok_or_else(|| JsNativeError::error().with_message("workflow host is missing"))?;
+    let persisted_name = name.clone();
     host.runtime
         .store
         .update_state(&host.runtime.run_id, |state| {
-            state.phase = Some(name);
+            state.phase = Some(persisted_name);
         })
         .map_err(native_error)?;
+    *host
+        .phase
+        .lock()
+        .map_err(|_| native_error("phase lock poisoned"))? = Some(name);
     Ok(JsValue::undefined())
 }
 
-fn host_sleep(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
+fn host_sleep(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let ms = args
         .get_or_undefined(0)
         .to_number(context)
@@ -604,7 +625,6 @@ fn host_log(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResul
     }
     Ok(JsValue::undefined())
 }
-
 
 fn js_string_arg(args: &[JsValue], index: usize, context: &mut Context) -> JsResult<String> {
     Ok(args

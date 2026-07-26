@@ -75,16 +75,18 @@ pub(crate) struct AgentCall {
     pub label: String,
     prompt: String,
     options: AgentOptions,
+    pub phase: Option<String>,
 }
 
 impl AgentCall {
-    pub fn new(key: String, prompt: String, options: AgentOptions) -> Self {
+    pub fn new(key: String, prompt: String, options: AgentOptions, phase: Option<String>) -> Self {
         let label = options.label.clone().unwrap_or_else(|| key.clone());
         Self {
             key,
             label,
             prompt,
             options,
+            phase,
         }
     }
 }
@@ -101,8 +103,9 @@ pub(crate) fn run(
         label,
         prompt,
         options,
+        phase,
     } = call;
-    let append = |state, result, error, transport_run_id| {
+    let append = |state, result, error, transport_run_id, duration_ms, usage| {
         store
             .append(
                 run_id,
@@ -115,6 +118,9 @@ pub(crate) fn run(
                     result,
                     error,
                     transport_run_id,
+                    phase: phase.clone(),
+                    duration_ms,
+                    usage,
                 },
             )
             .map_err(|error| error.to_string())
@@ -128,7 +134,7 @@ pub(crate) fn run(
             CallState::Succeeded => return Ok(entry.result.clone().unwrap_or(Value::Null)),
             CallState::Failed => {
                 if let Some(transport_run_id) = entry.transport_run_id.as_deref()
-                    && let Ok(Some(result)) =
+                    && let Ok(Some((result, duration_ms, usage))) =
                         try_recover_structured(transport, transport_run_id, options.schema.as_ref())
                 {
                     append(
@@ -136,6 +142,8 @@ pub(crate) fn run(
                         Some(result.clone()),
                         None,
                         Some(transport_run_id.to_owned()),
+                        duration_ms,
+                        usage,
                     )?;
                     return Ok(result);
                 }
@@ -168,6 +176,8 @@ pub(crate) fn run(
                 None,
                 None,
                 Some(response.run_id.clone()),
+                None,
+                None,
             )?;
             response.run_id
         };
@@ -180,6 +190,8 @@ pub(crate) fn run(
                 None,
                 Some("interrupted".to_owned()),
                 Some(transport_run_id),
+                None,
+                None,
             )?;
             return Err("workflow interrupted".to_owned());
         }
@@ -189,6 +201,7 @@ pub(crate) fn run(
         match record.state {
             ServitorState::Accepted | ServitorState::Running => thread::sleep(POLL_INTERVAL),
             ServitorState::Succeeded => {
+                let (duration_ms, usage) = record_metrics(&record);
                 match materialize_output(record.output.as_ref(), options.schema.as_ref()) {
                     Ok(result) => {
                         append(
@@ -196,6 +209,8 @@ pub(crate) fn run(
                             Some(result.clone()),
                             None,
                             Some(transport_run_id),
+                            duration_ms,
+                            usage,
                         )?;
                         return Ok(result);
                     }
@@ -205,12 +220,15 @@ pub(crate) fn run(
                             None,
                             Some(error.clone()),
                             Some(transport_run_id),
+                            duration_ms,
+                            usage,
                         )?;
                         return Err(error);
                     }
                 }
             }
             ServitorState::Failed | ServitorState::Cancelled => {
+                let (duration_ms, usage) = record_metrics(&record);
                 let message = record
                     .error
                     .map(|error| format!("{}: {}", error.code, error.message))
@@ -220,7 +238,14 @@ pub(crate) fn run(
                 } else {
                     CallState::Failed
                 };
-                append(state, None, Some(message.clone()), Some(transport_run_id))?;
+                append(
+                    state,
+                    None,
+                    Some(message.clone()),
+                    Some(transport_run_id),
+                    duration_ms,
+                    usage,
+                )?;
                 return Err(message);
             }
         }
@@ -238,17 +263,27 @@ fn try_recover_structured(
     transport: &dyn Transport,
     transport_run_id: &str,
     schema: Option<&Value>,
-) -> Result<Option<Value>, String> {
+) -> Result<Option<(Value, Option<u64>, Option<Value>)>, String> {
     let record = transport
         .inspect(transport_run_id)
         .map_err(|error| format!("{}: {}", error.code, error.message))?;
     if record.state != ServitorState::Succeeded {
         return Ok(None);
     }
+    let (duration_ms, usage) = record_metrics(&record);
     match materialize_output(record.output.as_ref(), schema) {
-        Ok(value) => Ok(Some(value)),
+        Ok(value) => Ok(Some((value, duration_ms, usage))),
         Err(_) => Ok(None),
     }
+}
+
+fn record_metrics(record: &servitor::RunRecord) -> (Option<u64>, Option<Value>) {
+    let duration_ms = match (record.started_at, record.finished_at) {
+        (Some(start), Some(end)) => u64::try_from((end - start).num_milliseconds()).ok(),
+        _ => None,
+    };
+    let usage = record.diagnostics.provider.get("usage").cloned();
+    (duration_ms, usage)
 }
 
 fn materialize_output(output: Option<&Output>, schema: Option<&Value>) -> JobResult {
@@ -318,4 +353,3 @@ mod materialize_tests {
         assert_eq!(value["ok"], true);
     }
 }
-
