@@ -159,6 +159,10 @@ pub(crate) fn run(
         }
     }
 
+    let resumed_correction = existing
+        .as_ref()
+        .filter(|entry| entry.state == CallState::Submitted && correction_exhausted(entry))
+        .and_then(|entry| entry.schema_correction.clone());
     let (first_run_id, first_record) = match existing.as_ref() {
         Some(entry) if matches!(entry.state, CallState::Submitted | CallState::Failed) => {
             let transport_run_id = entry
@@ -208,17 +212,54 @@ pub(crate) fn run(
                     Some(first_run_id),
                     None,
                     None,
-                    None,
+                    resumed_correction,
                 )?;
                 return Err(error);
             }
         },
     };
     if first_record.state != ServitorState::Succeeded {
-        return finish_transport_failure(&append, first_run_id, first_record, None);
+        return finish_transport_failure(&append, first_run_id, first_record, resumed_correction);
     }
 
     let (first_duration_ms, first_usage) = record_metrics(&first_record);
+    if let Some(mut metadata) = resumed_correction {
+        return match materialize_output(first_record.output.as_ref(), options.schema.as_ref()) {
+            Ok(result) => {
+                append(
+                    CallState::Succeeded,
+                    Some(result.clone()),
+                    None,
+                    Some(first_run_id),
+                    first_duration_ms,
+                    first_usage,
+                    Some(metadata),
+                )?;
+                Ok(result)
+            }
+            Err(second_error) => {
+                let first_error = metadata
+                    .validation_errors
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown initial schema validation error".to_owned());
+                metadata.validation_errors.push(second_error.clone());
+                let combined = format!(
+                    "schema validation failed after one correction; first: {first_error}; correction: {second_error}"
+                );
+                append(
+                    CallState::Failed,
+                    None,
+                    Some(combined.clone()),
+                    Some(first_run_id),
+                    first_duration_ms,
+                    first_usage,
+                    Some(metadata),
+                )?;
+                Err(combined)
+            }
+        };
+    }
     match materialize_output(first_record.output.as_ref(), options.schema.as_ref()) {
         Ok(result) => {
             append(

@@ -396,6 +396,68 @@ fn exhausted_schema_correction_fails_and_resume_does_not_submit_third_time() {
 }
 
 #[test]
+fn submitted_schema_correction_is_polled_on_resume_without_third_submission() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-submitted-correction");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "submitted-correction.js",
+        r#"return await agent("INVALID_TWICE", { schema: { type: "object", required: ["ok"] } });"#,
+    );
+    let failed = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("terminal workflow");
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(transport.count(), 2);
+
+    let journal_path = WorkflowStore::new(&root).journal_path(&failed.run_id);
+    let journal = fs::read_to_string(&journal_path).expect("journal");
+    let crash_journal = journal.lines().take(2).collect::<Vec<_>>().join("\n");
+    let submitted: Value = serde_json::from_str(
+        crash_journal
+            .lines()
+            .last()
+            .expect("correction submission entry"),
+    )
+    .expect("submitted correction json");
+    assert_eq!(submitted["state"], "submitted");
+    assert_eq!(submitted["transport_run_id"], "fake-2");
+    assert_eq!(submitted["schema_correction"]["attempted"], true);
+    fs::write(&journal_path, format!("{crash_journal}\n")).expect("simulate crash journal");
+
+    let resumed = engine(&root, Arc::clone(&transport))
+        .resume(&failed.run_id)
+        .expect("resume submitted correction");
+    assert_eq!(resumed.status, RunStatus::Failed);
+    assert_eq!(
+        transport.count(),
+        2,
+        "resume submitted a third transport run"
+    );
+    let terminal: Value = serde_json::from_str(
+        fs::read_to_string(&journal_path)
+            .expect("resumed journal")
+            .lines()
+            .last()
+            .expect("terminal correction entry"),
+    )
+    .expect("terminal correction json");
+    assert_eq!(terminal["state"], "failed");
+    assert_eq!(
+        terminal["schema_correction"]["transport_run_ids"],
+        json!(["fake-1", "fake-2"])
+    );
+    assert_eq!(
+        terminal["schema_correction"]["validation_errors"]
+            .as_array()
+            .expect("validation errors")
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn transport_submission_failure_has_no_schema_correction_retry() {
     let temp = TempDir::new().expect("tempdir");
     let transport = Arc::new(FakeTransport::failing(Duration::ZERO));
