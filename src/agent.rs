@@ -1,5 +1,5 @@
 use crate::json_extract::extract_json_value_for_schema;
-use crate::model::{CallKind, CallState, JournalEntry};
+use crate::model::{CallKind, CallState, JournalEntry, SchemaCorrectionMetadata};
 use crate::scheduler::JobResult;
 use crate::store::WorkflowStore;
 use chrono::Utc;
@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+const INVALID_OUTPUT_EXCERPT_MAX_CHARS: usize = 2_000;
 
 pub trait Transport: Send + Sync {
     fn submit(
@@ -105,7 +106,7 @@ pub(crate) fn run(
         options,
         phase,
     } = call;
-    let append = |state, result, error, transport_run_id, duration_ms, usage| {
+    let append = |state, result, error, transport_run_id, duration_ms, usage, schema_correction| {
         store
             .append(
                 run_id,
@@ -121,6 +122,7 @@ pub(crate) fn run(
                     phase: phase.clone(),
                     duration_ms,
                     usage,
+                    schema_correction,
                 },
             )
             .map_err(|error| error.to_string())
@@ -132,7 +134,7 @@ pub(crate) fn run(
     if let Some(entry) = existing.as_ref() {
         match entry.state {
             CallState::Succeeded => return Ok(entry.result.clone().unwrap_or(Value::Null)),
-            CallState::Failed => {
+            CallState::Failed if correction_exhausted(entry) => {
                 if let Some(transport_run_id) = entry.transport_run_id.as_deref()
                     && let Ok(Some((result, duration_ms, usage))) =
                         try_recover_structured(transport, transport_run_id, options.schema.as_ref())
@@ -144,33 +146,43 @@ pub(crate) fn run(
                         Some(transport_run_id.to_owned()),
                         duration_ms,
                         usage,
+                        entry.schema_correction.clone(),
                     )?;
                     return Ok(result);
                 }
+                return Err(entry
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "schema correction was already exhausted".to_owned()));
             }
-            CallState::Submitted | CallState::Cancelled => {}
+            CallState::Failed | CallState::Submitted | CallState::Cancelled => {}
         }
     }
-    let transport_run_id =
-        if let Some(entry) = existing.filter(|entry| entry.state == CallState::Submitted) {
-            entry
+
+    let (first_run_id, first_record) = match existing.as_ref() {
+        Some(entry) if matches!(entry.state, CallState::Submitted | CallState::Failed) => {
+            let transport_run_id = entry
                 .transport_run_id
-                .ok_or_else(|| "submitted agent call has no Servitor run id".to_owned())?
-        } else {
-            let response = transport
-                .submit(SubmitRequest {
-                    agent: options.agent.clone(),
-                    model: options.model.clone(),
-                    input: Input::Text {
-                        text: structured_prompt(&prompt, options.schema.as_ref()),
-                    },
-                    cwd: resolve_cwd(default_cwd, options.cwd.as_deref()),
-                    system_prompt: options.system_prompt.clone(),
-                    continuation: None,
-                    timeout_seconds: options.timeout_seconds,
-                    native_args: options.native_args.clone(),
-                })
-                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+                .clone()
+                .ok_or_else(|| "journaled agent call has no Servitor run id".to_owned())?;
+            let record = if entry.state == CallState::Failed {
+                Some(
+                    transport
+                        .inspect(&transport_run_id)
+                        .map_err(|error| format!("{}: {}", error.code, error.message))?,
+                )
+            } else {
+                None
+            };
+            (transport_run_id, record)
+        }
+        _ => {
+            let response = submit(
+                transport,
+                &options,
+                default_cwd,
+                structured_prompt(&prompt, options.schema.as_ref()),
+            )?;
             append(
                 CallState::Submitted,
                 None,
@@ -178,78 +190,257 @@ pub(crate) fn run(
                 Some(response.run_id.clone()),
                 None,
                 None,
-            )?;
-            response.run_id
-        };
-
-    loop {
-        if store.cancel_requested(run_id) || store.pause_requested(run_id) {
-            let _ = transport.cancel(&transport_run_id);
-            append(
-                CallState::Cancelled,
-                None,
-                Some("interrupted".to_owned()),
-                Some(transport_run_id),
-                None,
                 None,
             )?;
-            return Err("workflow interrupted".to_owned());
+            (response.run_id, None)
         }
-        let record = transport
-            .inspect(&transport_run_id)
-            .map_err(|error| format!("{}: {}", error.code, error.message))?;
-        match record.state {
-            ServitorState::Accepted | ServitorState::Running => thread::sleep(POLL_INTERVAL),
-            ServitorState::Succeeded => {
-                let (duration_ms, usage) = record_metrics(&record);
-                match materialize_output(record.output.as_ref(), options.schema.as_ref()) {
-                    Ok(result) => {
-                        append(
-                            CallState::Succeeded,
-                            Some(result.clone()),
-                            None,
-                            Some(transport_run_id),
-                            duration_ms,
-                            usage,
-                        )?;
-                        return Ok(result);
-                    }
+    };
+
+    let first_record = match first_record {
+        Some(record) => record,
+        None => match wait_for_terminal(store, transport, run_id, &first_run_id) {
+            Ok(record) => record,
+            Err(error) => {
+                append(
+                    CallState::Failed,
+                    None,
+                    Some(error.clone()),
+                    Some(first_run_id),
+                    None,
+                    None,
+                    None,
+                )?;
+                return Err(error);
+            }
+        },
+    };
+    if first_record.state != ServitorState::Succeeded {
+        return finish_transport_failure(&append, first_run_id, first_record, None);
+    }
+
+    let (first_duration_ms, first_usage) = record_metrics(&first_record);
+    match materialize_output(first_record.output.as_ref(), options.schema.as_ref()) {
+        Ok(result) => {
+            append(
+                CallState::Succeeded,
+                Some(result.clone()),
+                None,
+                Some(first_run_id),
+                first_duration_ms,
+                first_usage,
+                None,
+            )?;
+            Ok(result)
+        }
+        Err(first_error) if options.schema.is_some() => {
+            let invalid_output = output_text(first_record.output.as_ref());
+            let correction_prompt = correction_prompt(
+                &prompt,
+                options.schema.as_ref().expect("schema checked"),
+                &first_error,
+                &invalid_output,
+            );
+            let correction = match submit(transport, &options, default_cwd, correction_prompt) {
+                Ok(response) => response,
+                Err(error) => {
+                    let metadata = SchemaCorrectionMetadata {
+                        attempted: true,
+                        transport_run_ids: vec![first_run_id.clone()],
+                        validation_errors: vec![first_error],
+                    };
+                    append(
+                        CallState::Failed,
+                        None,
+                        Some(error.clone()),
+                        Some(first_run_id),
+                        first_duration_ms,
+                        first_usage,
+                        Some(metadata),
+                    )?;
+                    return Err(error);
+                }
+            };
+            let correction_run_id = correction.run_id;
+            let mut metadata = SchemaCorrectionMetadata {
+                attempted: true,
+                transport_run_ids: vec![first_run_id, correction_run_id.clone()],
+                validation_errors: vec![first_error.clone()],
+            };
+            append(
+                CallState::Submitted,
+                None,
+                Some(first_error.clone()),
+                Some(correction_run_id.clone()),
+                None,
+                None,
+                Some(metadata.clone()),
+            )?;
+            let correction_record =
+                match wait_for_terminal(store, transport, run_id, &correction_run_id) {
+                    Ok(record) => record,
                     Err(error) => {
                         append(
                             CallState::Failed,
                             None,
                             Some(error.clone()),
-                            Some(transport_run_id),
-                            duration_ms,
-                            usage,
+                            Some(correction_run_id),
+                            None,
+                            None,
+                            Some(metadata),
                         )?;
                         return Err(error);
                     }
+                };
+            if correction_record.state != ServitorState::Succeeded {
+                return finish_transport_failure(
+                    &append,
+                    correction_run_id,
+                    correction_record,
+                    Some(metadata),
+                );
+            }
+            let (duration_ms, usage) = record_metrics(&correction_record);
+            match materialize_output(correction_record.output.as_ref(), options.schema.as_ref()) {
+                Ok(result) => {
+                    append(
+                        CallState::Succeeded,
+                        Some(result.clone()),
+                        None,
+                        Some(correction_run_id),
+                        duration_ms,
+                        usage,
+                        Some(metadata),
+                    )?;
+                    Ok(result)
+                }
+                Err(second_error) => {
+                    metadata.validation_errors.push(second_error.clone());
+                    let combined = format!(
+                        "schema validation failed after one correction; first: {first_error}; correction: {second_error}"
+                    );
+                    append(
+                        CallState::Failed,
+                        None,
+                        Some(combined.clone()),
+                        Some(correction_run_id),
+                        duration_ms,
+                        usage,
+                        Some(metadata),
+                    )?;
+                    Err(combined)
                 }
             }
-            ServitorState::Failed | ServitorState::Cancelled => {
-                let (duration_ms, usage) = record_metrics(&record);
-                let message = record
-                    .error
-                    .map(|error| format!("{}: {}", error.code, error.message))
-                    .unwrap_or_else(|| format!("Servitor run ended as {:?}", record.state));
-                let state = if record.state == ServitorState::Cancelled {
-                    CallState::Cancelled
-                } else {
-                    CallState::Failed
-                };
-                append(
-                    state,
-                    None,
-                    Some(message.clone()),
-                    Some(transport_run_id),
-                    duration_ms,
-                    usage,
-                )?;
-                return Err(message);
-            }
+        }
+        Err(error) => {
+            append(
+                CallState::Failed,
+                None,
+                Some(error.clone()),
+                Some(first_run_id),
+                first_duration_ms,
+                first_usage,
+                None,
+            )?;
+            Err(error)
         }
     }
+}
+
+fn correction_exhausted(entry: &JournalEntry) -> bool {
+    entry
+        .schema_correction
+        .as_ref()
+        .is_some_and(|metadata| metadata.attempted)
+}
+
+fn submit(
+    transport: &dyn Transport,
+    options: &AgentOptions,
+    default_cwd: &Path,
+    text: String,
+) -> Result<servitor::SubmitResponse, String> {
+    transport
+        .submit(SubmitRequest {
+            agent: options.agent.clone(),
+            model: options.model.clone(),
+            input: Input::Text { text },
+            cwd: resolve_cwd(default_cwd, options.cwd.as_deref()),
+            system_prompt: options.system_prompt.clone(),
+            continuation: None,
+            timeout_seconds: options.timeout_seconds,
+            native_args: options.native_args.clone(),
+        })
+        .map_err(|error| format!("{}: {}", error.code, error.message))
+}
+
+fn wait_for_terminal(
+    store: &WorkflowStore,
+    transport: &dyn Transport,
+    workflow_run_id: &str,
+    transport_run_id: &str,
+) -> Result<servitor::RunRecord, String> {
+    loop {
+        if store.cancel_requested(workflow_run_id) || store.pause_requested(workflow_run_id) {
+            let _ = transport.cancel(transport_run_id);
+            return Err("workflow interrupted".to_owned());
+        }
+        let record = transport
+            .inspect(transport_run_id)
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+        match record.state {
+            ServitorState::Accepted | ServitorState::Running => thread::sleep(POLL_INTERVAL),
+            _ => return Ok(record),
+        }
+    }
+}
+
+fn finish_transport_failure<F>(
+    append: &F,
+    transport_run_id: String,
+    record: servitor::RunRecord,
+    schema_correction: Option<SchemaCorrectionMetadata>,
+) -> JobResult
+where
+    F: Fn(
+        CallState,
+        Option<Value>,
+        Option<String>,
+        Option<String>,
+        Option<u64>,
+        Option<Value>,
+        Option<SchemaCorrectionMetadata>,
+    ) -> Result<(), String>,
+{
+    let (duration_ms, usage) = record_metrics(&record);
+    let message = record
+        .error
+        .map(|error| format!("{}: {}", error.code, error.message))
+        .unwrap_or_else(|| format!("Servitor run ended as {:?}", record.state));
+    let state = if record.state == ServitorState::Cancelled {
+        CallState::Cancelled
+    } else {
+        CallState::Failed
+    };
+    append(
+        state,
+        None,
+        Some(message.clone()),
+        Some(transport_run_id),
+        duration_ms,
+        usage,
+        schema_correction,
+    )?;
+    Err(message)
+}
+
+fn correction_prompt(prompt: &str, schema: &Value, error: &str, invalid: &str) -> String {
+    let excerpt: String = invalid
+        .chars()
+        .take(INVALID_OUTPUT_EXCERPT_MAX_CHARS)
+        .collect();
+    format!(
+        "Correct the JSON response for the original task below.\n\nOriginal task:\n{prompt}\n\nJSON Schema:\n{schema}\n\nValidation error:\n{error}\n\nInvalid output excerpt (bounded):\n{excerpt}\n\nReturn only corrected JSON matching the schema. Do not include Markdown fences, prose, or explanation."
+    )
 }
 
 fn structured_prompt(prompt: &str, schema: Option<&Value>) -> String {

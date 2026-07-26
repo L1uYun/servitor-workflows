@@ -92,8 +92,11 @@ workflow scripts: `Date.now()`, `Math.random()`, argless `new Date()`, and
 The default agent is `pi`.
 
 When an agent call requests structured output, the runtime extracts JSON from free-form model text by:
-strip reasoning wrappers → collect candidates (whole text, fenced ```json, balanced `{...}`/`[...]` spans) → trailing-comma repair → shape filter from schema `type` → **schema-valid selection** (required/properties/items): if several candidates validate, take the **last** (final-answer convention). Schema is a selection criterion among candidates, not only a post-check on the first shape match. Pure whole-text JSON still works. The runtime does not set a token budget, retry a
-provider silently, or fall back to another provider. No provider-specific prose strippers.
+strip reasoning wrappers → collect candidates (whole text, fenced ```json, balanced `{...}`/`[...]` spans) → trailing-comma repair → shape filter from schema `type` → **schema-valid selection** (required/properties/items): if several candidates validate, take the **last** (final-answer convention). Schema is a selection criterion among candidates, not only a post-check on the first shape match. Pure whole-text JSON still works.
+
+If a successful transport output still fails schema validation, the engine submits exactly one correction request under the same logical journal call. The correction includes the original task, schema, validation error, and a bounded invalid-output excerpt, and requires bare corrected JSON. Backend, model, cwd, system prompt, timeout, and native arguments are preserved. Provider, timeout, worker, submission, inspection, cancellation, and other transport failures are never retried by this mechanism. The optional `schema_correction` journal metadata retains both transport run IDs and validation errors; an exhausted correction is terminal and resume does not submit a third transport run.
+
+The runtime does not set a token budget, retry a provider silently, or fall back to another provider. No provider-specific prose strippers.
 
 Structured output supports the deliberately small JSON Schema subset used by
 workflow contracts: `type`, `required`, `properties`, and `items`.

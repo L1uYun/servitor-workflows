@@ -131,6 +131,17 @@ pub struct JournalEntry {
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_correction: Option<SchemaCorrectionMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchemaCorrectionMetadata {
+    pub attempted: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transport_run_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,6 +206,7 @@ mod tests {
         assert_eq!(entry.phase, None);
         assert_eq!(entry.duration_ms, None);
         assert_eq!(entry.usage, None);
+        assert_eq!(entry.schema_correction, None);
     }
 
     #[test]
@@ -211,10 +223,12 @@ mod tests {
             phase: None,
             duration_ms: None,
             usage: None,
+            schema_correction: None,
         };
         let value = serde_json::to_value(entry).expect("serialize journal entry");
         assert!(value.get("phase").is_none());
         assert!(value.get("duration_ms").is_none());
         assert!(value.get("usage").is_none());
+        assert!(value.get("schema_correction").is_none());
     }
 }

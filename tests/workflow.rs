@@ -23,6 +23,9 @@ struct FakeTransport {
     peak_inspections: AtomicUsize,
     delay: Duration,
     records: Mutex<BTreeMap<String, RunRecord>>,
+    requests: Mutex<Vec<SubmitRequest>>,
+    fail_submissions: bool,
+    fail_after: Option<usize>,
 }
 
 impl FakeTransport {
@@ -33,6 +36,21 @@ impl FakeTransport {
             peak_inspections: AtomicUsize::new(0),
             delay,
             records: Mutex::new(BTreeMap::new()),
+            requests: Mutex::new(Vec::new()),
+            fail_submissions: false,
+            fail_after: None,
+        }
+    }
+    fn failing(delay: Duration) -> Self {
+        Self {
+            fail_submissions: true,
+            ..Self::new(delay)
+        }
+    }
+    fn fail_after(delay: Duration, successful_submissions: usize) -> Self {
+        Self {
+            fail_after: Some(successful_submissions),
+            ..Self::new(delay)
         }
     }
     fn count(&self) -> usize {
@@ -46,6 +64,13 @@ impl FakeTransport {
 impl Transport for FakeTransport {
     fn submit(&self, request: SubmitRequest) -> Result<SubmitResponse, ErrorInfo> {
         let number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_submissions || self.fail_after.is_some_and(|limit| number > limit) {
+            return Err(ErrorInfo::new("provider", "simulated transport failure"));
+        }
+        self.requests
+            .lock()
+            .map_err(|_| ErrorInfo::new("lock", "request lock poisoned"))?
+            .push(request.clone());
         let run_id = format!("fake-{number}");
         let prompt = match request.input {
             Input::Text { text } => text,
@@ -58,6 +83,10 @@ impl Transport for FakeTransport {
 {\"summary\":\"ok\",\"score\":1}
 ```"
             .to_owned()
+        } else if prompt.contains("INVALID_TWICE") {
+            "still-not-json".to_owned()
+        } else if prompt.contains("VALID_FIRST") {
+            r#"{"ok":true}"#.to_owned()
         } else if prompt.contains("RETRY_JSON") {
             if number == 1 {
                 "not-json".to_owned()
@@ -240,7 +269,7 @@ fn gate_replay_uses_cached_calls() {
 }
 
 #[test]
-fn resume_retries_a_failed_structured_agent_call() {
+fn invalid_structured_agent_is_corrected_without_resume() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("state-retry-agent");
     let transport = Arc::new(FakeTransport::new(Duration::ZERO));
@@ -258,18 +287,151 @@ fn resume_retries_a_failed_structured_agent_call() {
     "#,
     );
 
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("terminal state");
+    assert_eq!(state.status, RunStatus::Succeeded);
+    assert_eq!(state.result, Some(json!({"ok": true})));
+    assert_eq!(transport.count(), 2);
+}
+
+#[test]
+fn structured_agent_corrects_invalid_output_once_and_preserves_options() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-correct-once");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "correct-once.js",
+        r#"return await agent("RETRY_JSON", {
+          agent: "claude", model: "model-x", cwd: "nested", systemPrompt: "system-x",
+          timeoutSeconds: 42, nativeArgs: ["--flag"],
+          schema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }
+        });"#,
+    );
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("structured workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(state.result, Some(json!({"ok": true})));
+    assert_eq!(transport.count(), 2);
+    let requests = transport.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].agent, requests[1].agent);
+    assert_eq!(requests[0].model, requests[1].model);
+    assert_eq!(requests[0].cwd, requests[1].cwd);
+    assert_eq!(requests[0].system_prompt, requests[1].system_prompt);
+    assert_eq!(requests[0].timeout_seconds, requests[1].timeout_seconds);
+    assert_eq!(requests[0].native_args, requests[1].native_args);
+    let prompt = match &requests[1].input {
+        Input::Text { text } => text,
+        Input::Image(_) => panic!("text correction prompt"),
+    };
+    assert!(prompt.contains("Original task:\nRETRY_JSON"));
+    assert!(prompt.contains("JSON Schema:"));
+    assert!(prompt.contains("Validation error:"));
+    assert!(prompt.contains("Invalid output excerpt (bounded):\nnot-json"));
+    assert!(prompt.contains("Return only corrected JSON"));
+}
+
+#[test]
+fn structured_agent_accepts_valid_first_output_without_correction() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "valid-first.js",
+        r#"return await agent("VALID_FIRST", { schema: { type: "object", required: ["ok"] } });"#,
+    );
+    let state = engine(
+        &temp.path().join("state-valid-first"),
+        Arc::clone(&transport),
+    )
+    .start(&path, Value::Null, 1, 10)
+    .expect("workflow");
+    assert_eq!(state.status, RunStatus::Succeeded);
+    assert_eq!(transport.count(), 1);
+}
+
+#[test]
+fn exhausted_schema_correction_fails_and_resume_does_not_submit_third_time() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-invalid-twice");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "invalid-twice.js",
+        r#"return await agent("INVALID_TWICE", { schema: { type: "object", required: ["ok"] } });"#,
+    );
     let failed = engine(&root, Arc::clone(&transport))
         .start(&path, Value::Null, 1, 10)
-        .expect("failed terminal state");
+        .expect("terminal workflow");
     assert_eq!(failed.status, RunStatus::Failed);
-    assert_eq!(transport.count(), 1);
-
+    assert_eq!(transport.count(), 2);
+    let journal = fs::read_to_string(WorkflowStore::new(&root).journal_path(&failed.run_id))
+        .expect("journal");
+    let terminal: Value = serde_json::from_str(journal.lines().last().expect("terminal entry"))
+        .expect("terminal json");
+    assert_eq!(
+        terminal["schema_correction"]["transport_run_ids"],
+        json!(["fake-1", "fake-2"])
+    );
+    assert_eq!(
+        terminal["schema_correction"]["validation_errors"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     let resumed = engine(&root, Arc::clone(&transport))
         .resume(&failed.run_id)
-        .expect("resume structured call");
-    assert_eq!(resumed.status, RunStatus::Succeeded);
-    assert_eq!(resumed.resume_count, 1);
-    assert_eq!(resumed.result, Some(json!({"ok": true})));
+        .expect("resume exhausted workflow");
+    assert_eq!(resumed.status, RunStatus::Failed);
+    assert_eq!(
+        transport.count(),
+        2,
+        "resume submitted a third transport run"
+    );
+}
+
+#[test]
+fn transport_submission_failure_has_no_schema_correction_retry() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::failing(Duration::ZERO));
+    let path = script(
+        &temp,
+        "transport-failure.js",
+        r#"return await agent("TRANSPORT_FAIL", { schema: { type: "object" } });"#,
+    );
+    let state = engine(
+        &temp.path().join("state-transport-failure"),
+        Arc::clone(&transport),
+    )
+    .start(&path, Value::Null, 1, 10)
+    .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert_eq!(transport.count(), 1);
+}
+
+#[test]
+fn correction_submission_failure_is_not_retried_on_resume() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-correction-submit-failure");
+    let transport = Arc::new(FakeTransport::fail_after(Duration::ZERO, 1));
+    let path = script(
+        &temp,
+        "correction-submit-failure.js",
+        r#"return await agent("INVALID_TWICE", { schema: { type: "object" } });"#,
+    );
+    let failed = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("terminal workflow");
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(transport.count(), 2);
+    let resumed = engine(&root, Arc::clone(&transport))
+        .resume(&failed.run_id)
+        .expect("resume exhausted workflow");
+    assert_eq!(resumed.status, RunStatus::Failed);
     assert_eq!(transport.count(), 2);
 }
 

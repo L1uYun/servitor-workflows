@@ -325,6 +325,7 @@ fn append(
                 phase,
                 duration_ms,
                 usage: None,
+                schema_correction: None,
             },
         )
         .map_err(|error| error.to_string())
