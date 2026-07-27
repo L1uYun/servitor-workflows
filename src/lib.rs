@@ -1,4 +1,5 @@
 mod agent;
+mod budget;
 mod command;
 mod engine;
 mod error;
@@ -10,10 +11,12 @@ mod script;
 mod store;
 
 pub use agent::{ServitorTransport, Transport};
+pub use budget::Budget;
 pub use engine::{Engine, Inspection};
 pub use error::{ErrorPayload, WorkflowError};
 pub use model::{
-    PublicRun, ReconstructedState, RunState, RunStatus, WorkflowEvent, WorkflowEventEnvelope,
+    BudgetEnvelope, BudgetEvent, BudgetLedger, CallKind, CallState, JournalEntry, PublicRun,
+    ReconstructedState, RunState, RunStatus, WorkflowEvent, WorkflowEventEnvelope,
 };
 pub use store::WorkflowStore;
 

@@ -48,6 +48,11 @@ pub struct RunState {
     /// foundation only, exercised by V2-C.
     #[serde(default)]
     pub parent_run_id: Option<String>,
+    /// Optional hard money limit from `meta.moneyCap`. `None` means unlimited
+    /// (the default). `Some(n)` means the run's aggregate agent spend may not
+    /// exceed `n` units; commands and gates cost nothing.
+    #[serde(default)]
+    pub money_cap: Option<u64>,
     pub status: RunStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -269,6 +274,8 @@ pub enum WorkflowEvent {
         args: Value,
         max_parallel: usize,
         max_calls: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        money_cap: Option<u64>,
     },
     RunResumed {
         resume_count: u32,
@@ -349,6 +356,7 @@ pub struct ReconstructedState {
     pub name: String,
     pub max_parallel: usize,
     pub max_calls: usize,
+    pub money_cap: Option<u64>,
     pub status: RunStatus,
     pub phase: Option<String>,
     pub active: BTreeMap<String, ActiveCall>,
@@ -359,4 +367,75 @@ pub struct ReconstructedState {
     pub error: Option<String>,
     pub resume_count: u32,
     pub call_count: usize,
+}
+
+// ---------------------------------------------------------------------------
+// V2-B: shared multidimensional budget ledger (budget.jsonl per run)
+// ---------------------------------------------------------------------------
+
+/// Schema version stamped on every `BudgetEnvelope`.
+pub const BUDGET_SCHEMA_VERSION: u32 = 1;
+
+/// Budget events recorded to `budget.jsonl` for `workflow.v2` runs. Each
+/// entry is idempotent by call `key` — reserve scans the existing ledger
+/// before writing so a crash after reservation never double-charges.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BudgetEvent {
+    Reserved {
+        key: String,
+        kind: CallKind,
+        /// Conservative money estimate in cents (1 = 0.01 USD). `None` when
+        /// moneyCap is unlimited or the call kind has no cost.
+        estimate_money: Option<u64>,
+    },
+    Settled {
+        key: String,
+        /// Actual money charge in cents. `None` when moneyCap is unlimited.
+        actual_money: Option<u64>,
+        /// Token count from provider usage (attributed, never gates).
+        actual_tokens: u64,
+    },
+    Released {
+        key: String,
+        reason: String,
+    },
+}
+
+/// One append-only line of `budget.jsonl`. `owner_run_id` is the run whose
+/// ledger is charged (in V2-B this equals `run_id`; V2-C children write
+/// into their parent's ledger).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BudgetEnvelope {
+    pub version: u32,
+    pub sequence: u64,
+    pub at: DateTime<Utc>,
+    pub run_id: String,
+    pub owner_run_id: String,
+    pub event: BudgetEvent,
+}
+
+/// Reconstructed view of a run's budget ledger. `limit_calls`/`limit_money`
+/// come from the run contract; the counter fields are derived from the
+/// `budget.jsonl` stream.
+#[derive(Clone, Debug, PartialEq, Default, Serialize)]
+pub struct BudgetLedger {
+    pub limit_calls: Option<usize>,
+    pub limit_money: Option<u64>,
+    pub used_calls: u64,
+    pub used_money: u64,
+    pub held_calls: u64,
+    pub held_money: u64,
+    pub attributed_tokens: u64,
+    pub reservations: BTreeMap<String, ReservationSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ReservationSummary {
+    pub kind: CallKind,
+    pub estimate_money: Option<u64>,
+    pub actual_money: Option<u64>,
+    pub actual_tokens: u64,
+    pub settled: bool,
+    pub released: bool,
 }

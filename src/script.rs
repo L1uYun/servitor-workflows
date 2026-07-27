@@ -1,7 +1,7 @@
 use crate::agent::AgentOptions;
 use crate::command::CommandOptions;
 use crate::error::WorkflowError;
-use crate::model::{GateRequest, RunStatus, WorkflowEvent};
+use crate::model::{CallKind, GateRequest, RunStatus, WorkflowEvent};
 use crate::scheduler::{RuntimeHost, call_key};
 use boa_engine::{
     Context, JsArgs, JsNativeError, JsResult, JsValue, NativeFunction, Source,
@@ -162,6 +162,8 @@ struct HostState {
     log_replay: Arc<Mutex<Option<(usize, usize)>>>,
     #[unsafe_ignore_trace]
     phase: Arc<Mutex<Option<String>>>,
+    #[unsafe_ignore_trace]
+    budget: Option<crate::budget::Budget>,
     max_calls: usize,
 }
 
@@ -194,13 +196,32 @@ impl HostState {
             }
         }
 
-        let mut calls = self
-            .calls
-            .lock()
-            .map_err(|_| "call counter lock poisoned".to_owned())?;
-        *calls += 1;
-        if *calls > self.max_calls {
-            return Err(format!("workflow exceeded max_calls={}", self.max_calls));
+        // V2-B: when a budget handle is present, gate through the durable
+        // budget.jsonl ledger; otherwise fall back to the v1 in-memory counter.
+        if let Some(ref budget) = self.budget {
+            let call_kind = match kind {
+                "agent" => CallKind::Agent,
+                "command" => CallKind::Command,
+                "gate" => CallKind::Gate,
+                _ => {
+                    return Err("unknown call kind".to_owned());
+                }
+            };
+            let jk = self
+                .journal_keys
+                .lock()
+                .map_err(|_| "journal key lock poisoned".to_owned())?;
+            crate::budget::budget_gate_key(budget, &key, call_kind, input, &jk, self.max_calls)
+                .map_err(|error| error.to_string())?;
+        } else {
+            let mut calls = self
+                .calls
+                .lock()
+                .map_err(|_| "call counter lock poisoned".to_owned())?;
+            *calls += 1;
+            if *calls > self.max_calls {
+                return Err(format!("workflow exceeded max_calls={}", self.max_calls));
+            }
         }
         Ok(key)
     }
@@ -577,6 +598,7 @@ fn execute_vm(
     max_calls: usize,
 ) -> Result<Value, WorkflowError> {
     let mut context = Context::default();
+    let budget = runtime.budget.clone();
     let journal_index = runtime
         .store
         .journal_index(&runtime.run_id)
@@ -595,6 +617,7 @@ fn execute_vm(
         journal_keys: Arc::new(Mutex::new(journal_keys)),
         log_replay: Arc::new(Mutex::new(None)),
         phase: Arc::new(Mutex::new(initial_phase)),
+        budget,
         max_calls,
     });
     context
@@ -783,6 +806,11 @@ async fn host_gate(
     let label = options.label.clone().unwrap_or_else(|| question.clone());
     let input = json!({"question": question, "label": label});
     let key = host.key("gate", &input).map_err(native_error)?;
+    if let Some(budget) = host.budget.as_ref() {
+        // Opening a gate is the completed host call; the later human decision
+        // must not retain a budget reservation while the run is paused.
+        budget.settle(&key, None, 0).map_err(native_error)?;
+    }
     let state = host
         .runtime
         .store

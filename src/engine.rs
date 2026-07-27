@@ -1,6 +1,7 @@
 use crate::agent::Transport;
+use crate::budget::Budget;
 use crate::error::WorkflowError;
-use crate::model::{GateDecision, PublicRun, RunState, RunStatus, WorkflowEvent};
+use crate::model::{CallState, GateDecision, PublicRun, RunState, RunStatus, WorkflowEvent};
 use crate::run_summary;
 use crate::scheduler::{RuntimeHost, Scheduler};
 use crate::script;
@@ -75,6 +76,8 @@ impl Engine {
         self.execute_existing(&state.run_id)
     }
 
+    /// Parse the workflow script's `meta` block (including `meta.moneyCap`) into
+    /// a `RunState` seed. V2-B adds moneyCap parsing; V2-G will add cost-table keys.
     pub fn prepare(
         &self,
         path: &Path,
@@ -103,6 +106,9 @@ impl Engine {
                 path: path.to_path_buf(),
                 source,
             })?;
+        let money_cap = contract
+            .as_ref()
+            .and_then(|_| parse_meta_money_cap(&script));
         let now = Utc::now();
         let run_id = Uuid::now_v7().to_string();
         let state = RunState {
@@ -122,6 +128,7 @@ impl Engine {
             max_calls,
             contract,
             parent_run_id: None,
+            money_cap,
             resume_count: 0,
             phase: None,
             active: Default::default(),
@@ -144,6 +151,7 @@ impl Engine {
                     args: state.args.clone(),
                     max_parallel: state.max_parallel,
                     max_calls: state.max_calls,
+                    money_cap: state.money_cap,
                 },
             )?;
         }
@@ -161,6 +169,7 @@ impl Engine {
         if state.status.blocks_resume_rerun() {
             return self.ensure_terminal_artifacts(state);
         }
+        self.reconcile_budget(run_id, "recovered on resume")?;
         self.transition(
             run_id,
             WorkflowEvent::RunResumed {
@@ -355,6 +364,7 @@ impl Engine {
             )?
         };
         if state.status.is_terminal() {
+            self.reconcile_budget(run_id, "cancelled")?;
             self.ensure_terminal_artifacts(state)
         } else {
             Ok(state)
@@ -390,17 +400,51 @@ impl Engine {
                 decided_at: Utc::now(),
             });
         })?;
+        self.reconcile_budget(run_id, "superseded")?;
         self.ensure_terminal_artifacts(state)
     }
 
     pub fn inspect(&self, run_id: &str) -> Result<Inspection, WorkflowError> {
+        let state = self.store.load_state(run_id)?;
+        let budget = if state.contract.as_deref() == Some("workflow.v2") {
+            Some(self.store.reconstruct_budget(run_id)?)
+        } else {
+            None
+        };
+        let budget_path = (state.contract.as_deref() == Some("workflow.v2"))
+            .then(|| self.store.budget_path(run_id));
         Ok(Inspection {
-            state: self.store.load_state(run_id)?,
+            state,
             script_path: self.store.script_path(run_id),
             state_path: self.store.state_path(run_id),
             journal_path: self.store.journal_path(run_id),
+            budget_path,
+            budget,
             run_summary_path: self.store.run_summary_path(run_id),
         })
+    }
+
+    fn reconcile_budget(&self, run_id: &str, reason: &str) -> Result<(), WorkflowError> {
+        let state = self.store.load_state(run_id)?;
+        if state.contract.as_deref() != Some("workflow.v2") {
+            return Ok(());
+        }
+        let budget = Budget::new(
+            Arc::clone(&self.store),
+            run_id.to_owned(),
+            run_id.to_owned(),
+        );
+        let journal = self.store.journal_index(run_id)?;
+        let ledger = budget.ledger()?;
+        for (key, reservation) in ledger.reservations {
+            let is_submitted = journal
+                .get(&key)
+                .is_some_and(|entry| entry.state == CallState::Submitted);
+            if !reservation.settled && !reservation.released && !is_submitted {
+                budget.release(&key, reason)?;
+            }
+        }
+        Ok(())
     }
 
     fn execute(&self, run_id: &str) -> Result<RunState, WorkflowError> {
@@ -436,6 +480,14 @@ impl Engine {
             return self.ensure_terminal_artifacts(state);
         }
         let source = self.store.load_script(run_id)?;
+        // V2-B: create budget handle. V1 runs have no budget (None on host).
+        let budget = (initial.contract.as_deref() == Some("workflow.v2")).then(|| {
+            Budget::new(
+                Arc::clone(&self.store),
+                run_id.to_owned(),
+                run_id.to_owned(),
+            )
+        });
         let runtime = Arc::new(RuntimeHost {
             run_id: run_id.to_owned(),
             cwd: initial.cwd.clone(),
@@ -444,6 +496,7 @@ impl Engine {
             scheduler: Scheduler::new(initial.max_parallel),
             contract: initial.contract.clone(),
             parent_run_id: initial.parent_run_id.clone(),
+            budget,
         });
         let result = script::execute(runtime, &source, &initial.args, initial.max_calls);
         let current = self.store.load_state(run_id)?;
@@ -592,6 +645,10 @@ pub struct Inspection {
     pub script_path: PathBuf,
     pub state_path: PathBuf,
     pub journal_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<crate::model::BudgetLedger>,
     pub run_summary_path: PathBuf,
 }
 
@@ -624,6 +681,18 @@ fn delivery_report(value: &Value) -> Result<Option<PathBuf>, WorkflowError> {
     Ok(Some(path))
 }
 
+/// Parse `meta.moneyCap` from the script's meta block. Returns `None` when
+/// the key is absent or the script has no `meta` block. V2-G will extend this
+/// to also parse a cost table.
+fn parse_meta_money_cap(script: &str) -> Option<u64> {
+    let meta = script::parse_meta(script).ok()??;
+    // moneyCap must be a positive integer in cents. Null / absent = unlimited.
+    match meta.get("moneyCap")? {
+        Value::Number(n) if n.is_u64() && n.as_u64()? > 0 => n.as_u64(),
+        _ => None,
+    }
+}
+
 fn validate_script(script: &str) -> Result<Option<String>, WorkflowError> {
     if script.trim().is_empty() {
         return Err(WorkflowError::InvalidWorkflow("script is empty".to_owned()));
@@ -636,6 +705,21 @@ fn validate_script(script: &str) -> Result<Option<String>, WorkflowError> {
         return Err(WorkflowError::InvalidWorkflow(
             "new workflows must declare `meta.contract: \"workflow.v2\"`".to_owned(),
         ));
+    }
+    // Contract validation owns `moneyCap` semantics: absent or null is
+    // unlimited; a present value must be a positive integer number of cents.
+    let meta = script::parse_meta(script)?;
+    if let Some(value) = meta.as_ref().and_then(|meta| meta.get("moneyCap")) {
+        match value {
+            Value::Null => {}
+            Value::Number(number)
+                if number.is_u64() && number.as_u64().is_some_and(|cap| cap > 0) => {}
+            _ => {
+                return Err(WorkflowError::InvalidWorkflow(
+                    "meta.moneyCap must be a positive integer number of cents or null".to_owned(),
+                ));
+            }
+        }
     }
     Ok(contract)
 }

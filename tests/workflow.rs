@@ -5,7 +5,10 @@ use servitor::{
     Activity, ErrorInfo, Input, Output, RunRecord, RunState as ServitorState, SubmitRequest,
     SubmitResponse,
 };
-use servitor_workflows::{Engine, RunState, RunStatus, Transport, WorkflowStore};
+use servitor_workflows::{
+    BudgetEvent, CallKind, CallState, Engine, JournalEntry, RunState, RunStatus, Transport,
+    WorkflowStore,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -218,6 +221,7 @@ fn legacy_state(store: &WorkflowStore, path: &Path, status: RunStatus) -> RunSta
         cwd: path.parent().expect("script parent").to_path_buf(),
         contract: None,
         parent_run_id: None,
+        money_cap: None,
         status,
         created_at: now,
         updated_at: now,
@@ -235,6 +239,183 @@ fn legacy_state(store: &WorkflowStore, path: &Path, status: RunStatus) -> RunSta
         report: None,
         run_summary: None,
         journal_path: store.journal_path(&run_id),
+    }
+}
+
+#[test]
+fn v2_budget_ledger_reserves_and_settles_each_host_call() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-budget-ledger");
+    let path = script(
+        &temp,
+        "budget-ledger.js",
+        r#"const result = await command("cmd", ["/C", "exit 0"]); return { result };"#,
+    );
+    let state = engine(
+        &root,
+        Arc::new(FakeTransport::new(Duration::from_millis(5))),
+    )
+    .start(&path, Value::Null, 1, 2)
+    .expect("run");
+    assert_eq!(state.status, RunStatus::Succeeded);
+
+    let store = WorkflowStore::new(&root);
+    let events = store
+        .read_budget_events(&state.run_id)
+        .expect("read budget");
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[0].event, BudgetEvent::Reserved { .. }));
+    assert!(matches!(events[1].event, BudgetEvent::Settled { .. }));
+    let ledger = store.reconstruct_budget(&state.run_id).expect("ledger");
+    assert_eq!(ledger.used_calls, 1);
+    assert_eq!(ledger.held_calls, 0);
+    assert_eq!(ledger.limit_calls, Some(2));
+    assert_eq!(ledger.limit_money, None);
+}
+
+#[test]
+fn v2_meta_money_cap_is_persisted_and_emitted() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-money-cap");
+    let path = temp.path().join("money-cap.js");
+    fs::write(
+        &path,
+        r#"export const meta = { name: "cap", contract: "workflow.v2", moneyCap: 123 }; return { done: true };"#,
+    )
+    .expect("write script");
+    let state = engine(
+        &root,
+        Arc::new(FakeTransport::new(Duration::from_millis(5))),
+    )
+    .start(&path, Value::Null, 1, 1)
+    .expect("run");
+    assert_eq!(state.money_cap, Some(123));
+    let reconstructed = WorkflowStore::new(&root)
+        .reconstruct_state(&state.run_id)
+        .expect("reconstruct");
+    assert_eq!(reconstructed.money_cap, Some(123));
+}
+#[test]
+fn v2_budget_released_reservation_cannot_settle() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-budget-release");
+    let path = script(&temp, "budget-release.js", r#"return { done: true };"#);
+    let state = engine(
+        &root,
+        Arc::new(FakeTransport::new(Duration::from_millis(5))),
+    )
+    .prepare(&path, Value::Null, 1, 2)
+    .expect("prepare");
+    let store = WorkflowStore::new(&root);
+    store
+        .append_budget_event(
+            &state.run_id,
+            &state.run_id,
+            BudgetEvent::Reserved {
+                key: "call".to_owned(),
+                kind: CallKind::Command,
+                estimate_money: None,
+            },
+        )
+        .expect("reserve");
+    store
+        .append_budget_event(
+            &state.run_id,
+            &state.run_id,
+            BudgetEvent::Released {
+                key: "call".to_owned(),
+                reason: "cancelled".to_owned(),
+            },
+        )
+        .expect("release");
+    store
+        .append_budget_event(
+            &state.run_id,
+            &state.run_id,
+            BudgetEvent::Settled {
+                key: "call".to_owned(),
+                actual_money: None,
+                actual_tokens: 0,
+            },
+        )
+        .expect("late settlement");
+
+    let ledger = store.reconstruct_budget(&state.run_id).expect("ledger");
+    assert_eq!(ledger.used_calls, 0);
+    assert_eq!(ledger.held_calls, 0);
+    assert!(ledger.reservations["call"].released);
+    assert!(!ledger.reservations["call"].settled);
+}
+
+#[test]
+fn v2_resume_preserves_submitted_reservation() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-budget-resume");
+    let path = script(&temp, "budget-resume.js", r#"return { done: true };"#);
+    let state = engine(
+        &root,
+        Arc::new(FakeTransport::new(Duration::from_millis(5))),
+    )
+    .prepare(&path, Value::Null, 1, 1)
+    .expect("prepare");
+    let store = WorkflowStore::new(&root);
+    store
+        .append_budget_event(
+            &state.run_id,
+            &state.run_id,
+            BudgetEvent::Reserved {
+                key: "call".to_owned(),
+                kind: CallKind::Agent,
+                estimate_money: None,
+            },
+        )
+        .expect("reserve");
+    store
+        .append(
+            &state.run_id,
+            &JournalEntry {
+                at: Utc::now(),
+                key: "call".to_owned(),
+                kind: CallKind::Agent,
+                state: CallState::Submitted,
+                label: "call".to_owned(),
+                result: None,
+                error: None,
+                transport_run_id: Some("fake-1".to_owned()),
+                phase: None,
+                duration_ms: None,
+                usage: None,
+                schema_correction: None,
+            },
+        )
+        .expect("submitted journal entry");
+
+    engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .resume(&state.run_id)
+        .expect("resume");
+    let ledger = store.reconstruct_budget(&state.run_id).expect("ledger");
+    assert_eq!(ledger.held_calls, 1);
+    assert_eq!(ledger.used_calls, 0);
+    assert!(!ledger.reservations["call"].released);
+}
+
+#[test]
+fn v2_rejects_invalid_money_cap() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-invalid-money-cap");
+    for (name, money_cap) in [("zero", "0"), ("negative", "-1"), ("fraction", "1.5")] {
+        let path = temp.path().join(format!("{name}.js"));
+        fs::write(
+            &path,
+            format!(
+                "export const meta = {{ name: \"cap\", contract: \"workflow.v2\", moneyCap: {money_cap} }}; return {{}};"
+            ),
+        )
+        .expect("write script");
+        let error = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+            .prepare(&path, Value::Null, 1, 1)
+            .expect_err("invalid money cap must fail");
+        assert!(error.to_string().contains("meta.moneyCap"));
     }
 }
 

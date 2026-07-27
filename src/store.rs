@@ -1,6 +1,7 @@
 use crate::error::WorkflowError;
 use crate::model::{
-    EVENT_SCHEMA_VERSION, GateDecision, GateRequest, JournalEntry, ReconstructedState, RunState,
+    BUDGET_SCHEMA_VERSION, BudgetEnvelope, BudgetEvent, BudgetLedger, EVENT_SCHEMA_VERSION,
+    GateDecision, GateRequest, JournalEntry, ReconstructedState, ReservationSummary, RunState,
     RunStatus, SupersedeInfo, WorkflowEvent, WorkflowEventEnvelope,
 };
 use chrono::Utc;
@@ -51,6 +52,9 @@ impl WorkflowStore {
     /// `workflow.v2` runs; v1 runs never create this file.
     pub fn events_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("events.jsonl")
+    }
+    pub fn budget_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("budget.jsonl")
     }
     pub fn command_result_path(&self, run_id: &str, key: &str) -> PathBuf {
         self.run_dir(run_id)
@@ -137,17 +141,29 @@ impl WorkflowStore {
         let path = self.journal_path(run_id);
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .map_err(|source| WorkflowError::Write {
                 path: path.clone(),
                 source,
             })?;
+        file.lock_exclusive()
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            })?;
         let mut bytes = serde_json::to_vec(entry)?;
         bytes.push(b'\n');
-        file.write_all(&bytes)
+        let result = file
+            .write_all(&bytes)
             .and_then(|_| file.sync_data())
-            .map_err(|source| WorkflowError::Write { path, source })
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            });
+        let unlock = FileExt::unlock(&file).map_err(|source| WorkflowError::Write { path, source });
+        result.and(unlock)
     }
 
     pub fn journal_index(
@@ -319,6 +335,183 @@ impl WorkflowStore {
         Ok(text.lines().filter(|line| !line.trim().is_empty()).count() as u64)
     }
 
+    // ------------------------------------------------------------------
+    // V2-B: shared multidimensional budget ledger (budget.jsonl)
+    // ------------------------------------------------------------------
+
+    pub fn append_budget_event(
+        &self,
+        run_id: &str,
+        owner_run_id: &str,
+        event: BudgetEvent,
+    ) -> Result<(), WorkflowError> {
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("budget write lock poisoned".to_owned()))?;
+        let path = self.budget_path(run_id);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        file.lock_exclusive()
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        let sequence = Self::count_event_lines_in(&mut file, &path)? + 1;
+        file.seek(SeekFrom::End(0))
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        let envelope = BudgetEnvelope {
+            version: BUDGET_SCHEMA_VERSION,
+            sequence,
+            at: Utc::now(),
+            run_id: run_id.to_owned(),
+            owner_run_id: owner_run_id.to_owned(),
+            event,
+        };
+        let mut bytes = serde_json::to_vec(&envelope)?;
+        bytes.push(b'\n');
+        let result = file
+            .write_all(&bytes)
+            .and_then(|_| file.sync_data())
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            });
+        let unlock = FileExt::unlock(&file).map_err(|source| WorkflowError::Write { path, source });
+        result.and(unlock)
+    }
+
+    pub fn read_budget_events(&self, run_id: &str) -> Result<Vec<BudgetEnvelope>, WorkflowError> {
+        let path = self.budget_path(run_id);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(WorkflowError::Read { path, source }),
+        };
+        let mut out = Vec::new();
+        for (line_num, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let envelope: BudgetEnvelope = serde_json::from_str(trimmed).map_err(|source| {
+                WorkflowError::Invariant(format!(
+                    "budget line {} malformed: {source}",
+                    line_num + 1
+                ))
+            })?;
+            if envelope.version != BUDGET_SCHEMA_VERSION {
+                return Err(WorkflowError::Invariant(format!(
+                    "budget version mismatch: expected {BUDGET_SCHEMA_VERSION}, got {}",
+                    envelope.version
+                )));
+            }
+            if envelope.owner_run_id != run_id {
+                return Err(WorkflowError::Invariant(format!(
+                    "budget run id mismatch: expected {run_id}, got {}",
+                    envelope.owner_run_id
+                )));
+            }
+            let expected_sequence = (out.len() + 1) as u64;
+            if envelope.sequence != expected_sequence {
+                return Err(WorkflowError::Invariant(format!(
+                    "budget sequence gap in run {run_id}: expected {expected_sequence}, got {}",
+                    envelope.sequence
+                )));
+            }
+            out.push(envelope);
+        }
+        Ok(out)
+    }
+
+    pub fn reconstruct_budget(&self, run_id: &str) -> Result<BudgetLedger, WorkflowError> {
+        let state = self.load_state(run_id)?;
+        let events = self.read_budget_events(run_id)?;
+        let mut ledger = BudgetLedger {
+            limit_calls: if state.contract.is_some() {
+                Some(state.max_calls)
+            } else {
+                None
+            },
+            limit_money: state.money_cap,
+            ..Default::default()
+        };
+        for envelope in events {
+            match envelope.event {
+                BudgetEvent::Reserved {
+                    key,
+                    kind,
+                    estimate_money,
+                } => {
+                    let existing = ledger.reservations.get(&key);
+                    let already_known = existing.is_some();
+                    if !already_known {
+                        ledger.held_calls = ledger.held_calls.saturating_add(1);
+                        if let Some(est) = estimate_money {
+                            ledger.held_money = ledger.held_money.saturating_add(est);
+                        }
+                    }
+                    ledger
+                        .reservations
+                        .entry(key)
+                        .or_insert_with(|| ReservationSummary {
+                            kind,
+                            estimate_money,
+                            actual_money: None,
+                            actual_tokens: 0,
+                            settled: false,
+                            released: false,
+                        });
+                }
+                BudgetEvent::Settled {
+                    key,
+                    actual_money,
+                    actual_tokens,
+                } => {
+                    if let Some(res) = ledger.reservations.get_mut(&key) {
+                        if !res.settled && !res.released {
+                            res.settled = true;
+                            res.actual_money = actual_money;
+                            res.actual_tokens = actual_tokens;
+                            ledger.used_calls = ledger.used_calls.saturating_add(1);
+                            ledger.held_calls = ledger.held_calls.saturating_sub(1);
+                            if let Some(held) = res.estimate_money {
+                                ledger.held_money = ledger.held_money.saturating_sub(held);
+                            }
+                            if let Some(money) = actual_money {
+                                ledger.used_money = ledger.used_money.saturating_add(money);
+                            }
+                            ledger.attributed_tokens =
+                                ledger.attributed_tokens.saturating_add(actual_tokens);
+                        }
+                    }
+                }
+                BudgetEvent::Released { key, .. } => {
+                    if let Some(res) = ledger.reservations.get_mut(&key) {
+                        if !res.released && !res.settled {
+                            res.released = true;
+                            ledger.held_calls = ledger.held_calls.saturating_sub(1);
+                            if let Some(held) = res.estimate_money {
+                                ledger.held_money = ledger.held_money.saturating_sub(held);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(ledger)
+    }
+
     /// Reconstruct run state purely from persisted artifacts: the versioned
     /// event stream (`events.jsonl`) for lifecycle/phase/gate, the journal
     /// (`journal.jsonl`) for call outcomes and active calls, and the static
@@ -337,6 +530,7 @@ impl WorkflowStore {
             name: state.name.clone(),
             max_parallel: state.max_parallel,
             max_calls: state.max_calls,
+            money_cap: state.money_cap,
             status: RunStatus::Running,
             phase: None,
             active: BTreeMap::new(),
@@ -355,11 +549,13 @@ impl WorkflowStore {
                     name,
                     max_parallel,
                     max_calls,
+                    money_cap,
                     ..
                 } => {
                     rs.name = name;
                     rs.max_parallel = max_parallel;
                     rs.max_calls = max_calls;
+                    rs.money_cap = money_cap;
                     rs.status = RunStatus::Running;
                 }
                 WorkflowEvent::RunResumed { resume_count } => {

@@ -1,4 +1,5 @@
 use crate::agent::{AgentCall, AgentOptions, Transport};
+use crate::budget::Budget;
 use crate::command::{CommandCall, CommandOptions};
 use crate::model::{ActiveCall, CallKind, WorkflowEvent};
 use crate::store::WorkflowStore;
@@ -71,6 +72,8 @@ pub struct RuntimeHost {
     /// stream. V2-A only — children inherit via V2-C.
     pub contract: Option<String>,
     pub parent_run_id: Option<String>,
+    /// Shared budget handle (V2-B+). `None` for v1 runs.
+    pub budget: Option<Budget>,
 }
 
 impl RuntimeHost {
@@ -104,15 +107,17 @@ impl RuntimeHost {
         let cwd = self.cwd.clone();
         let store = Arc::clone(&self.store);
         let transport = Arc::clone(&self.transport);
+        let budget = self.budget.clone();
         self.scheduler.submit(move || {
-            with_active(
+            let result = with_active(
                 &store,
                 &run_id,
                 &active_key,
                 CallKind::Agent,
                 &active_label,
                 || crate::agent::run(&store, transport.as_ref(), &run_id, &cwd, call),
-            )
+            );
+            settle_budget(budget.as_ref(), &store, &active_key, result)
         })
     }
 
@@ -130,17 +135,73 @@ impl RuntimeHost {
         let run_id = self.run_id.clone();
         let cwd = self.cwd.clone();
         let store = Arc::clone(&self.store);
+        let budget = self.budget.clone();
         self.scheduler.submit(move || {
-            with_active(
+            let result = with_active(
                 &store,
                 &run_id,
                 &active_key,
                 CallKind::Command,
                 &active_label,
                 || crate::command::run(&store, &run_id, &cwd, call),
-            )
+            );
+            settle_budget(budget.as_ref(), &store, &active_key, result)
         })
     }
+}
+
+fn settle_budget(
+    budget: Option<&Budget>,
+    store: &WorkflowStore,
+    key: &str,
+    result: JobResult,
+) -> JobResult {
+    let Some(budget) = budget else {
+        return result;
+    };
+    // V2-B does not price calls yet. Agent token totals are already normalized
+    // into the durable journal by `agent::run`, so attribute them at settlement.
+    let actual_tokens = store
+        .journal_index(&budget.run_id())
+        .ok()
+        .and_then(|journal| {
+            journal
+                .get(key)
+                .and_then(|entry| usage_tokens(entry.usage.as_ref()))
+        })
+        .unwrap_or(0);
+    if let Err(error) = budget.settle(key, None, actual_tokens) {
+        return match result {
+            Ok(_) => Err(format!(
+                "budget settlement failed after successful call: {error}"
+            )),
+            Err(result_error) => Err(format!("{result_error}; budget settlement failed: {error}")),
+        };
+    }
+    result
+}
+
+fn usage_tokens(usage: Option<&Value>) -> Option<u64> {
+    let usage = usage?.as_object()?;
+    for key in ["total_tokens", "totalTokens", "total"] {
+        if let Some(total) = usage.get(key).and_then(Value::as_u64) {
+            return Some(total);
+        }
+    }
+    for (input, output) in [
+        ("input", "output"),
+        ("input_tokens", "output_tokens"),
+        ("prompt_tokens", "completion_tokens"),
+        ("inputTokens", "outputTokens"),
+    ] {
+        if let (Some(input), Some(output)) = (
+            usage.get(input).and_then(Value::as_u64),
+            usage.get(output).and_then(Value::as_u64),
+        ) {
+            return Some(input.saturating_add(output));
+        }
+    }
+    None
 }
 
 fn with_active<F>(
