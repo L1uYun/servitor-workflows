@@ -39,6 +39,15 @@ pub struct RunState {
     pub run_id: String,
     pub name: String,
     pub cwd: PathBuf,
+    /// Contract version string. `Some("workflow.v2")` for new v2 runs; `None`
+    /// for v1 runs (the frozen compatibility path). Drives whether the
+    /// versioned event stream is written.
+    #[serde(default)]
+    pub contract: Option<String>,
+    /// Parent run id for structured-concurrency children. `None` in V2-A;
+    /// foundation only, exercised by V2-C.
+    #[serde(default)]
+    pub parent_run_id: Option<String>,
     pub status: RunStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -235,4 +244,119 @@ mod tests {
         assert!(value.get("usage").is_none());
         assert!(value.get("schema_correction").is_none());
     }
+}
+
+// ---------------------------------------------------------------------------
+// V2-A: versioned append-only event stream + event-to-state reconstruction
+// ---------------------------------------------------------------------------
+
+/// Schema version stamped on every `WorkflowEventEnvelope`. Bumped only on a
+/// breaking change to the event shape. `workflow.v2` runs emit envelopes with
+/// this version; v1 runs never emit events (they keep the frozen journal path).
+pub const EVENT_SCHEMA_VERSION: u32 = 2;
+
+/// Lifecycle event recorded to `events.jsonl` for `workflow.v2` runs. Call
+/// outcomes remain in `journal.jsonl` (the v1 call-event stream); the lifecycle
+/// stream here carries run-level transitions, phases, and gates so a run can
+/// be reconstructed without in-memory state. V2-A deliberately records only
+/// what the foundation needs; budgets, children, isolation, routing, and watch
+/// arrive in later slices.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkflowEvent {
+    RunStarted {
+        name: String,
+        args: Value,
+        max_parallel: usize,
+        max_calls: usize,
+    },
+    RunResumed {
+        resume_count: u32,
+    },
+    PhaseChanged {
+        phase: String,
+    },
+    GateOpened {
+        key: String,
+        label: String,
+        question: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    },
+    GateDecided {
+        key: String,
+        approved: bool,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<Value>,
+    },
+    RunSucceeded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<Value>,
+    },
+    RunFailed {
+        error: String,
+    },
+    RunCancelled {
+        error: String,
+    },
+    RunSuperseded {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_contract: Option<String>,
+    },
+    RunPaused,
+    /// A pause request is durable while active calls drain. This is distinct
+    /// from `RunPaused`, which means execution has stopped and may resume.
+    RunPausing,
+    /// A cancellation request is durable while active calls drain. This is
+    /// distinct from `RunCancelled`, which is the terminal outcome.
+    RunCancelling {
+        error: String,
+    },
+}
+
+/// One append-only line of `events.jsonl`. `sequence` is monotonic per run;
+/// `parent_run_id` is `None` in V2-A and exists so V2-C can grow the tree
+/// without reshaping the envelope.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowEventEnvelope {
+    pub version: u32,
+    pub sequence: u64,
+    pub at: DateTime<Utc>,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    pub event: WorkflowEvent,
+}
+
+/// State rebuilt purely from persisted artifacts (`events.jsonl` lifecycle
+/// stream + `journal.jsonl` call stream + the static identity fields a run
+/// records at creation). Compared against live `RunState` to prove the
+/// reconstruction is deterministic for fixed traces.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReconstructedState {
+    pub version: u32,
+    pub contract: Option<String>,
+    pub run_id: String,
+    pub parent_run_id: Option<String>,
+    pub name: String,
+    pub max_parallel: usize,
+    pub max_calls: usize,
+    pub status: RunStatus,
+    pub phase: Option<String>,
+    pub active: BTreeMap<String, ActiveCall>,
+    pub waiting_gate: Option<GateRequest>,
+    pub supersede: Option<SupersedeInfo>,
+    pub decisions: BTreeMap<String, GateDecision>,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+    pub resume_count: u32,
+    pub call_count: usize,
 }

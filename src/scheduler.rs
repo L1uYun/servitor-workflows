@@ -1,6 +1,6 @@
 use crate::agent::{AgentCall, AgentOptions, Transport};
 use crate::command::{CommandCall, CommandOptions};
-use crate::model::{ActiveCall, CallKind};
+use crate::model::{ActiveCall, CallKind, WorkflowEvent};
 use crate::store::WorkflowStore;
 use chrono::Utc;
 use futures_channel::oneshot;
@@ -66,9 +66,30 @@ pub struct RuntimeHost {
     pub store: Arc<WorkflowStore>,
     pub transport: Arc<dyn Transport>,
     pub scheduler: Scheduler,
+    /// `Some("workflow.v2")` for v2 runs; `None` for v1 runs. Host functions
+    /// use this to decide whether to append lifecycle events to the versioned
+    /// stream. V2-A only — children inherit via V2-C.
+    pub contract: Option<String>,
+    pub parent_run_id: Option<String>,
 }
 
 impl RuntimeHost {
+    pub fn transition<F>(&self, event: WorkflowEvent, update: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut crate::model::RunState),
+    {
+        if self.contract.as_deref() != Some("workflow.v2") {
+            self.store
+                .update_state(&self.run_id, update)
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        self.store
+            .transition(&self.run_id, self.parent_run_id.as_deref(), event, update)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn agent(
         &self,
         key: String,

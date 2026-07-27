@@ -1,8 +1,13 @@
 use crate::error::WorkflowError;
-use crate::model::{JournalEntry, RunState, RunStatus};
+use crate::model::{
+    EVENT_SCHEMA_VERSION, GateDecision, GateRequest, JournalEntry, ReconstructedState, RunState,
+    RunStatus, SupersedeInfo, WorkflowEvent, WorkflowEventEnvelope,
+};
+use chrono::Utc;
+use fs2::FileExt;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -41,6 +46,11 @@ impl WorkflowStore {
     }
     pub fn journal_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("journal.jsonl")
+    }
+    /// Path of the versioned append-only event stream. Written only for
+    /// `workflow.v2` runs; v1 runs never create this file.
+    pub fn events_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("events.jsonl")
     }
     pub fn command_result_path(&self, run_id: &str, key: &str) -> PathBuf {
         self.run_dir(run_id)
@@ -160,30 +170,307 @@ impl WorkflowStore {
         Ok(index)
     }
 
-    pub fn mark_superseded(
+    /// Append one lifecycle event to `events.jsonl`. The envelope is stamped
+    /// with the event schema version, a monotonic per-run sequence, the wall
+    /// time, the run id, and the parent run id (foundation only; `None` in
+    /// V2-A). The file is append-only and `sync_data`'d so a crash leaves a
+    /// clean tail. Returns `Ok(())` even when the run is v1 (no event stream)
+    /// so callers can gate on a single v2 check upstream.
+    pub fn append_event(
         &self,
         run_id: &str,
-        reason: String,
-        evidence: Option<String>,
-        new_contract: Option<String>,
-    ) -> Result<RunState, WorkflowError> {
-        if reason.trim().is_empty() {
-            return Err(WorkflowError::InvalidOperation(
-                "supersede reason is required".to_owned(),
-            ));
-        }
-        self.request_cancel(run_id)?;
-        self.update_state(run_id, |state| {
-            state.status = RunStatus::Superseded;
-            state.active.clear();
-            state.waiting_gate = None;
-            state.supersede = Some(crate::model::SupersedeInfo {
-                reason,
-                evidence,
-                new_contract,
-                decided_at: chrono::Utc::now(),
+        parent_run_id: Option<&str>,
+        event: WorkflowEvent,
+    ) -> Result<(), WorkflowError> {
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("event write lock poisoned".to_owned()))?;
+        let path = self.events_path(run_id);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        file.lock_exclusive()
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        let sequence = Self::count_event_lines_in(&mut file, &path)? + 1;
+        file.seek(SeekFrom::End(0))
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        let envelope = WorkflowEventEnvelope {
+            version: EVENT_SCHEMA_VERSION,
+            sequence,
+            at: Utc::now(),
+            run_id: run_id.to_owned(),
+            parent_run_id: parent_run_id.map(str::to_owned),
+            event,
+        };
+        let mut bytes = serde_json::to_vec(&envelope)?;
+        bytes.push(b'\n');
+        let result = file
+            .write_all(&bytes)
+            .and_then(|_| file.sync_data())
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
             });
-        })
+        let unlock = FileExt::unlock(&file).map_err(|source| WorkflowError::Write { path, source });
+        result.and(unlock)
+    }
+
+    /// Persist a v2 lifecycle event before applying its matching state mutation.
+    /// A caller can use this when an event/state pair has a single transition
+    /// boundary; reconstruction remains authoritative after a crash between the
+    /// two durable writes.
+    pub fn transition<F>(
+        &self,
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        event: WorkflowEvent,
+        update: F,
+    ) -> Result<RunState, WorkflowError>
+    where
+        F: FnOnce(&mut RunState),
+    {
+        self.transition_many(run_id, parent_run_id, [event], update)
+    }
+
+    /// Persist all lifecycle events for a compound transition before applying
+    /// its matching state mutation. This preserves the event-first recovery
+    /// boundary when one state change has more than one observable event.
+    pub fn transition_many<F, I>(
+        &self,
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        events: I,
+        update: F,
+    ) -> Result<RunState, WorkflowError>
+    where
+        F: FnOnce(&mut RunState),
+        I: IntoIterator<Item = WorkflowEvent>,
+    {
+        for event in events {
+            self.append_event(run_id, parent_run_id, event)?;
+        }
+        self.update_state(run_id, update)
+    }
+
+    /// for v1 runs (no `events.jsonl`) and for v2 runs that have not yet
+    /// recorded any events.
+    pub fn read_events(&self, run_id: &str) -> Result<Vec<WorkflowEventEnvelope>, WorkflowError> {
+        let path = self.events_path(run_id);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(source) => return Err(WorkflowError::Read { path, source }),
+        };
+        let mut out = Vec::new();
+        for (expected_sequence, line) in
+            (1_u64..).zip(text.lines().filter(|line| !line.trim().is_empty()))
+        {
+            let envelope: WorkflowEventEnvelope = serde_json::from_str(line)?;
+            if envelope.version != EVENT_SCHEMA_VERSION {
+                return Err(WorkflowError::Invariant(format!(
+                    "unsupported event schema version {} in run {run_id}",
+                    envelope.version
+                )));
+            }
+            if envelope.run_id != run_id {
+                return Err(WorkflowError::Invariant(format!(
+                    "event run id mismatch: expected {run_id}, got {}",
+                    envelope.run_id
+                )));
+            }
+            if envelope.sequence != expected_sequence {
+                return Err(WorkflowError::Invariant(format!(
+                    "event sequence gap in run {run_id}: expected {expected_sequence}, got {}",
+                    envelope.sequence
+                )));
+            }
+            out.push(envelope);
+        }
+        Ok(out)
+    }
+
+    fn count_event_lines_in(file: &mut std::fs::File, path: &Path) -> Result<u64, WorkflowError> {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| WorkflowError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .map_err(|source| WorkflowError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok(text.lines().filter(|line| !line.trim().is_empty()).count() as u64)
+    }
+
+    /// Reconstruct run state purely from persisted artifacts: the versioned
+    /// event stream (`events.jsonl`) for lifecycle/phase/gate, the journal
+    /// (`journal.jsonl`) for call outcomes and active calls, and the static
+    /// identity fields recorded at run creation. V2-A foundation: this never
+    /// consults in-memory runtime state.
+    pub fn reconstruct_state(&self, run_id: &str) -> Result<ReconstructedState, WorkflowError> {
+        let state = self.load_state(run_id)?;
+        let events = self.read_events(run_id)?;
+        let journal = self.journal_index(run_id)?;
+
+        let mut rs = ReconstructedState {
+            version: state.version,
+            contract: state.contract.clone(),
+            run_id: run_id.to_owned(),
+            parent_run_id: state.parent_run_id.clone(),
+            name: state.name.clone(),
+            max_parallel: state.max_parallel,
+            max_calls: state.max_calls,
+            status: RunStatus::Running,
+            phase: None,
+            active: BTreeMap::new(),
+            waiting_gate: None,
+            supersede: None,
+            decisions: BTreeMap::new(),
+            result: None,
+            error: None,
+            resume_count: 0,
+            call_count: journal.len(),
+        };
+
+        for envelope in events {
+            match envelope.event {
+                WorkflowEvent::RunStarted {
+                    name,
+                    max_parallel,
+                    max_calls,
+                    ..
+                } => {
+                    rs.name = name;
+                    rs.max_parallel = max_parallel;
+                    rs.max_calls = max_calls;
+                    rs.status = RunStatus::Running;
+                }
+                WorkflowEvent::RunResumed { resume_count } => {
+                    rs.resume_count = resume_count;
+                    rs.status = RunStatus::Running;
+                }
+                WorkflowEvent::PhaseChanged { phase } => rs.phase = Some(phase),
+                WorkflowEvent::GateOpened {
+                    key,
+                    label,
+                    question,
+                    expect,
+                    current,
+                    hint,
+                } => {
+                    rs.status = RunStatus::WaitingHuman;
+                    rs.waiting_gate = Some(GateRequest {
+                        key,
+                        label,
+                        question,
+                        expect,
+                        current,
+                        hint,
+                    });
+                }
+                WorkflowEvent::GateDecided {
+                    key,
+                    approved,
+                    reason,
+                    value,
+                } => {
+                    rs.waiting_gate = None;
+                    rs.decisions.insert(
+                        key,
+                        GateDecision {
+                            approved,
+                            reason,
+                            decided_at: envelope.at,
+                            value,
+                        },
+                    );
+                    rs.status = if approved {
+                        RunStatus::Running
+                    } else {
+                        RunStatus::Failed
+                    };
+                }
+                WorkflowEvent::RunSucceeded { result } => {
+                    rs.status = RunStatus::Succeeded;
+                    rs.result = result;
+                    rs.waiting_gate = None;
+                    rs.active.clear();
+                }
+                WorkflowEvent::RunFailed { error } => {
+                    rs.status = RunStatus::Failed;
+                    rs.error = Some(error);
+                    rs.waiting_gate = None;
+                    rs.active.clear();
+                }
+                WorkflowEvent::RunCancelled { error } => {
+                    rs.status = RunStatus::Cancelled;
+                    rs.error = Some(error);
+                    rs.waiting_gate = None;
+                    rs.active.clear();
+                }
+                WorkflowEvent::RunSuperseded {
+                    reason,
+                    evidence,
+                    new_contract,
+                } => {
+                    rs.status = RunStatus::Superseded;
+                    rs.supersede = Some(SupersedeInfo {
+                        reason,
+                        evidence,
+                        new_contract,
+                        decided_at: envelope.at,
+                    });
+                    rs.waiting_gate = None;
+                    rs.active.clear();
+                }
+                WorkflowEvent::RunPaused => {
+                    rs.status = RunStatus::Paused;
+                    rs.active.clear();
+                }
+                WorkflowEvent::RunPausing => rs.status = RunStatus::Pausing,
+                WorkflowEvent::RunCancelling { error } => {
+                    rs.status = RunStatus::Cancelling;
+                    rs.error = Some(error);
+                }
+            }
+        }
+
+        // Active calls: a journal key whose last recorded state is `Submitted`
+        // has an in-flight worker. Terminal lifecycle events always win over a
+        // stale submitted journal entry left behind by a crash.
+        if !rs.status.is_terminal() {
+            for (key, entry) in journal {
+                if entry.state == crate::model::CallState::Submitted {
+                    rs.active.insert(
+                        key,
+                        crate::model::ActiveCall {
+                            kind: entry.kind,
+                            label: entry.label,
+                            started_at: entry.at,
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(rs)
     }
 
     pub fn request_pause(&self, run_id: &str) -> Result<(), WorkflowError> {
@@ -250,7 +537,7 @@ impl WorkflowStore {
             let modified = entry.metadata().and_then(|meta| meta.modified()).ok();
             entries.push((modified, name));
         }
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         Ok(entries.into_iter().map(|(_, name)| name).collect())
     }
 

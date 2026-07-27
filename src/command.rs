@@ -103,17 +103,14 @@ pub(crate) fn run(
             CallState::Failed | CallState::Submitted | CallState::Cancelled => {}
         }
     }
-    append(
+    let journal = CommandJournal {
         store,
         run_id,
-        &key,
-        &label,
-        CallState::Submitted,
-        None,
-        None,
-        phase.clone(),
-        None,
-    )?;
+        key: &key,
+        label: &label,
+        phase: phase.clone(),
+    };
+    journal.append(CallState::Submitted, None, None, None)?;
     let call_dir = store
         .run_dir(run_id)
         .join("commands")
@@ -143,15 +140,10 @@ pub(crate) fn run(
         if store.cancel_requested(run_id) || store.pause_requested(run_id) {
             let _ = child.kill();
             let _ = child.wait();
-            append(
-                store,
-                run_id,
-                &key,
-                &label,
+            journal.append(
                 CallState::Cancelled,
                 None,
                 Some("interrupted".to_owned()),
-                phase.clone(),
                 None,
             )?;
             return Err("workflow interrupted".to_owned());
@@ -169,14 +161,7 @@ pub(crate) fn run(
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(POLL_INTERVAL),
             Err(error) => {
-                return fail(
-                    store,
-                    run_id,
-                    &key,
-                    &label,
-                    error.to_string(),
-                    phase.clone(),
-                );
+                return fail(&journal, error.to_string());
             }
         }
     };
@@ -198,42 +183,29 @@ pub(crate) fn run(
     write_command_result(store, run_id, &key, &result_json)?;
     if timed_out {
         return fail_with_result(
-            store,
-            run_id,
-            &key,
-            &label,
+            &journal,
             "command timed out".to_owned(),
             result_json,
-            phase.clone(),
             Some(duration_ms),
         );
     }
     if status.success() {
-        append(
-            store,
-            run_id,
-            &key,
-            &label,
+        journal.append(
             CallState::Succeeded,
             Some(result_json.clone()),
             None,
-            phase.clone(),
             Some(duration_ms),
         )?;
         Ok(result_json)
     } else {
         fail_with_result(
-            store,
-            run_id,
-            &key,
-            &label,
+            &journal,
             format!(
                 "command exited with {:?}: {}",
                 status.code(),
                 result_json["stderr"].as_str().unwrap_or_default().trim()
             ),
             result_json,
-            phase.clone(),
             Some(duration_ms),
         )
     }
@@ -254,81 +226,61 @@ fn write_command_result(
 }
 
 fn fail_with_result(
-    store: &WorkflowStore,
-    run_id: &str,
-    key: &str,
-    label: &str,
+    journal: &CommandJournal<'_>,
     message: String,
     result: Value,
-    phase: Option<String>,
     duration_ms: Option<u64>,
 ) -> JobResult {
-    append(
-        store,
-        run_id,
-        key,
-        label,
+    journal.append(
         CallState::Failed,
         Some(result),
         Some(message.clone()),
-        phase,
         duration_ms,
     )?;
     Err(message)
 }
 
-fn fail(
-    store: &WorkflowStore,
-    run_id: &str,
-    key: &str,
-    label: &str,
-    message: String,
-    phase: Option<String>,
-) -> JobResult {
-    append(
-        store,
-        run_id,
-        key,
-        label,
-        CallState::Failed,
-        None,
-        Some(message.clone()),
-        phase,
-        None,
-    )?;
+fn fail(journal: &CommandJournal<'_>, message: String) -> JobResult {
+    journal.append(CallState::Failed, None, Some(message.clone()), None)?;
     Err(message)
 }
 
-fn append(
-    store: &WorkflowStore,
-    run_id: &str,
-    key: &str,
-    label: &str,
-    state: CallState,
-    result: Option<Value>,
-    error: Option<String>,
+struct CommandJournal<'a> {
+    store: &'a WorkflowStore,
+    run_id: &'a str,
+    key: &'a str,
+    label: &'a str,
     phase: Option<String>,
-    duration_ms: Option<u64>,
-) -> Result<(), String> {
-    store
-        .append(
-            run_id,
-            &JournalEntry {
-                at: Utc::now(),
-                key: key.to_owned(),
-                kind: CallKind::Command,
-                state,
-                label: label.to_owned(),
-                result,
-                error,
-                transport_run_id: None,
-                phase,
-                duration_ms,
-                usage: None,
-                schema_correction: None,
-            },
-        )
-        .map_err(|error| error.to_string())
+}
+
+impl CommandJournal<'_> {
+    fn append(
+        &self,
+        state: CallState,
+        result: Option<Value>,
+        error: Option<String>,
+        duration_ms: Option<u64>,
+    ) -> Result<(), String> {
+        self.store
+            .append(
+                self.run_id,
+                &JournalEntry {
+                    at: Utc::now(),
+                    key: self.key.to_owned(),
+                    kind: CallKind::Command,
+                    state,
+                    label: self.label.to_owned(),
+                    result,
+                    error,
+                    transport_run_id: None,
+                    phase: self.phase.clone(),
+                    duration_ms,
+                    usage: None,
+                    schema_correction: None,
+                },
+            )
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn resolve_cwd(default: &Path, requested: Option<&Path>) -> PathBuf {

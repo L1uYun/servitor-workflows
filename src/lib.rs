@@ -12,7 +12,9 @@ mod store;
 pub use agent::{ServitorTransport, Transport};
 pub use engine::{Engine, Inspection};
 pub use error::{ErrorPayload, WorkflowError};
-pub use model::{PublicRun, RunState, RunStatus};
+pub use model::{
+    PublicRun, ReconstructedState, RunState, RunStatus, WorkflowEvent, WorkflowEventEnvelope,
+};
 pub use store::WorkflowStore;
 
 pub fn default_engine() -> Engine {

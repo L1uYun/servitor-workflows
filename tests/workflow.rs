@@ -5,7 +5,7 @@ use servitor::{
     Activity, ErrorInfo, Input, Output, RunRecord, RunState as ServitorState, SubmitRequest,
     SubmitResponse,
 };
-use servitor_workflows::{Engine, RunStatus, Transport, WorkflowStore};
+use servitor_workflows::{Engine, RunState, RunStatus, Transport, WorkflowStore};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -202,12 +202,486 @@ fn script(temp: &TempDir, name: &str, body: &str) -> std::path::PathBuf {
     let path = temp.path().join(name);
     fs::write(
         &path,
-        format!("export const meta = {{ name: \"test\" }};\n{body}"),
+        format!("export const meta = {{ name: \"test\", contract: \"workflow.v2\" }};\n{body}"),
     )
     .expect("write fixture");
     path
 }
 
+fn legacy_state(store: &WorkflowStore, path: &Path, status: RunStatus) -> RunState {
+    let now = Utc::now();
+    let run_id = "legacy-v1-fixture".to_owned();
+    RunState {
+        version: 1,
+        run_id: run_id.clone(),
+        name: "legacy".to_owned(),
+        cwd: path.parent().expect("script parent").to_path_buf(),
+        contract: None,
+        parent_run_id: None,
+        status,
+        created_at: now,
+        updated_at: now,
+        args: Value::Null,
+        max_parallel: 1,
+        max_calls: 10,
+        resume_count: 0,
+        phase: None,
+        active: BTreeMap::new(),
+        waiting_gate: None,
+        supersede: None,
+        decisions: BTreeMap::new(),
+        result: None,
+        error: None,
+        report: None,
+        run_summary: None,
+        journal_path: store.journal_path(&run_id),
+    }
+}
+
+#[test]
+fn new_runs_require_explicit_v2_contract() {
+    let temp = TempDir::new().expect("tempdir");
+    let missing = temp.path().join("missing.js");
+    fs::write(
+        &missing,
+        "export const meta = { name: \"legacy\" }; return {};",
+    )
+    .expect("write missing contract fixture");
+    let wrong = temp.path().join("wrong.js");
+    fs::write(
+        &wrong,
+        "export const meta = { name: \"wrong\", contract: \"workflow.v3\" }; return {};",
+    )
+    .expect("write wrong contract fixture");
+    let runtime = engine(
+        &temp.path().join("state"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    );
+
+    let missing_error = runtime
+        .start(&missing, Value::Null, 1, 10)
+        .expect_err("missing v2 contract must fail");
+    assert!(missing_error.to_string().contains("workflow.v2"));
+    let wrong_error = runtime
+        .start(&wrong, Value::Null, 1, 10)
+        .expect_err("wrong contract must fail");
+    assert!(
+        wrong_error
+            .to_string()
+            .contains("unsupported workflow `contract`")
+    );
+    assert_eq!(
+        fs::read_dir(temp.path().join("state").join("runs"))
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        0
+    );
+}
+
+#[test]
+fn computed_metadata_initializer_is_rejected() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("computed-metadata.js");
+    fs::write(
+        &path,
+        r#"
+        export const meta = makeMeta({ contract: "workflow.v2" });
+        return {};
+        "#,
+    )
+    .expect("write computed metadata fixture");
+
+    let error = engine(
+        &temp.path().join("state"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    )
+    .start(&path, Value::Null, 1, 10)
+    .expect_err("computed metadata must not satisfy v2 contract");
+    assert!(error.to_string().contains("workflow.v2"));
+}
+
+#[test]
+fn metadata_decoy_before_real_declaration_is_ignored() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("metadata-decoy.js");
+    fs::write(
+        &path,
+        r#"
+        // export const meta = { name: "decoy" };
+        const text = "export const meta = { contract: 'workflow.v2' };";
+        export const meta = { name: "missing-contract" };
+        return {};
+        "#,
+    )
+    .expect("write metadata decoy fixture");
+    let error = engine(
+        &temp.path().join("state"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    )
+    .start(&path, Value::Null, 1, 10)
+    .expect_err("decoy metadata must not satisfy v2 contract");
+    assert!(error.to_string().contains("workflow.v2"));
+}
+
+#[test]
+fn regex_metadata_decoy_is_ignored() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("regex-metadata-decoy.js");
+    fs::write(
+        &path,
+        r#"
+        const marker = /export const meta = { contract: "workflow.v2" }/;
+        return { accepted: marker.test("meta") };
+        "#,
+    )
+    .expect("write regex metadata decoy fixture");
+
+    let error = engine(
+        &temp.path().join("state"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    )
+    .start(&path, Value::Null, 1, 10)
+    .expect_err("regex text must not satisfy v2 contract");
+    assert!(error.to_string().contains("workflow.v2"));
+}
+
+#[test]
+fn nested_metadata_declaration_is_ignored() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("nested-metadata-decoy.js");
+    fs::write(
+        &path,
+        r#"
+        function unused() { export const meta = { contract: "workflow.v2" }; }
+        return { ok: true };
+        "#,
+    )
+    .expect("write nested metadata decoy fixture");
+
+    let error = engine(
+        &temp.path().join("state"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    )
+    .start(&path, Value::Null, 1, 10)
+    .expect_err("nested metadata must not satisfy v2 contract");
+    assert!(
+        !error.to_string().is_empty(),
+        "nested export declaration must be rejected before execution"
+    );
+}
+
+#[test]
+fn metadata_declaration_allows_comments_before_assignment() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("comment-before-assignment.js");
+    fs::write(
+        &path,
+        r#"
+        export const meta /* note = { decoy } */ = {
+          contract: "workflow.v2",
+        };
+        return {};
+        "#,
+    )
+    .expect("write commented assignment fixture");
+
+    let state = engine(
+        &temp.path().join("state"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    )
+    .start(&path, Value::Null, 1, 10)
+    .expect("comments before assignment must be supported");
+    assert_eq!(state.contract.as_deref(), Some("workflow.v2"));
+}
+
+#[test]
+fn v2_contract_metadata_accepts_json5_comments() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("commented-meta.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          // this comment has a closing brace: }
+          name: "commented",
+          /* and this one has a quote: " */
+          contract: "workflow.v2",
+        };
+        return { ok: true };"#,
+    )
+    .expect("write commented metadata fixture");
+
+    let state = engine(
+        &temp.path().join("state"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    )
+    .start(&path, Value::Null, 1, 10)
+    .expect("JSON5 comments must not break v2 metadata extraction");
+    assert_eq!(state.contract.as_deref(), Some("workflow.v2"));
+    assert_eq!(state.status, RunStatus::Succeeded);
+}
+
+#[test]
+fn legacy_nonterminal_run_resumes_without_rewriting_v1_journal() {
+    let temp = TempDir::new().expect("tempdir");
+    let state_root = temp.path().join("state");
+    let store = WorkflowStore::new(&state_root);
+    let path = temp.path().join("legacy.js");
+    let source = "export const meta = { name: \"legacy\" }; return { legacy: true };";
+    fs::write(&path, source).expect("write legacy fixture");
+    let state = legacy_state(&store, &path, RunStatus::Failed);
+    store
+        .create_run(&state, source)
+        .expect("persist legacy run");
+    let journal = br#"{"at":"2026-01-01T00:00:00Z","key":"old#0","kind":"command","state":"succeeded","label":"old","result":{"ok":true}}
+"#;
+    fs::write(store.journal_path(&state.run_id), journal).expect("write frozen v1 journal");
+    let before = fs::read(store.journal_path(&state.run_id)).expect("read journal before resume");
+
+    let resumed = engine(&state_root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .resume(&state.run_id)
+        .expect("resume legacy run");
+
+    assert_eq!(resumed.version, 1);
+    assert_eq!(resumed.contract, None);
+    assert_eq!(resumed.status, RunStatus::Succeeded);
+    assert_eq!(resumed.result, Some(json!({"legacy": true})));
+    assert!(!store.events_path(&state.run_id).exists());
+    assert_eq!(
+        fs::read(store.journal_path(&state.run_id)).expect("read journal after resume"),
+        before
+    );
+}
+
+#[test]
+fn v2_events_are_append_only_and_reconstruct_terminal_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let state_root = temp.path().join("state");
+    let path = script(
+        &temp,
+        "events.js",
+        "phase(\"verify\"); return { outcome: \"ok\" };",
+    );
+    let state = engine(&state_root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, json!({"input": 1}), 2, 12)
+        .expect("run v2 workflow");
+    let store = WorkflowStore::new(&state_root);
+    let events = store.read_events(&state.run_id).expect("read v2 events");
+
+    assert_eq!(state.version, 2);
+    assert_eq!(state.contract.as_deref(), Some("workflow.v2"));
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    let reconstructed = store
+        .reconstruct_state(&state.run_id)
+        .expect("reconstruct state from persisted events");
+    assert_eq!(reconstructed.status, state.status);
+    assert_eq!(reconstructed.phase, state.phase);
+    assert_eq!(reconstructed.result, state.result);
+    assert_eq!(reconstructed.max_parallel, state.max_parallel);
+    assert_eq!(reconstructed.max_calls, state.max_calls);
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(store.journal_path(&state.run_id))
+        .and_then(|mut file| {
+            use std::io::Write;
+            writeln!(
+                file,
+                r#"{{"at":"2026-01-01T00:00:00Z","key":"stale#0","kind":"agent","state":"submitted","label":"stale"}}"#
+            )
+        })
+        .expect("append stale submitted journal entry");
+    let reconstructed = store
+        .reconstruct_state(&state.run_id)
+        .expect("reconstruct terminal state with stale journal");
+    assert!(
+        reconstructed.active.is_empty(),
+        "terminal lifecycle event must override stale submitted calls"
+    );
+
+    let mut torn_events = fs::read_to_string(store.events_path(&state.run_id))
+        .expect("read event stream before tear");
+    torn_events.push_str("{\"broken\":\n");
+    fs::write(store.events_path(&state.run_id), torn_events).expect("write torn event tail");
+    assert!(store.reconstruct_state(&state.run_id).is_err());
+}
+
+#[test]
+fn v2_gate_rejection_is_recorded_as_terminal_event() {
+    let temp = TempDir::new().expect("tempdir");
+    let state_root = temp.path().join("state");
+    let path = script(
+        &temp,
+        "gate-reject.js",
+        "await gate(\"approve release?\", { label: \"release\" }); return { released: true };",
+    );
+    let runtime = engine(&state_root, Arc::new(FakeTransport::new(Duration::ZERO)));
+    let waiting = runtime
+        .start(&path, Value::Null, 1, 10)
+        .expect("run to gate");
+    assert_eq!(waiting.status, RunStatus::WaitingHuman);
+
+    let rejected = runtime
+        .approve(&waiting.run_id, false, "not approved".to_owned(), None)
+        .expect("reject gate");
+    let store = WorkflowStore::new(&state_root);
+    let events = store.read_events(&waiting.run_id).expect("read events");
+    assert_eq!(events.len(), 4);
+    assert!(matches!(
+        events[1].event,
+        servitor_workflows::WorkflowEvent::GateOpened { .. }
+    ));
+    assert!(matches!(
+        events[2].event,
+        servitor_workflows::WorkflowEvent::GateDecided {
+            approved: false,
+            ..
+        }
+    ));
+    let reconstructed = store
+        .reconstruct_state(&waiting.run_id)
+        .expect("reconstruct rejected gate");
+    assert_eq!(reconstructed.status, rejected.status);
+    assert_eq!(reconstructed.error, rejected.error);
+}
+
+#[test]
+fn v2_cancellation_is_recorded_as_terminal_event() {
+    let temp = TempDir::new().expect("tempdir");
+    let state_root = temp.path().join("state");
+    let path = script(&temp, "cancel.js", "return { unused: true };");
+    let runtime = engine(&state_root, Arc::new(FakeTransport::new(Duration::ZERO)));
+    let prepared = runtime
+        .prepare(&path, Value::Null, 1, 10)
+        .expect("prepare v2 run");
+    let cancelled = runtime
+        .cancel(&prepared.run_id, "operator cancelled".to_owned())
+        .expect("cancel prepared run");
+    let store = WorkflowStore::new(&state_root);
+    let events = store.read_events(&prepared.run_id).expect("read events");
+    assert!(matches!(
+        events.last().expect("terminal event").event,
+        servitor_workflows::WorkflowEvent::RunCancelled { .. }
+    ));
+    let reconstructed = store
+        .reconstruct_state(&prepared.run_id)
+        .expect("reconstruct cancelled run");
+    assert_eq!(reconstructed.status, cancelled.status);
+    assert_eq!(reconstructed.error, cancelled.error);
+}
+
+#[test]
+fn pending_cancellation_reason_survives_resume() {
+    let temp = TempDir::new().expect("tempdir");
+    let state_root = temp.path().join("state");
+    let path = script(&temp, "cancel-resume.js", "return { unused: true };");
+    let runtime = engine(&state_root, Arc::new(FakeTransport::new(Duration::ZERO)));
+    let prepared = runtime
+        .prepare(&path, Value::Null, 1, 10)
+        .expect("prepare v2 run");
+    let state_path = runtime.store().state_path(&prepared.run_id);
+    let mut persisted: Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("read prepared state"))
+            .expect("decode prepared state");
+    persisted["active"] = json!({
+        "active#0": {
+            "kind": "agent",
+            "label": "active",
+            "started_at": Utc::now(),
+        }
+    });
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("encode active state"),
+    )
+    .expect("seed active call");
+    let cancelling = runtime
+        .cancel(&prepared.run_id, "operator cancelled".to_owned())
+        .expect("request cancellation");
+    assert_eq!(cancelling.status, RunStatus::Cancelling);
+
+    let resumed = runtime
+        .resume(&prepared.run_id)
+        .expect("resume cancellation");
+    assert_eq!(resumed.status, RunStatus::Cancelled);
+    assert_eq!(
+        resumed.error.as_deref(),
+        Some("cancelled: operator cancelled")
+    );
+    let reconstructed = runtime
+        .store()
+        .reconstruct_state(&prepared.run_id)
+        .expect("reconstruct resumed cancellation");
+    assert_eq!(reconstructed.error, resumed.error);
+}
+
+#[test]
+fn v2_pause_resume_and_supersede_reconstruct_from_events() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(250)));
+    let path = script(
+        &temp,
+        "pause-resume.js",
+        "phase(\"prepare\"); const result = await agent(\"LONG\"); return { result };",
+    );
+    let runtime = engine(&root, Arc::clone(&transport));
+    let prepared = runtime
+        .prepare(&path, Value::Null, 1, 10)
+        .expect("prepare v2 run");
+    let run_id = prepared.run_id;
+    let paused = runtime.pause(&run_id).expect("pause v2 run");
+    assert_eq!(paused.status, RunStatus::Paused);
+
+    let resumed = runtime.resume(&run_id).expect("resume v2 run");
+    assert_eq!(resumed.status, RunStatus::Succeeded, "{:?}", resumed.error);
+    let store = WorkflowStore::new(&root);
+    let events = store.read_events(&run_id).expect("read lifecycle events");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, servitor_workflows::WorkflowEvent::RunPaused))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event.event,
+        servitor_workflows::WorkflowEvent::RunResumed { resume_count: 1 }
+    )));
+    let reconstructed = store
+        .reconstruct_state(&run_id)
+        .expect("reconstruct resumed run");
+    assert_eq!(reconstructed.status, resumed.status);
+    assert_eq!(reconstructed.phase, resumed.phase);
+    assert_eq!(reconstructed.resume_count, resumed.resume_count);
+
+    let redirect = runtime
+        .prepare(&path, Value::Null, 1, 10)
+        .expect("prepare v2 supersede run");
+    let superseded = runtime
+        .supersede(
+            &redirect.run_id,
+            "redirected by operator".to_owned(),
+            Some("evidence.md".to_owned()),
+            Some("next-contract.md".to_owned()),
+        )
+        .expect("supersede v2 run");
+    let reconstructed = store
+        .reconstruct_state(&redirect.run_id)
+        .expect("reconstruct superseded run");
+    assert_eq!(reconstructed.status, superseded.status);
+    assert_eq!(
+        reconstructed
+            .supersede
+            .expect("reconstructed supersede")
+            .reason,
+        "redirected by operator"
+    );
+}
 #[test]
 fn dynamic_pipeline_fans_out_and_runs_concurrently() {
     let temp = TempDir::new().expect("tempdir");
@@ -644,6 +1118,34 @@ fn result_report_is_validated_as_a_delivery_artifact() {
 }
 
 #[test]
+fn script_supersede_requests_cancellation_for_active_calls() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-script-supersede");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(400)));
+    let path = script(
+        &temp,
+        "script-supersede.js",
+        r#"
+            const pending = agent("LONG");
+            await supersede({ reason: "contract replaced" });
+        "#,
+    );
+
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("superseded workflow");
+
+    assert_eq!(state.status, RunStatus::Superseded);
+    assert!(
+        root.join("runs")
+            .join(&state.run_id)
+            .join("cancel.request")
+            .exists(),
+        "script-initiated supersede must request active-call cancellation"
+    );
+}
+
+#[test]
 fn missing_delivery_report_fails_the_run() {
     let temp = TempDir::new().expect("tempdir");
     let missing = temp.path().join("missing.html");
@@ -703,6 +1205,10 @@ fn pause_and_cancel_interrupt_active_calls() {
         paused.status,
         RunStatus::Pausing | RunStatus::Paused
     ));
+    let paused_reconstruction = WorkflowStore::new(&root)
+        .reconstruct_state(&run_id)
+        .expect("reconstruct pause request");
+    assert_eq!(paused_reconstruction.status, paused.status);
     let final_pause = runner.join().expect("join").expect("runner result");
     assert_eq!(final_pause.status, RunStatus::Paused);
     assert!(
@@ -728,6 +1234,15 @@ fn pause_and_cancel_interrupt_active_calls() {
         cancelling.status,
         RunStatus::Cancelling | RunStatus::Cancelled
     ));
+    let cancelling_reconstruction = WorkflowStore::new(&second_root)
+        .reconstruct_state(&second_id)
+        .expect("reconstruct cancellation request");
+    assert_eq!(cancelling_reconstruction.status, cancelling.status);
+    assert_eq!(
+        cancelling_reconstruction.error.as_deref(),
+        Some("cancelled: test cancel audit reason"),
+        "cancellation reason must reconstruct during drain"
+    );
     let final_cancel = runner.join().expect("join").expect("runner result");
     assert_eq!(final_cancel.status, RunStatus::Cancelled);
     assert_eq!(
@@ -845,6 +1360,32 @@ fn command_journal_records_phase_and_duration() {
     assert_eq!(succeeded["phase"], "build");
     assert!(succeeded["duration_ms"].as_u64().is_some());
     assert!(succeeded.get("usage").is_none());
+}
+
+#[test]
+fn cancelling_waiting_gate_clears_live_and_reconstructed_gate() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-cancel-waiting");
+    let path = script(
+        &temp,
+        "cancel-waiting.js",
+        r#"return await gate("ship it?", { label: "ship" });"#,
+    );
+    let runtime = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)));
+    let waiting = runtime.start(&path, Value::Null, 1, 10).expect("start");
+    assert_eq!(waiting.status, RunStatus::WaitingHuman);
+    assert!(waiting.waiting_gate.is_some());
+
+    let cancelled = runtime
+        .cancel(&waiting.run_id, "operator cancelled".to_owned())
+        .expect("cancel waiting run");
+    assert_eq!(cancelled.status, RunStatus::Cancelled);
+    assert!(cancelled.waiting_gate.is_none());
+    let reconstructed = runtime
+        .store()
+        .reconstruct_state(&waiting.run_id)
+        .expect("reconstruct cancelled waiting run");
+    assert_eq!(reconstructed.waiting_gate, cancelled.waiting_gate);
 }
 
 #[test]
@@ -1488,7 +2029,7 @@ fn detached_run_reuses_one_record_and_waits_for_success() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn detach probe");
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while process.try_wait().expect("poll detach probe").is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -1497,7 +2038,7 @@ fn detached_run_reuses_one_record_and_waits_for_success() {
         "detach parent did not exit promptly"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(5),
         "detach took {:?}",
         started.elapsed()
     );

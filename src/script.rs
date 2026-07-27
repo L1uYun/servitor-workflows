@@ -1,7 +1,7 @@
 use crate::agent::AgentOptions;
 use crate::command::CommandOptions;
 use crate::error::WorkflowError;
-use crate::model::{GateRequest, RunStatus};
+use crate::model::{GateRequest, RunStatus, WorkflowEvent};
 use crate::scheduler::{RuntimeHost, call_key};
 use boa_engine::{
     Context, JsArgs, JsNativeError, JsResult, JsValue, NativeFunction, Source,
@@ -229,7 +229,14 @@ struct GateOptions {
 }
 
 fn wrap_script(script: &str) -> String {
-    let body = script.replacen("export const meta", "const meta", 1);
+    let body = match meta_export_start(script) {
+        Some(start) => format!(
+            "{}const meta{}",
+            &script[..start],
+            &script[start + "export const meta".len()..]
+        ),
+        None => script.to_owned(),
+    };
     format!(
         "(async () => {{ const __result = await (async () => {{ {body} }})(); return JSON.stringify(__result ?? null); }})()"
     )
@@ -244,6 +251,304 @@ pub fn parse_check(script: &str) -> Result<(), WorkflowError> {
     boa_engine::Script::parse(Source::from_bytes(&wrapped), None, &mut context)
         .map(|_| ())
         .map_err(|error| WorkflowError::InvalidWorkflow(error.to_string()))
+}
+
+/// Extract the `export const meta = { ... }` object literal as JSON-like data.
+/// Returns `Ok(None)` when the script declares no `meta`. Metadata uses the
+/// JSON5 literal subset (unquoted keys, single-quoted strings, arrays, nested
+/// values, and comments), but never evaluates JavaScript expressions. This
+/// keeps validation side-effect-free and rejects computed properties, calls,
+/// getters, and references to ambient globals.
+pub fn parse_meta(script: &str) -> Result<Option<Value>, WorkflowError> {
+    let Some(literal) = extract_meta_literal(script) else {
+        return Ok(None);
+    };
+    json5::from_str(&literal).map(Some).map_err(|error| {
+        WorkflowError::InvalidWorkflow(format!("meta must be a JSON5 object literal: {error}"))
+    })
+}
+
+/// Resolve the workflow contract from its `meta` declaration.
+///
+/// - `Some("workflow.v2")` when `meta.contract` is the string `"workflow.v2"`;
+///   the run becomes a v2 run with the versioned event stream.
+/// - `None` when `meta` omits `contract` — the run stays on the frozen v1
+///   compatibility path (no event stream, journal-only replay).
+/// - `Err` when `contract` is present but not the string `"workflow.v2"`
+///   (null, number, bool, or any other string). New v2 runs must not accept
+///   missing or non-v2 contract metadata.
+pub fn contract_of(script: &str) -> Result<Option<String>, WorkflowError> {
+    let Some(meta) = parse_meta(script)? else {
+        return Ok(None);
+    };
+    match meta.get("contract") {
+        None => Ok(None),
+        Some(Value::String(s)) if s == "workflow.v2" => Ok(Some(s.clone())),
+        Some(other) => Err(WorkflowError::InvalidWorkflow(format!(
+            "unsupported workflow `contract` metadata: {} — expected the string \"workflow.v2\" or omit the field for a v1 run",
+            summarize_contract(other)
+        ))),
+    }
+}
+
+fn summarize_contract(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("\"{s}\""),
+        Value::Null => "null".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// Locate a real top-level `export const meta` declaration, ignoring strings,
+/// comments, and regular-expression literals. The byte after `meta` must be
+/// whitespace or `=` so `export const metadata` is not treated as a workflow
+/// declaration.
+fn meta_export_start(script: &str) -> Option<usize> {
+    const KEY: &[u8] = b"export const meta";
+    let bytes = script.as_bytes();
+    let mut index = 0;
+    let mut depth = 0usize;
+    let mut expects_expression = true;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while bytes
+                .get(index)
+                .is_some_and(|next| *next != b'\n' && *next != b'\r')
+            {
+                index += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while !(bytes.get(index) == Some(&b'*') && bytes.get(index + 1) == Some(&b'/')) {
+                bytes.get(index)?;
+                index += 1;
+            }
+            index += 2;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            index = skip_quoted(bytes, index)?;
+            expects_expression = false;
+            continue;
+        }
+        if byte == b'/' && expects_expression {
+            index = skip_regex(bytes, index)?;
+            expects_expression = false;
+            continue;
+        }
+        if depth == 0 && bytes[index..].starts_with(KEY) {
+            let following = bytes.get(index + KEY.len()).copied();
+            if following.is_none_or(|next| next.is_ascii_whitespace() || next == b'=') {
+                return Some(index);
+            }
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' {
+            let start = index;
+            index += 1;
+            while bytes
+                .get(index)
+                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == b'_' || *next == b'$')
+            {
+                index += 1;
+            }
+            let word = &script[start..index];
+            expects_expression = matches!(
+                word,
+                "return"
+                    | "case"
+                    | "throw"
+                    | "else"
+                    | "do"
+                    | "typeof"
+                    | "void"
+                    | "delete"
+                    | "new"
+                    | "in"
+                    | "of"
+                    | "yield"
+                    | "await"
+                    | "const"
+                    | "let"
+                    | "var"
+            );
+            continue;
+        }
+        expects_expression = match byte {
+            b'{' => {
+                depth += 1;
+                true
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            b'(' | b'[' => true,
+            b')' | b']' => false,
+            b'.' => false,
+            b'+' | b'-' if bytes.get(index + 1) == Some(&byte) => false,
+            b'/' => true,
+            _ => !byte.is_ascii_digit(),
+        };
+        index += 1;
+    }
+    None
+}
+
+fn skip_quoted(bytes: &[u8], mut index: usize) -> Option<usize> {
+    let quote = *bytes.get(index)?;
+    index += 1;
+    while let Some(byte) = bytes.get(index) {
+        if *byte == b'\\' {
+            index += 2;
+        } else if *byte == quote {
+            return Some(index + 1);
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+fn skip_regex(bytes: &[u8], mut index: usize) -> Option<usize> {
+    debug_assert_eq!(bytes.get(index), Some(&b'/'));
+    index += 1;
+    let mut in_class = false;
+    while let Some(byte) = bytes.get(index) {
+        match *byte {
+            b'\\' => index += 2,
+            b'[' => {
+                in_class = true;
+                index += 1;
+            }
+            b']' => {
+                in_class = false;
+                index += 1;
+            }
+            b'/' if !in_class => {
+                index += 1;
+                while bytes
+                    .get(index)
+                    .is_some_and(|flag| flag.is_ascii_alphabetic())
+                {
+                    index += 1;
+                }
+                return Some(index);
+            }
+            b'\n' | b'\r' => return None,
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Scan `export const meta = { ... }` and return the balanced object literal
+/// substring (including the outer braces). Returns `None` when no meta literal
+/// can be located. Tracks string and brace nesting so a `}` inside a string
+/// value does not prematurely close the scan.
+fn extract_meta_literal(script: &str) -> Option<String> {
+    let start = meta_export_start(script)?;
+    let after_key = &script[start + "export const meta".len()..];
+    let eq = skip_metadata_trivia(after_key)?;
+    if after_key.as_bytes().get(eq) != Some(&b'=') {
+        return None;
+    }
+    let rest = &after_key[skip_metadata_trivia(&after_key[eq + 1..])? + eq + 1..];
+    if rest.as_bytes().first() != Some(&b'{') {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut depth: i64 = 0;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' && bytes[index] != b'\r' {
+                index += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            if index + 1 >= bytes.len() {
+                return None;
+            }
+            index += 2;
+            continue;
+        }
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(rest[..=index].to_owned());
+                }
+            }
+            b'\'' | b'\"' => quote = Some(byte),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn skip_metadata_trivia(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    loop {
+        while bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while bytes
+                .get(index)
+                .is_some_and(|byte| *byte != b'\n' && *byte != b'\r')
+            {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while !(bytes.get(index) == Some(&b'*') && bytes.get(index + 1) == Some(&b'/')) {
+                bytes.get(index)?;
+                index += 1;
+            }
+            index += 2;
+            continue;
+        }
+        return Some(index);
+    }
 }
 
 pub fn execute(
@@ -493,19 +798,29 @@ async fn host_gate(
             serde_json::to_string(&result).map_err(native_error)?
         )));
     }
+    let request = GateRequest {
+        key,
+        label,
+        question,
+        expect: options.expect.clone(),
+        current: options.current.clone(),
+        hint: options.hint.clone(),
+    };
     host.runtime
-        .store
-        .update_state(&host.runtime.run_id, |state| {
-            state.status = RunStatus::WaitingHuman;
-            state.waiting_gate = Some(GateRequest {
-                key,
-                label,
-                question,
-                expect: options.expect.clone(),
-                current: options.current.clone(),
-                hint: options.hint.clone(),
-            });
-        })
+        .transition(
+            WorkflowEvent::GateOpened {
+                key: request.key.clone(),
+                label: request.label.clone(),
+                question: request.question.clone(),
+                expect: request.expect.clone(),
+                current: request.current.clone(),
+                hint: request.hint.clone(),
+            },
+            |state| {
+                state.status = RunStatus::WaitingHuman;
+                state.waiting_gate = Some(request);
+            },
+        )
         .map_err(native_error)?;
     Err(JsNativeError::error()
         .with_message("workflow is waiting for human input")
@@ -536,13 +851,31 @@ async fn host_supersede(
         (js_string_arg(args, 0, context)?, host)
     };
     let options: SupersedeOptions = serde_json::from_str(&options_json).map_err(native_error)?;
+    if options.reason.trim().is_empty() {
+        return Err(native_error("supersede reason is required"));
+    }
     host.runtime
         .store
-        .mark_superseded(
-            &host.runtime.run_id,
-            options.reason.clone(),
-            options.evidence.clone(),
-            options.new_contract.clone(),
+        .request_cancel(&host.runtime.run_id)
+        .map_err(native_error)?;
+    host.runtime
+        .transition(
+            WorkflowEvent::RunSuperseded {
+                reason: options.reason.clone(),
+                evidence: options.evidence.clone(),
+                new_contract: options.new_contract.clone(),
+            },
+            |state| {
+                state.status = RunStatus::Superseded;
+                state.active.clear();
+                state.waiting_gate = None;
+                state.supersede = Some(crate::model::SupersedeInfo {
+                    reason: options.reason.clone(),
+                    evidence: options.evidence.clone(),
+                    new_contract: options.new_contract.clone(),
+                    decided_at: chrono::Utc::now(),
+                });
+            },
         )
         .map_err(native_error)?;
     Err(JsNativeError::error()
@@ -558,10 +891,12 @@ fn host_phase(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         .ok_or_else(|| JsNativeError::error().with_message("workflow host is missing"))?;
     let persisted_name = name.clone();
     host.runtime
-        .store
-        .update_state(&host.runtime.run_id, |state| {
-            state.phase = Some(persisted_name);
-        })
+        .transition(
+            WorkflowEvent::PhaseChanged {
+                phase: name.clone(),
+            },
+            |state| state.phase = Some(persisted_name),
+        )
         .map_err(native_error)?;
     *host
         .phase

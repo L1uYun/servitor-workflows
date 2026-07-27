@@ -12,6 +12,7 @@ use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const INVALID_OUTPUT_EXCERPT_MAX_CHARS: usize = 2_000;
+type RecoveredStructuredOutput = (Value, Option<u64>, Option<Value>);
 
 pub trait Transport: Send + Sync {
     fn submit(
@@ -495,7 +496,7 @@ fn try_recover_structured(
     transport: &dyn Transport,
     transport_run_id: &str,
     schema: Option<&Value>,
-) -> Result<Option<(Value, Option<u64>, Option<Value>)>, String> {
+) -> Result<Option<RecoveredStructuredOutput>, String> {
     let record = transport
         .inspect(transport_run_id)
         .map_err(|error| format!("{}: {}", error.code, error.message))?;

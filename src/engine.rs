@@ -1,6 +1,6 @@
 use crate::agent::Transport;
 use crate::error::WorkflowError;
-use crate::model::{GateDecision, PublicRun, RunState, RunStatus};
+use crate::model::{GateDecision, PublicRun, RunState, RunStatus, WorkflowEvent};
 use crate::run_summary;
 use crate::scheduler::{RuntimeHost, Scheduler};
 use crate::script;
@@ -28,6 +28,42 @@ impl Engine {
         &self.store
     }
 
+    fn transition<F>(
+        &self,
+        run_id: &str,
+        event: WorkflowEvent,
+        update: F,
+    ) -> Result<RunState, WorkflowError>
+    where
+        F: FnOnce(&mut RunState),
+    {
+        let state = self.store.load_state(run_id)?;
+        if state.contract.as_deref() == Some("workflow.v2") {
+            self.store
+                .transition(run_id, state.parent_run_id.as_deref(), event, update)
+        } else {
+            self.store.update_state(run_id, update)
+        }
+    }
+
+    fn transition_many<F, I>(
+        &self,
+        run_id: &str,
+        events: I,
+        update: F,
+    ) -> Result<RunState, WorkflowError>
+    where
+        F: FnOnce(&mut RunState),
+        I: IntoIterator<Item = WorkflowEvent>,
+    {
+        let state = self.store.load_state(run_id)?;
+        if state.contract.as_deref() == Some("workflow.v2") {
+            self.store
+                .transition_many(run_id, state.parent_run_id.as_deref(), events, update)
+        } else {
+            self.store.update_state(run_id, update)
+        }
+    }
     pub fn start(
         &self,
         path: &Path,
@@ -55,7 +91,10 @@ impl Engine {
             path: path.to_path_buf(),
             source,
         })?;
-        validate_script(&script)?;
+        // New runs must opt into the v2 contract explicitly. Legacy v1 runs are
+        // resumed from their persisted state and never pass through prepare().
+        let contract = validate_script(&script)?;
+        let version = 2;
         let cwd = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -67,7 +106,7 @@ impl Engine {
         let now = Utc::now();
         let run_id = Uuid::now_v7().to_string();
         let state = RunState {
-            version: 1,
+            version,
             run_id: run_id.clone(),
             name: path
                 .file_stem()
@@ -81,6 +120,8 @@ impl Engine {
             args,
             max_parallel,
             max_calls,
+            contract,
+            parent_run_id: None,
             resume_count: 0,
             phase: None,
             active: Default::default(),
@@ -94,6 +135,18 @@ impl Engine {
             journal_path: self.store.journal_path(&run_id),
         };
         self.store.create_run(&state, &script)?;
+        if state.contract.as_deref() == Some("workflow.v2") {
+            self.store.append_event(
+                &state.run_id,
+                None,
+                WorkflowEvent::RunStarted {
+                    name: state.name.clone(),
+                    args: state.args.clone(),
+                    max_parallel: state.max_parallel,
+                    max_calls: state.max_calls,
+                },
+            )?;
+        }
         Ok(state)
     }
 
@@ -108,9 +161,15 @@ impl Engine {
         if state.status.blocks_resume_rerun() {
             return self.ensure_terminal_artifacts(state);
         }
-        self.store.update_state(run_id, |state| {
-            state.resume_count = state.resume_count.saturating_add(1);
-        })?;
+        self.transition(
+            run_id,
+            WorkflowEvent::RunResumed {
+                resume_count: state.resume_count.saturating_add(1),
+            },
+            |state| {
+                state.resume_count = state.resume_count.saturating_add(1);
+            },
+        )?;
         self.store.clear_pause(run_id)?;
         self.execute(run_id)
     }
@@ -189,41 +248,67 @@ impl Engine {
         let gate = state
             .waiting_gate
             .ok_or_else(|| WorkflowError::Invariant("waiting run has no gate".to_owned()))?;
-        self.store.update_state(run_id, |state| {
-            state.decisions.insert(
-                gate.key.clone(),
-                GateDecision {
-                    approved,
-                    reason: reason.clone(),
-                    decided_at: Utc::now(),
-                    value,
-                },
-            );
-            state.waiting_gate = None;
-            if approved {
-                state.status = RunStatus::Running;
-            } else {
-                state.status = RunStatus::Failed;
-                state.error = Some(reason);
-            }
-        })?;
+        let decided_event = WorkflowEvent::GateDecided {
+            key: gate.key.clone(),
+            approved,
+            reason: reason.clone(),
+            value: value.clone(),
+        };
         if approved {
+            self.transition(run_id, decided_event, |state| {
+                state.decisions.insert(
+                    gate.key.clone(),
+                    GateDecision {
+                        approved,
+                        reason: reason.clone(),
+                        decided_at: Utc::now(),
+                        value,
+                    },
+                );
+                state.waiting_gate = None;
+                state.status = RunStatus::Running;
+            })?;
             self.execute(run_id)
         } else {
-            let state = self.store.load_state(run_id)?;
+            let state = self.transition_many(
+                run_id,
+                [
+                    decided_event,
+                    WorkflowEvent::RunFailed {
+                        error: reason.clone(),
+                    },
+                ],
+                |state| {
+                    state.decisions.insert(
+                        gate.key.clone(),
+                        GateDecision {
+                            approved,
+                            reason: reason.clone(),
+                            decided_at: Utc::now(),
+                            value,
+                        },
+                    );
+                    state.waiting_gate = None;
+                    state.status = RunStatus::Failed;
+                    state.error = Some(reason);
+                },
+            )?;
             self.ensure_terminal_artifacts(state)
         }
     }
 
     pub fn pause(&self, run_id: &str) -> Result<RunState, WorkflowError> {
         self.store.request_pause(run_id)?;
-        self.store.update_state(run_id, |state| {
-            state.status = if state.active.is_empty() {
-                RunStatus::Paused
-            } else {
-                RunStatus::Pausing
-            };
-        })
+        let state = self.store.load_state(run_id)?;
+        if state.active.is_empty() {
+            self.transition(run_id, WorkflowEvent::RunPaused, |state| {
+                state.status = RunStatus::Paused;
+            })
+        } else {
+            self.transition(run_id, WorkflowEvent::RunPausing, |state| {
+                state.status = RunStatus::Pausing;
+            })
+        }
     }
 
     /// Validate a workflow script without creating a run: same emptiness/meta
@@ -242,14 +327,33 @@ impl Engine {
 
     pub fn cancel(&self, run_id: &str, reason: String) -> Result<RunState, WorkflowError> {
         self.store.request_cancel(run_id)?;
-        let state = self.store.update_state(run_id, |state| {
-            state.error = Some(format!("cancelled: {reason}"));
-            state.status = if state.active.is_empty() {
-                RunStatus::Cancelled
-            } else {
-                RunStatus::Cancelling
-            };
-        })?;
+        let state = self.store.load_state(run_id)?;
+        let error = format!("cancelled: {reason}");
+        let state = if state.active.is_empty() {
+            self.transition(
+                run_id,
+                WorkflowEvent::RunCancelled {
+                    error: error.clone(),
+                },
+                |state| {
+                    state.error = Some(error);
+                    state.status = RunStatus::Cancelled;
+                    state.waiting_gate = None;
+                    state.active.clear();
+                },
+            )?
+        } else {
+            self.transition(
+                run_id,
+                WorkflowEvent::RunCancelling {
+                    error: error.clone(),
+                },
+                |state| {
+                    state.error = Some(error);
+                    state.status = RunStatus::Cancelling;
+                },
+            )?
+        };
         if state.status.is_terminal() {
             self.ensure_terminal_artifacts(state)
         } else {
@@ -264,9 +368,28 @@ impl Engine {
         evidence: Option<String>,
         new_contract: Option<String>,
     ) -> Result<RunState, WorkflowError> {
-        let state = self
-            .store
-            .mark_superseded(run_id, reason, evidence, new_contract)?;
+        if reason.trim().is_empty() {
+            return Err(WorkflowError::InvalidOperation(
+                "supersede reason is required".to_owned(),
+            ));
+        }
+        self.store.request_cancel(run_id)?;
+        let event = WorkflowEvent::RunSuperseded {
+            reason: reason.clone(),
+            evidence: evidence.clone(),
+            new_contract: new_contract.clone(),
+        };
+        let state = self.transition(run_id, event, |state| {
+            state.status = RunStatus::Superseded;
+            state.active.clear();
+            state.waiting_gate = None;
+            state.supersede = Some(crate::model::SupersedeInfo {
+                reason,
+                evidence,
+                new_contract,
+                decided_at: Utc::now(),
+            });
+        })?;
         self.ensure_terminal_artifacts(state)
     }
 
@@ -281,19 +404,35 @@ impl Engine {
     }
 
     fn execute(&self, run_id: &str) -> Result<RunState, WorkflowError> {
+        let cancel_requested = self.store.cancel_requested(run_id);
         let initial = self.store.update_state(run_id, |state| {
             state.status = RunStatus::Running;
             state.active.clear();
             state.waiting_gate = None;
             state.result = None;
-            state.error = None;
+            if !cancel_requested {
+                state.error = None;
+            }
             state.report = None;
             state.run_summary = None;
         })?;
         if self.store.cancel_requested(run_id) {
-            let state = self.store.update_state(run_id, |state| {
-                state.status = RunStatus::Cancelled;
-            })?;
+            let error = initial
+                .error
+                .clone()
+                .unwrap_or_else(|| "workflow cancelled".to_owned());
+            let state = self.transition(
+                run_id,
+                WorkflowEvent::RunCancelled {
+                    error: error.clone(),
+                },
+                |state| {
+                    state.status = RunStatus::Cancelled;
+                    state.error = Some(error);
+                    state.active.clear();
+                },
+            )?;
+            let _ = self.store.clear_cancel(run_id);
             return self.ensure_terminal_artifacts(state);
         }
         let source = self.store.load_script(run_id)?;
@@ -303,6 +442,8 @@ impl Engine {
             store: Arc::clone(&self.store),
             transport: Arc::clone(&self.transport),
             scheduler: Scheduler::new(initial.max_parallel),
+            contract: initial.contract.clone(),
+            parent_run_id: initial.parent_run_id.clone(),
         });
         let result = script::execute(runtime, &source, &initial.args, initial.max_calls);
         let current = self.store.load_state(run_id)?;
@@ -310,15 +451,24 @@ impl Engine {
             return self.ensure_terminal_artifacts(current);
         }
         if self.store.cancel_requested(run_id) {
-            let state = self.store.update_state(run_id, |state| {
-                state.status = RunStatus::Cancelled;
-                state.active.clear();
-            })?;
+            let state = self.transition(
+                run_id,
+                WorkflowEvent::RunCancelled {
+                    error: current
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "workflow cancelled".to_owned()),
+                },
+                |state| {
+                    state.status = RunStatus::Cancelled;
+                    state.active.clear();
+                },
+            )?;
             let _ = self.store.clear_cancel(run_id);
             return self.ensure_terminal_artifacts(state);
         }
         if self.store.pause_requested(run_id) {
-            let state = self.store.update_state(run_id, |state| {
+            let state = self.transition(run_id, WorkflowEvent::RunPaused, |state| {
                 state.status = RunStatus::Paused;
                 state.active.clear();
             })?;
@@ -330,26 +480,44 @@ impl Engine {
         }
         let state = match result {
             Ok(value) => match delivery_report(&value) {
-                Ok(report) => self.store.update_state(run_id, |state| {
-                    state.status = RunStatus::Succeeded;
-                    state.result = Some(value);
-                    state.error = None;
-                    state.report = report;
-                    state.active.clear();
-                }),
-                Err(error) => self.store.update_state(run_id, |state| {
-                    state.status = RunStatus::Failed;
-                    state.result = Some(value);
-                    state.error = Some(error.to_string());
-                    state.report = None;
-                    state.active.clear();
-                }),
+                Ok(report) => self.transition(
+                    run_id,
+                    WorkflowEvent::RunSucceeded {
+                        result: Some(value.clone()),
+                    },
+                    |state| {
+                        state.status = RunStatus::Succeeded;
+                        state.result = Some(value);
+                        state.error = None;
+                        state.report = report;
+                        state.active.clear();
+                    },
+                ),
+                Err(error) => self.transition(
+                    run_id,
+                    WorkflowEvent::RunFailed {
+                        error: error.to_string(),
+                    },
+                    |state| {
+                        state.status = RunStatus::Failed;
+                        state.result = Some(value);
+                        state.error = Some(error.to_string());
+                        state.report = None;
+                        state.active.clear();
+                    },
+                ),
             },
-            Err(error) => self.store.update_state(run_id, |state| {
-                state.status = RunStatus::Failed;
-                state.error = Some(error.to_string());
-                state.active.clear();
-            }),
+            Err(error) => self.transition(
+                run_id,
+                WorkflowEvent::RunFailed {
+                    error: error.to_string(),
+                },
+                |state| {
+                    state.status = RunStatus::Failed;
+                    state.error = Some(error.to_string());
+                    state.active.clear();
+                },
+            ),
         }?;
         self.ensure_terminal_artifacts(state)
     }
@@ -374,11 +542,18 @@ impl Engine {
             match state.result.as_ref().map(delivery_report).transpose() {
                 Ok(report) => report.flatten(),
                 Err(error) => {
-                    return self.store.update_state(&state.run_id, |state| {
-                        state.status = RunStatus::Failed;
-                        state.error = Some(error.to_string());
-                        state.report = None;
-                    });
+                    let error = error.to_string();
+                    return self.transition(
+                        &state.run_id,
+                        WorkflowEvent::RunFailed {
+                            error: error.clone(),
+                        },
+                        |state| {
+                            state.status = RunStatus::Failed;
+                            state.error = Some(error);
+                            state.report = None;
+                        },
+                    );
                 }
             }
         } else {
@@ -387,11 +562,18 @@ impl Engine {
         let path = match run_summary::write(&self.store, &state) {
             Ok(path) => path,
             Err(error) => {
-                return self.store.update_state(&state.run_id, |state| {
-                    state.status = RunStatus::Failed;
-                    state.error = Some(format!("run summary generation failed: {error}"));
-                    state.run_summary = None;
-                });
+                let error = format!("run summary generation failed: {error}");
+                return self.transition(
+                    &state.run_id,
+                    WorkflowEvent::RunFailed {
+                        error: error.clone(),
+                    },
+                    |state| {
+                        state.status = RunStatus::Failed;
+                        state.error = Some(error);
+                        state.run_summary = None;
+                    },
+                );
             }
         };
         if state.report == report && state.run_summary.as_ref() == Some(&path) {
@@ -442,14 +624,18 @@ fn delivery_report(value: &Value) -> Result<Option<PathBuf>, WorkflowError> {
     Ok(Some(path))
 }
 
-fn validate_script(script: &str) -> Result<(), WorkflowError> {
+fn validate_script(script: &str) -> Result<Option<String>, WorkflowError> {
     if script.trim().is_empty() {
         return Err(WorkflowError::InvalidWorkflow("script is empty".to_owned()));
     }
-    if !script.contains("export const meta") {
+    script::parse_check(script)?;
+    // New runs are v2-only. Existing v1 runs bypass this path and keep their
+    // persisted script, state, journal, and frozen replay semantics.
+    let contract = script::contract_of(script)?;
+    if contract.as_deref() != Some("workflow.v2") {
         return Err(WorkflowError::InvalidWorkflow(
-            "script must declare `export const meta`".to_owned(),
+            "new workflows must declare `meta.contract: \"workflow.v2\"`".to_owned(),
         ));
     }
-    script::parse_check(script)
+    Ok(contract)
 }

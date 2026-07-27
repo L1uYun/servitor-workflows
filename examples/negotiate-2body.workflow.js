@@ -1,6 +1,7 @@
 export const meta = {
   name: "negotiate-2body",
   description: "Two-body proposal/review loop with synthesizer decision (C6 canary)",
+  contract: "workflow.v2",
 };
 
 // args:
