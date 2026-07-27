@@ -66,7 +66,9 @@ pub struct RuntimeHost {
     pub cwd: PathBuf,
     pub store: Arc<WorkflowStore>,
     pub transport: Arc<dyn Transport>,
-    pub scheduler: Scheduler,
+    /// Shared tree scheduler. Child orchestration itself runs outside this pool,
+    /// so `maxParallel=1` cannot deadlock when the child invokes a host call.
+    pub scheduler: Arc<Scheduler>,
     /// `Some("workflow.v2")` for v2 runs; `None` for v1 runs. Host functions
     /// use this to decide whether to append lifecycle events to the versioned
     /// stream. V2-A only — children inherit via V2-C.

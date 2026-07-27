@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug)]
 pub struct WorkflowStore {
@@ -106,6 +106,9 @@ impl WorkflowStore {
     }
 
     pub fn save_state(&self, state: &RunState) -> Result<(), WorkflowError> {
+        let _process_guard = process_write_lock()
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("state write lock poisoned".to_owned()))?;
         let _guard = self
             .writes
             .lock()
@@ -118,6 +121,9 @@ impl WorkflowStore {
     where
         F: FnOnce(&mut RunState),
     {
+        let _process_guard = process_write_lock()
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("state write lock poisoned".to_owned()))?;
         let _guard = self
             .writes
             .lock()
@@ -134,6 +140,9 @@ impl WorkflowStore {
     }
 
     pub fn append(&self, run_id: &str, entry: &JournalEntry) -> Result<(), WorkflowError> {
+        let _process_guard = process_write_lock()
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("journal write lock poisoned".to_owned()))?;
         let _guard = self
             .writes
             .lock()
@@ -170,6 +179,16 @@ impl WorkflowStore {
         &self,
         run_id: &str,
     ) -> Result<BTreeMap<String, JournalEntry>, WorkflowError> {
+        let _process_guard = process_write_lock()
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("journal read lock poisoned".to_owned()))?;
+        self.journal_index_unlocked(run_id)
+    }
+
+    fn journal_index_unlocked(
+        &self,
+        run_id: &str,
+    ) -> Result<BTreeMap<String, JournalEntry>, WorkflowError> {
         let path = self.journal_path(run_id);
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -198,6 +217,9 @@ impl WorkflowStore {
         parent_run_id: Option<&str>,
         event: WorkflowEvent,
     ) -> Result<(), WorkflowError> {
+        let _process_guard = process_write_lock()
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("event write lock poisoned".to_owned()))?;
         let _guard = self
             .writes
             .lock()
@@ -339,17 +361,78 @@ impl WorkflowStore {
     // V2-B: shared multidimensional budget ledger (budget.jsonl)
     // ------------------------------------------------------------------
 
-    pub fn append_budget_event(
+    pub fn reserve_budget(
         &self,
-        run_id: &str,
         owner_run_id: &str,
-        event: BudgetEvent,
+        originating_run_id: &str,
+        key: String,
+        kind: crate::model::CallKind,
+        estimate_money: Option<u64>,
     ) -> Result<(), WorkflowError> {
+        let _process_guard = process_write_lock()
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("budget write lock poisoned".to_owned()))?;
         let _guard = self
             .writes
             .lock()
             .map_err(|_| WorkflowError::Invariant("budget write lock poisoned".to_owned()))?;
-        let path = self.budget_path(run_id);
+        let ledger = self.reconstruct_budget_unlocked(owner_run_id)?;
+        if ledger.reservations.contains_key(&key) {
+            return Ok(());
+        }
+        if let Some(limit) = ledger.limit_calls {
+            let committed = (ledger.used_calls + ledger.held_calls) as usize;
+            if committed >= limit {
+                return Err(WorkflowError::Invariant(format!(
+                    "budget exhausted: {committed} calls committed (limit {limit})"
+                )));
+            }
+        }
+        if let (Some(cap), Some(estimate)) = (ledger.limit_money, estimate_money) {
+            let committed = ledger.used_money + ledger.held_money;
+            if committed.saturating_add(estimate) > cap {
+                return Err(WorkflowError::Invariant(format!(
+                    "budget exhausted: {committed} money used/held + {estimate} estimate > cap {cap}"
+                )));
+            }
+        }
+        self.append_budget_event_locked(
+            owner_run_id,
+            originating_run_id,
+            BudgetEvent::Reserved {
+                key,
+                kind,
+                estimate_money,
+            },
+        )
+    }
+
+    pub fn append_budget_event(
+        &self,
+        owner_run_id: &str,
+        originating_run_id: &str,
+        event: BudgetEvent,
+    ) -> Result<(), WorkflowError> {
+        let _process_guard = process_write_lock()
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("budget write lock poisoned".to_owned()))?;
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("budget write lock poisoned".to_owned()))?;
+        self.append_budget_event_locked(owner_run_id, originating_run_id, event)
+    }
+
+    fn append_budget_event_locked(
+        &self,
+        owner_run_id: &str,
+        originating_run_id: &str,
+        event: BudgetEvent,
+    ) -> Result<(), WorkflowError> {
+        // A tree has one physical ledger owned by its root. The envelope retains
+        // the originating child id for attribution, but capacity is reconstructed
+        // from this owner file so sibling children cannot bypass root limits.
+        let path = self.budget_path(owner_run_id);
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -374,7 +457,7 @@ impl WorkflowStore {
             version: BUDGET_SCHEMA_VERSION,
             sequence,
             at: Utc::now(),
-            run_id: run_id.to_owned(),
+            run_id: originating_run_id.to_owned(),
             owner_run_id: owner_run_id.to_owned(),
             event,
         };
@@ -392,6 +475,16 @@ impl WorkflowStore {
     }
 
     pub fn read_budget_events(&self, run_id: &str) -> Result<Vec<BudgetEnvelope>, WorkflowError> {
+        let _process_guard = process_write_lock()
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("budget read lock poisoned".to_owned()))?;
+        self.read_budget_events_unlocked(run_id)
+    }
+
+    fn read_budget_events_unlocked(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<BudgetEnvelope>, WorkflowError> {
         let path = self.budget_path(run_id);
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -435,8 +528,15 @@ impl WorkflowStore {
     }
 
     pub fn reconstruct_budget(&self, run_id: &str) -> Result<BudgetLedger, WorkflowError> {
+        let _process_guard = process_write_lock()
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("budget read lock poisoned".to_owned()))?;
+        self.reconstruct_budget_unlocked(run_id)
+    }
+
+    fn reconstruct_budget_unlocked(&self, run_id: &str) -> Result<BudgetLedger, WorkflowError> {
         let state = self.load_state(run_id)?;
-        let events = self.read_budget_events(run_id)?;
+        let events = self.read_budget_events_unlocked(run_id)?;
         let mut ledger = BudgetLedger {
             limit_calls: if state.contract.is_some() {
                 Some(state.max_calls)
@@ -565,6 +665,7 @@ impl WorkflowStore {
                 WorkflowEvent::PhaseChanged { phase } => rs.phase = Some(phase),
                 WorkflowEvent::GateOpened {
                     key,
+                    origin_run_id,
                     label,
                     question,
                     expect,
@@ -574,6 +675,7 @@ impl WorkflowStore {
                     rs.status = RunStatus::WaitingHuman;
                     rs.waiting_gate = Some(GateRequest {
                         key,
+                        origin_run_id,
                         label,
                         question,
                         expect,
@@ -737,6 +839,21 @@ impl WorkflowStore {
         Ok(entries.into_iter().map(|(_, name)| name).collect())
     }
 
+    pub fn child_run_ids(&self, parent_run_id: &str) -> Result<Vec<String>, WorkflowError> {
+        let mut children = Vec::new();
+        for run_id in self.list_run_ids()? {
+            let state = match self.load_state(&run_id) {
+                Ok(state) => state,
+                Err(_) => continue,
+            };
+            if state.parent_run_id.as_deref() == Some(parent_run_id) {
+                children.push(run_id);
+            }
+        }
+        children.sort();
+        Ok(children)
+    }
+
     fn assert_run(&self, run_id: &str) -> Result<(), WorkflowError> {
         if self.run_dir(run_id).is_dir() {
             Ok(())
@@ -756,6 +873,11 @@ impl WorkflowStore {
             source,
         })
     }
+}
+
+fn process_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn default_state_root() -> PathBuf {

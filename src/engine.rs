@@ -9,6 +9,7 @@ use crate::store::WorkflowStore;
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -25,8 +26,136 @@ impl Engine {
             transport,
         }
     }
+
+    pub(crate) fn from_shared(store: Arc<WorkflowStore>, transport: Arc<dyn Transport>) -> Self {
+        Self { store, transport }
+    }
     pub fn store(&self) -> &WorkflowStore {
         &self.store
+    }
+
+    pub(crate) fn prepare_child(
+        &self,
+        parent_run_id: &str,
+        parent_call_key: &str,
+        path: &Path,
+        args: Value,
+    ) -> Result<RunState, WorkflowError> {
+        const MAX_WORKFLOW_DEPTH: usize = 16;
+        let parent = self.store.load_state(parent_run_id)?;
+        let source = std::fs::read_to_string(path).map_err(|source| WorkflowError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let contract = validate_script(&source)?;
+        let cwd = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()
+            .map_err(|source| WorkflowError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let root_run_id = parent
+            .root_run_id
+            .clone()
+            .unwrap_or_else(|| parent.run_id.clone());
+        let mut ancestors = vec![parent.run_id.clone()];
+        let mut cursor = parent.parent_run_id.clone();
+        while let Some(run_id) = cursor {
+            let ancestor = self.store.load_state(&run_id)?;
+            ancestors.push(ancestor.run_id.clone());
+            cursor = ancestor.parent_run_id.clone();
+        }
+        if ancestors.len() >= MAX_WORKFLOW_DEPTH {
+            return Err(WorkflowError::InvalidWorkflow(format!(
+                "workflow nesting exceeds maximum depth {MAX_WORKFLOW_DEPTH}"
+            )));
+        }
+        let digest = sha256(&source);
+        for ancestor_run_id in &ancestors {
+            if sha256(&self.store.load_script(ancestor_run_id)?) == digest {
+                return Err(WorkflowError::InvalidWorkflow(
+                    "workflow child cycle detected before dispatch".to_owned(),
+                ));
+            }
+        }
+        let identity = format!(
+            "{root_run_id}\0{parent_run_id}\0{parent_call_key}\0{}\0{}",
+            path.canonicalize()
+                .map_err(|source| WorkflowError::Read {
+                    path: path.to_path_buf(),
+                    source
+                })?
+                .display(),
+            serde_json::to_string(&args)?
+        );
+        let run_id = format!("child-{}", sha256(&identity));
+        if let Ok(existing) = self.store.load_state(&run_id) {
+            if existing.parent_run_id.as_deref() != Some(parent_run_id)
+                || existing.parent_call_key.as_deref() != Some(parent_call_key)
+                || existing.root_run_id.as_deref() != Some(&root_run_id)
+            {
+                return Err(WorkflowError::Invariant(
+                    "persisted child identity does not match parent workflow call".to_owned(),
+                ));
+            }
+            return Ok(existing);
+        }
+        let now = Utc::now();
+        let state = RunState {
+            version: 2,
+            run_id: run_id.clone(),
+            name: path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workflow-child")
+                .to_owned(),
+            cwd,
+            contract,
+            parent_run_id: Some(parent_run_id.to_owned()),
+            root_run_id: Some(root_run_id),
+            parent_call_key: Some(parent_call_key.to_owned()),
+            money_cap: parent.money_cap,
+            status: RunStatus::Running,
+            created_at: now,
+            updated_at: now,
+            args,
+            max_parallel: parent.max_parallel,
+            max_calls: parent.max_calls,
+            resume_count: 0,
+            phase: None,
+            active: Default::default(),
+            waiting_gate: None,
+            supersede: None,
+            decisions: Default::default(),
+            result: None,
+            error: None,
+            report: None,
+            run_summary: None,
+            journal_path: self.store.journal_path(&run_id),
+        };
+        self.store.create_run(&state, &source)?;
+        self.store.append_event(
+            &state.run_id,
+            Some(parent_run_id),
+            WorkflowEvent::RunStarted {
+                name: state.name.clone(),
+                args: state.args.clone(),
+                max_parallel: state.max_parallel,
+                max_calls: state.max_calls,
+                money_cap: state.money_cap,
+            },
+        )?;
+        Ok(state)
+    }
+
+    pub(crate) fn execute_child(
+        &self,
+        run_id: &str,
+        scheduler: Arc<Scheduler>,
+    ) -> Result<RunState, WorkflowError> {
+        self.execute_with_scheduler(run_id, scheduler)
     }
 
     fn transition<F>(
@@ -128,6 +257,8 @@ impl Engine {
             max_calls,
             contract,
             parent_run_id: None,
+            root_run_id: Some(run_id.clone()),
+            parent_call_key: None,
             money_cap,
             resume_count: 0,
             phase: None,
@@ -243,6 +374,20 @@ impl Engine {
         reason: String,
         value: Option<Value>,
     ) -> Result<RunState, WorkflowError> {
+        let requested = self.store.load_state(run_id)?;
+        if let Some(origin_run_id) = requested
+            .waiting_gate
+            .as_ref()
+            .and_then(|gate| gate.origin_run_id.as_deref())
+            .filter(|origin| *origin != run_id)
+        {
+            let state = self.approve(origin_run_id, approved, reason, value)?;
+            return if state.status == RunStatus::Succeeded || state.status == RunStatus::Failed {
+                self.resume_waiting_ancestors(run_id, origin_run_id)
+            } else {
+                Ok(state)
+            };
+        }
         if reason.trim().is_empty() && value.is_none() {
             return Err(WorkflowError::InvalidOperation(
                 "decision reason or value is required".to_owned(),
@@ -306,7 +451,32 @@ impl Engine {
         }
     }
 
+    fn resume_waiting_ancestors(
+        &self,
+        requested_run_id: &str,
+        origin_run_id: &str,
+    ) -> Result<RunState, WorkflowError> {
+        let mut chain = Vec::new();
+        let mut cursor = origin_run_id.to_owned();
+        while cursor != requested_run_id {
+            let state = self.store.load_state(&cursor)?;
+            let parent_run_id = state.parent_run_id.ok_or_else(|| {
+                WorkflowError::Invariant(
+                    "bubbled gate origin is not a descendant of the requested run".to_owned(),
+                )
+            })?;
+            chain.push(parent_run_id.clone());
+            cursor = parent_run_id;
+        }
+        let mut resumed = self.store.load_state(origin_run_id)?;
+        for run_id in chain {
+            resumed = self.resume(&run_id)?;
+        }
+        Ok(resumed)
+    }
+
     pub fn pause(&self, run_id: &str) -> Result<RunState, WorkflowError> {
+        self.propagate_request(run_id, true)?;
         self.store.request_pause(run_id)?;
         let state = self.store.load_state(run_id)?;
         if state.active.is_empty() {
@@ -335,6 +505,7 @@ impl Engine {
     }
 
     pub fn cancel(&self, run_id: &str, reason: String) -> Result<RunState, WorkflowError> {
+        self.propagate_request(run_id, false)?;
         self.store.request_cancel(run_id)?;
         let state = self.store.load_state(run_id)?;
         let error = format!("cancelled: {reason}");
@@ -383,6 +554,7 @@ impl Engine {
                 "supersede reason is required".to_owned(),
             ));
         }
+        self.propagate_request(run_id, false)?;
         self.store.request_cancel(run_id)?;
         let event = WorkflowEvent::RunSuperseded {
             reason: reason.clone(),
@@ -424,7 +596,48 @@ impl Engine {
         })
     }
 
+    fn propagate_request(&self, run_id: &str, pause: bool) -> Result<(), WorkflowError> {
+        for child_run_id in self.store.child_run_ids(run_id)? {
+            self.propagate_request(&child_run_id, pause)?;
+            let child = self.store.load_state(&child_run_id)?;
+            if child.status.is_terminal() {
+                continue;
+            }
+            if pause {
+                self.store.request_pause(&child_run_id)?;
+            } else {
+                self.store.request_cancel(&child_run_id)?;
+            }
+        }
+        Ok(())
+    }
+
     fn reconcile_budget(&self, run_id: &str, reason: &str) -> Result<(), WorkflowError> {
+        let root = self.store.load_state(run_id)?;
+        let root_run_id = root
+            .root_run_id
+            .clone()
+            .unwrap_or_else(|| root.run_id.clone());
+        for origin_run_id in self.tree_run_ids(&root_run_id)? {
+            self.reconcile_budget_for_origin(&origin_run_id, &root_run_id, reason)?;
+        }
+        Ok(())
+    }
+
+    fn tree_run_ids(&self, run_id: &str) -> Result<Vec<String>, WorkflowError> {
+        let mut ids = vec![run_id.to_owned()];
+        for child in self.store.child_run_ids(run_id)? {
+            ids.extend(self.tree_run_ids(&child)?);
+        }
+        Ok(ids)
+    }
+
+    fn reconcile_budget_for_origin(
+        &self,
+        run_id: &str,
+        root_run_id: &str,
+        reason: &str,
+    ) -> Result<(), WorkflowError> {
         let state = self.store.load_state(run_id)?;
         if state.contract.as_deref() != Some("workflow.v2") {
             return Ok(());
@@ -432,22 +645,51 @@ impl Engine {
         let budget = Budget::new(
             Arc::clone(&self.store),
             run_id.to_owned(),
-            run_id.to_owned(),
+            root_run_id.to_owned(),
         );
         let journal = self.store.journal_index(run_id)?;
         let ledger = budget.ledger()?;
+        let key_prefix = (run_id != root_run_id).then(|| format!("{run_id}:"));
+        let child_prefixes = if run_id == root_run_id {
+            self.tree_run_ids(root_run_id)?
+                .into_iter()
+                .filter(|child_run_id| child_run_id != root_run_id)
+                .map(|child_run_id| format!("{child_run_id}:"))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         for (key, reservation) in ledger.reservations {
+            let local_key = match key_prefix.as_deref() {
+                Some(prefix) => match key.strip_prefix(prefix) {
+                    Some(local_key) => local_key,
+                    None => continue,
+                },
+                None if !child_prefixes.iter().any(|prefix| key.starts_with(prefix)) => {
+                    key.as_str()
+                }
+                None => continue,
+            };
             let is_submitted = journal
-                .get(&key)
+                .get(local_key)
                 .is_some_and(|entry| entry.state == CallState::Submitted);
             if !reservation.settled && !reservation.released && !is_submitted {
-                budget.release(&key, reason)?;
+                budget.release(local_key, reason)?;
             }
         }
         Ok(())
     }
 
     fn execute(&self, run_id: &str) -> Result<RunState, WorkflowError> {
+        let state = self.store.load_state(run_id)?;
+        self.execute_with_scheduler(run_id, Arc::new(Scheduler::new(state.max_parallel)))
+    }
+
+    fn execute_with_scheduler(
+        &self,
+        run_id: &str,
+        scheduler: Arc<Scheduler>,
+    ) -> Result<RunState, WorkflowError> {
         let cancel_requested = self.store.cancel_requested(run_id);
         let initial = self.store.update_state(run_id, |state| {
             state.status = RunStatus::Running;
@@ -480,12 +722,15 @@ impl Engine {
             return self.ensure_terminal_artifacts(state);
         }
         let source = self.store.load_script(run_id)?;
-        // V2-B: create budget handle. V1 runs have no budget (None on host).
+        let root_run_id = initial
+            .root_run_id
+            .clone()
+            .unwrap_or_else(|| initial.run_id.clone());
         let budget = (initial.contract.as_deref() == Some("workflow.v2")).then(|| {
             Budget::new(
                 Arc::clone(&self.store),
                 run_id.to_owned(),
-                run_id.to_owned(),
+                root_run_id.clone(),
             )
         });
         let runtime = Arc::new(RuntimeHost {
@@ -493,7 +738,7 @@ impl Engine {
             cwd: initial.cwd.clone(),
             store: Arc::clone(&self.store),
             transport: Arc::clone(&self.transport),
-            scheduler: Scheduler::new(initial.max_parallel),
+            scheduler,
             contract: initial.contract.clone(),
             parent_run_id: initial.parent_run_id.clone(),
             budget,
@@ -650,6 +895,12 @@ pub struct Inspection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget: Option<crate::model::BudgetLedger>,
     pub run_summary_path: PathBuf,
+}
+
+fn sha256(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn delivery_report(value: &Value) -> Result<Option<PathBuf>, WorkflowError> {

@@ -221,6 +221,8 @@ fn legacy_state(store: &WorkflowStore, path: &Path, status: RunStatus) -> RunSta
         cwd: path.parent().expect("script parent").to_path_buf(),
         contract: None,
         parent_run_id: None,
+        root_run_id: None,
+        parent_call_key: None,
         money_cap: None,
         status,
         created_at: now,
@@ -382,6 +384,7 @@ fn v2_resume_preserves_submitted_reservation() {
                 result: None,
                 error: None,
                 transport_run_id: Some("fake-1".to_owned()),
+                child_run_id: None,
                 phase: None,
                 duration_ms: None,
                 usage: None,
@@ -1760,6 +1763,603 @@ fn recovers_fenced_json_from_model_prose() {
     assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
     assert_eq!(state.result, Some(json!({"summary":"ok","score":1})));
     assert_eq!(transport.count(), 1);
+}
+
+#[test]
+fn workflow_pause_propagates_and_resume_replays_child_tree() {
+    let temp = TempDir::new().expect("tempdir");
+    let root_dir = temp.path().join("state");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(300)));
+    let _grandchild = script(
+        &temp,
+        "paused-grandchild.js",
+        r#"
+        return await agent("PAUSED_GRANDCHILD");
+    "#,
+    );
+    let _child = script(
+        &temp,
+        "paused-child.js",
+        r#"
+        return await workflow("paused-grandchild.js");
+    "#,
+    );
+    let root = script(
+        &temp,
+        "paused-root.js",
+        r#"
+        return await workflow("paused-child.js");
+    "#,
+    );
+    let runner_root = root_dir.clone();
+    let runner_transport = Arc::clone(&transport);
+    let runner = thread::spawn(move || {
+        engine(&runner_root, runner_transport).start(&root, Value::Null, 1, 10)
+    });
+    wait_for_call_count(&transport, 1);
+    let root_run_id = wait_for_root_run(&root_dir);
+
+    let paused = engine(&root_dir, Arc::clone(&transport))
+        .pause(&root_run_id)
+        .expect("pause root");
+    assert!(matches!(
+        paused.status,
+        RunStatus::Pausing | RunStatus::Paused
+    ));
+    let paused_root = runner.join().expect("join runner").expect("paused root");
+    assert_eq!(
+        paused_root.status,
+        RunStatus::Paused,
+        "{:?}",
+        paused_root.error
+    );
+
+    let store = WorkflowStore::new(&root_dir);
+    let child_id = store
+        .child_run_ids(&root_run_id)
+        .expect("child ids")
+        .remove(0);
+    let grandchild_id = store
+        .child_run_ids(&child_id)
+        .expect("grandchild ids")
+        .remove(0);
+    assert_eq!(
+        store.load_state(&child_id).expect("child").status,
+        RunStatus::Paused
+    );
+    assert_eq!(
+        store.load_state(&grandchild_id).expect("grandchild").status,
+        RunStatus::Paused
+    );
+
+    let resumed = engine(&root_dir, Arc::clone(&transport))
+        .resume(&root_run_id)
+        .expect("resume root");
+    assert_eq!(resumed.status, RunStatus::Succeeded, "{:?}", resumed.error);
+    assert_eq!(resumed.result, Some(json!("ok")));
+    assert_eq!(
+        transport.count(),
+        1,
+        "paused child call was submitted again"
+    );
+}
+
+fn wait_for_root_run(root: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(entries) = fs::read_dir(root.join("runs")) {
+            if let Some(run_id) = entries.flatten().find_map(|entry| {
+                let run_id = entry.file_name().to_string_lossy().into_owned();
+                WorkflowStore::new(root)
+                    .load_state(&run_id)
+                    .ok()
+                    .filter(|state| state.parent_run_id.is_none())
+                    .map(|_| run_id)
+            }) {
+                return run_id;
+            }
+        }
+        assert!(Instant::now() < deadline, "root run was not created");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn cancelling_root_propagates_to_active_child() {
+    let temp = TempDir::new().expect("tempdir");
+    let root_dir = temp.path().join("state");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(300)));
+    let _child = script(
+        &temp,
+        "cancellable-child.js",
+        r#"
+        return await agent("LONG_CHILD");
+    "#,
+    );
+    let root = script(
+        &temp,
+        "cancellable-root.js",
+        r#"
+        return await workflow("cancellable-child.js");
+    "#,
+    );
+    let runner_root = root_dir.clone();
+    let runner_transport = Arc::clone(&transport);
+    let runner = thread::spawn(move || {
+        engine(&runner_root, runner_transport).start(&root, Value::Null, 1, 10)
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let root_run_id = loop {
+        if let Ok(entries) = fs::read_dir(root_dir.join("runs")) {
+            if let Some(run_id) = entries.flatten().find_map(|entry| {
+                let run_id = entry.file_name().to_string_lossy().into_owned();
+                WorkflowStore::new(&root_dir)
+                    .load_state(&run_id)
+                    .ok()
+                    .filter(|state| state.parent_run_id.is_none())
+                    .map(|_| run_id)
+            }) {
+                break run_id;
+            }
+        }
+        assert!(Instant::now() < deadline, "root run was not created");
+        thread::sleep(Duration::from_millis(20));
+    };
+    wait_for_call_count(&transport, 1);
+
+    let cancelled = engine(&root_dir, Arc::clone(&transport))
+        .cancel(&root_run_id, "cancel child tree".to_owned())
+        .expect("cancel root");
+    assert!(matches!(
+        cancelled.status,
+        RunStatus::Cancelling | RunStatus::Cancelled
+    ));
+    let terminal = runner.join().expect("join runner").expect("runner result");
+    assert_eq!(
+        terminal.status,
+        RunStatus::Cancelled,
+        "{:?}",
+        terminal.error
+    );
+
+    let children = WorkflowStore::new(&root_dir)
+        .child_run_ids(&root_run_id)
+        .expect("children");
+    assert_eq!(children.len(), 1);
+    let child = WorkflowStore::new(&root_dir)
+        .load_state(&children[0])
+        .expect("child state");
+    assert_eq!(child.status, RunStatus::Cancelled);
+}
+
+#[test]
+fn rejected_child_gate_replays_parent_policy() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let _grandchild = script(
+        &temp,
+        "rejected-gate-grandchild.js",
+        r#"
+        await gate("continue?", { label: "child gate" });
+        return { unreachable: true };
+    "#,
+    );
+    let _child = script(
+        &temp,
+        "rejected-gate-child.js",
+        r#"
+        try {
+          await workflow("rejected-gate-grandchild.js");
+          return { caught: false };
+        } catch (error) {
+          return { caught: String(error).includes("not approved") };
+        }
+    "#,
+    );
+    let root = script(
+        &temp,
+        "rejected-gate-root.js",
+        r#"
+        return await workflow("rejected-gate-child.js");
+    "#,
+    );
+    let root_dir = temp.path().join("state");
+    let engine = engine(&root_dir, transport);
+    let waiting = engine
+        .start(&root, Value::Null, 1, 10)
+        .expect("reach bubbled gate");
+    assert_eq!(waiting.status, RunStatus::WaitingHuman);
+
+    let state = engine
+        .approve(&waiting.run_id, false, "not approved".to_owned(), None)
+        .expect("reject root gate");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(state.result, Some(json!({"caught": true})));
+}
+
+#[test]
+fn workflow_child_gate_bubbles_and_root_approval_resumes_tree() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let _grandchild = script(
+        &temp,
+        "gate-grandchild.js",
+        r#"
+        const decision = await gate("continue?", { label: "child gate" });
+        return { approved: decision.approved };
+    "#,
+    );
+    let _child = script(
+        &temp,
+        "gate-child.js",
+        r#"
+        return await workflow("gate-grandchild.js");
+    "#,
+    );
+    let root = script(
+        &temp,
+        "gate-root.js",
+        r#"
+        return await workflow("gate-child.js");
+    "#,
+    );
+    let root_dir = temp.path().join("state");
+    let engine = engine(&root_dir, transport);
+    let waiting = engine
+        .start(&root, Value::Null, 1, 10)
+        .expect("reach bubbled gate");
+    assert_eq!(
+        waiting.status,
+        RunStatus::WaitingHuman,
+        "{:?}",
+        waiting.error
+    );
+    let gate = waiting.waiting_gate.expect("bubbled gate");
+    let origin = gate.origin_run_id.expect("origin run");
+    assert_ne!(origin, waiting.run_id);
+
+    let state = engine
+        .approve(&waiting.run_id, true, "approved".to_owned(), None)
+        .expect("approve root gate");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(state.result, Some(json!({"approved": true})));
+}
+
+#[test]
+fn workflow_children_share_root_parallelism_limit() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(100)));
+    let _child_a = script(
+        &temp,
+        "parallel-child-a.js",
+        r#"
+        return await agent("CHILD_A");
+    "#,
+    );
+    let _child_b = script(
+        &temp,
+        "parallel-child-b.js",
+        r#"
+        return await agent("CHILD_B");
+    "#,
+    );
+    let root = script(
+        &temp,
+        "parallel-root.js",
+        r#"
+        const results = await parallel([
+          () => workflow("parallel-child-a.js"),
+          () => workflow("parallel-child-b.js"),
+        ]);
+        return { results };
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), Arc::clone(&transport))
+        .start(&root, Value::Null, 1, 10)
+        .expect("run nested parallel workflow");
+
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(state.result, Some(json!({"results":["ok", "ok"]})));
+    assert_eq!(transport.count(), 2);
+    assert_eq!(
+        transport.peak_inspections(),
+        1,
+        "children bypassed the root maxParallel limit"
+    );
+}
+
+#[test]
+fn workflow_children_share_root_max_calls_limit() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(100)));
+    let _first_child = script(
+        &temp,
+        "budget-child-a.js",
+        r#"
+        return await agent("BUDGET_CHILD_A");
+    "#,
+    );
+    let _second_child = script(
+        &temp,
+        "budget-child-b.js",
+        r#"
+        return await agent("BUDGET_CHILD_B");
+    "#,
+    );
+    let root = script(
+        &temp,
+        "budget-root.js",
+        r#"
+        const results = await parallel([
+          () => workflow("budget-child-a.js"),
+          () => workflow("budget-child-b.js"),
+        ]);
+        return { results };
+    "#,
+    );
+    let root_dir = temp.path().join("state");
+    let state = engine(&root_dir, Arc::clone(&transport))
+        .start(&root, Value::Null, 2, 3)
+        .expect("run shared budget workflow");
+
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(transport.count(), 1, "children bypassed root maxCalls");
+    let results = state.result.expect("results")["results"]
+        .as_array()
+        .expect("result array")
+        .clone();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.iter().filter(|value| value.is_null()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|value| **value == json!("ok"))
+            .count(),
+        1
+    );
+    let ledger = WorkflowStore::new(&root_dir)
+        .reconstruct_budget(&state.run_id)
+        .expect("root ledger");
+    assert_eq!(ledger.used_calls, 3);
+}
+
+#[test]
+fn workflow_depth_limit_rejects_before_leaf_dispatch() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let names = (0..17)
+        .map(|index| format!("depth-{index}.js"))
+        .collect::<Vec<_>>();
+    for (index, name) in names.iter().enumerate() {
+        let body = if let Some(next) = names.get(index + 1) {
+            format!(r#"return await workflow("{next}");"#)
+        } else {
+            "return await agent(\"DEPTH_LEAF\");".to_owned()
+        };
+        script(&temp, name, &body);
+    }
+
+    let root_dir = temp.path().join("state");
+    let state = engine(&root_dir, Arc::clone(&transport))
+        .start(&temp.path().join(&names[0]), Value::Null, 1, 100)
+        .expect("run depth limit workflow");
+
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("workflow nesting exceeds maximum depth 16")),
+        "{:?}",
+        state.error
+    );
+    assert_eq!(transport.count(), 0, "depth rejection dispatched leaf work");
+}
+
+#[test]
+fn workflow_indirect_cycle_is_rejected_before_leaf_dispatch() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let _child = script(
+        &temp,
+        "indirect-cycle-child.js",
+        r#"
+        return await workflow("indirect-cycle-root.js");
+    "#,
+    );
+    let root = script(
+        &temp,
+        "indirect-cycle-root.js",
+        r#"
+        return await workflow("indirect-cycle-child.js");
+    "#,
+    );
+
+    let state = engine(&temp.path().join("state"), Arc::clone(&transport))
+        .start(&root, Value::Null, 1, 10)
+        .expect("run indirect cycle workflow");
+
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cycle detected before dispatch")),
+        "{:?}",
+        state.error
+    );
+    assert_eq!(transport.count(), 0);
+}
+
+#[test]
+fn workflow_cycle_is_rejected_before_child_dispatch() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let root = script(
+        &temp,
+        "self-cycle.js",
+        r#"
+        await workflow("self-cycle.js");
+        return { unreachable: true };
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), Arc::clone(&transport))
+        .start(&root, Value::Null, 1, 10)
+        .expect("run cycle workflow");
+
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cycle detected before dispatch")),
+        "{:?}",
+        state.error
+    );
+    assert!(
+        WorkflowStore::new(&temp.path().join("state"))
+            .child_run_ids(&state.run_id)
+            .expect("children")
+            .is_empty()
+    );
+    assert_eq!(transport.count(), 0);
+}
+
+#[test]
+fn workflow_child_failure_is_catchable_by_parent_policy() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let _child = script(
+        &temp,
+        "failing-child.js",
+        r#"
+        throw new Error("expected child failure");
+    "#,
+    );
+    let root = script(
+        &temp,
+        "failure-policy-root.js",
+        r#"
+        try {
+          await workflow("failing-child.js");
+          return { caught: false };
+        } catch (error) {
+          return { caught: String(error).includes("expected child failure") };
+        }
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), transport)
+        .start(&root, Value::Null, 1, 10)
+        .expect("run parent failure policy");
+
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(state.result, Some(json!({"caught": true})));
+}
+
+#[test]
+fn workflow_child_tree_persists_identity_result_budget_and_shared_scheduler() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(50)));
+    let _grandchild = script(
+        &temp,
+        "grandchild.js",
+        r#"
+        const value = await agent("GRANDCHILD");
+        return { value };
+    "#,
+    );
+    let _child = script(
+        &temp,
+        "child.js",
+        r#"
+        const child = await workflow("grandchild.js");
+        return { child };
+    "#,
+    );
+    let root = script(
+        &temp,
+        "root.js",
+        r#"
+        const result = await workflow("child.js");
+        return { result };
+    "#,
+    );
+    let root_dir = temp.path().join("state");
+    let engine = engine(&root_dir, Arc::clone(&transport));
+    let state = engine
+        .start(&root, Value::Null, 1, 10)
+        .expect("run nested workflow");
+
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(
+        state.result,
+        Some(json!({"result":{"child":{"value":"ok"}}}))
+    );
+    assert_eq!(transport.count(), 1);
+
+    let store = WorkflowStore::new(&root_dir);
+    let root_children = store.child_run_ids(&state.run_id).expect("root children");
+    assert_eq!(root_children.len(), 1);
+    let child_state = store.load_state(&root_children[0]).expect("child state");
+    assert_eq!(
+        child_state.parent_run_id.as_deref(),
+        Some(state.run_id.as_str())
+    );
+    assert_eq!(
+        child_state.root_run_id.as_deref(),
+        Some(state.run_id.as_str())
+    );
+    assert!(child_state.parent_call_key.is_some());
+
+    let grandchildren = store
+        .child_run_ids(&child_state.run_id)
+        .expect("grandchildren");
+    assert_eq!(grandchildren.len(), 1);
+    let grandchild_state = store
+        .load_state(&grandchildren[0])
+        .expect("grandchild state");
+    assert_eq!(
+        grandchild_state.parent_run_id.as_deref(),
+        Some(child_state.run_id.as_str())
+    );
+    assert_eq!(
+        grandchild_state.root_run_id.as_deref(),
+        Some(state.run_id.as_str())
+    );
+    assert!(grandchild_state.parent_call_key.is_some());
+    assert_eq!(grandchild_state.status, RunStatus::Succeeded);
+
+    let ledger = store
+        .reconstruct_budget(&state.run_id)
+        .expect("root ledger");
+    assert_eq!(ledger.used_calls, 3);
+    let child_ledger_key = ledger
+        .reservations
+        .keys()
+        .find(|key| key.starts_with(&format!("{}:", child_state.run_id)))
+        .expect("child workflow reservation");
+    assert!(ledger.reservations[child_ledger_key].settled);
+    let grandchild_ledger_key = ledger
+        .reservations
+        .keys()
+        .find(|key| key.starts_with(&format!("{}:", grandchild_state.run_id)))
+        .expect("grandchild agent reservation");
+    assert!(ledger.reservations[grandchild_ledger_key].settled);
+
+    let root_journal = store.journal_index(&state.run_id).expect("root journal");
+    assert!(root_journal.values().any(|entry| {
+        entry.kind == CallKind::Workflow
+            && entry.child_run_id.as_deref() == Some(child_state.run_id.as_str())
+            && entry.state == CallState::Succeeded
+    }));
+    let child_journal = store
+        .journal_index(&child_state.run_id)
+        .expect("child journal");
+    assert!(child_journal.values().any(|entry| {
+        entry.kind == CallKind::Workflow
+            && entry.child_run_id.as_deref() == Some(grandchild_state.run_id.as_str())
+            && entry.state == CallState::Succeeded
+    }));
 }
 
 #[test]

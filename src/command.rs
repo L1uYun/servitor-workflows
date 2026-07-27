@@ -273,6 +273,7 @@ impl CommandJournal<'_> {
                     result,
                     error,
                     transport_run_id: None,
+                    child_run_id: None,
                     phase: self.phase.clone(),
                     duration_ms,
                     usage: None,

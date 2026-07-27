@@ -120,6 +120,7 @@ pub(crate) fn run(
                     result,
                     error,
                     transport_run_id,
+                    child_run_id: None,
                     phase: phase.clone(),
                     duration_ms,
                     usage,

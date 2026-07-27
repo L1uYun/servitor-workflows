@@ -26,52 +26,34 @@ impl Budget {
         }
     }
 
+    fn ledger_key(&self, key: &str) -> String {
+        if self.run_id == self.owner_run_id {
+            key.to_owned()
+        } else {
+            format!("{}:{key}", self.run_id)
+        }
+    }
+
     /// Book a call before execution. Idempotent by `key` — a crash after
     /// reservation never double-charges. Returns `Ok(())` when the budget
     /// allows the call; returns `Err(...)` when the call would exceed a hard
     /// limit (calls or money).
     pub fn reserve(&self, key: &str, kind: CallKind, input: &Value) -> Result<(), WorkflowError> {
-        // Reconstruct current ledger so we can gate before writing.
-        let ledger = self.store.reconstruct_budget(&self.owner_run_id)?;
-
-        // Check for idempotent re-reservation: same key already reserved.
-        if ledger.reservations.contains_key(key) {
-            return Ok(());
-        }
-
-        // Call-count gate.
-        if let Some(limit) = ledger.limit_calls {
-            let committed = (ledger.used_calls + ledger.held_calls) as usize;
-            if committed >= limit {
-                return Err(WorkflowError::Invariant(format!(
-                    "budget exhausted: {committed} calls committed (limit {limit})"
-                )));
-            }
-        }
-
-        // Money gate: estimate the cost, check against cap.
-        let estimate_money = cost_estimate(&kind, input, ledger.limit_money);
-        if let (Some(cap), Some(est)) = (ledger.limit_money, estimate_money) {
-            let committed = ledger.used_money + ledger.held_money;
-            if committed.saturating_add(est) > cap {
-                return Err(WorkflowError::Invariant(format!(
-                    "budget exhausted: {committed} money used/held + {est} estimate > cap {cap}"
-                )));
-            }
-        }
-
-        // Persist the reservation.
-        self.store.append_budget_event(
-            &self.run_id,
+        let ledger_key = self.ledger_key(key);
+        let limit_money = self
+            .store
+            .reconstruct_budget(&self.owner_run_id)?
+            .limit_money;
+        let estimate_money = cost_estimate(&kind, input, limit_money);
+        // The store owns the read → check → append critical section so sibling
+        // children cannot observe the same free capacity and over-reserve.
+        self.store.reserve_budget(
             &self.owner_run_id,
-            BudgetEvent::Reserved {
-                key: key.to_owned(),
-                kind,
-                estimate_money,
-            },
-        )?;
-
-        Ok(())
+            &self.run_id,
+            ledger_key,
+            kind,
+            estimate_money,
+        )
     }
 
     /// Finalize a call after completion. Sets actual cost and tokens.
@@ -82,19 +64,20 @@ impl Budget {
         actual_money: Option<u64>,
         actual_tokens: u64,
     ) -> Result<(), WorkflowError> {
+        let ledger_key = self.ledger_key(key);
         // Idempotency: skip if already settled.
         let ledger = self.store.reconstruct_budget(&self.owner_run_id)?;
-        match ledger.reservations.get(key) {
+        match ledger.reservations.get(&ledger_key) {
             Some(res) if res.settled => return Ok(()),
             Some(_) => {}
             None => return Ok(()),
         }
 
         self.store.append_budget_event(
-            &self.run_id,
             &self.owner_run_id,
+            &self.run_id,
             BudgetEvent::Settled {
-                key: key.to_owned(),
+                key: ledger_key,
                 actual_money,
                 actual_tokens,
             },
@@ -105,18 +88,19 @@ impl Budget {
     /// drain). Idempotent: a second release for the same key is a no-op.
     /// A settled key cannot be released.
     pub fn release(&self, key: &str, reason: &str) -> Result<(), WorkflowError> {
+        let ledger_key = self.ledger_key(key);
         let ledger = self.store.reconstruct_budget(&self.owner_run_id)?;
-        match ledger.reservations.get(key) {
+        match ledger.reservations.get(&ledger_key) {
             Some(res) if res.released || res.settled => return Ok(()),
             Some(_) => {}
             None => return Ok(()),
         }
 
         self.store.append_budget_event(
-            &self.run_id,
             &self.owner_run_id,
+            &self.run_id,
             BudgetEvent::Released {
-                key: key.to_owned(),
+                key: ledger_key,
                 reason: reason.to_owned(),
             },
         )

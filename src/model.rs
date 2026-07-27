@@ -48,9 +48,13 @@ pub struct RunState {
     /// foundation only, exercised by V2-C.
     #[serde(default)]
     pub parent_run_id: Option<String>,
-    /// Optional hard money limit from `meta.moneyCap`. `None` means unlimited
-    /// (the default). `Some(n)` means the run's aggregate agent spend may not
-    /// exceed `n` units; commands and gates cost nothing.
+    /// Stable root of a structured workflow tree. Root runs point to themselves;
+    /// v1 records omit it and remain readable.
+    #[serde(default)]
+    pub root_run_id: Option<String>,
+    /// The deterministic parent workflow call which owns this child run.
+    #[serde(default)]
+    pub parent_call_key: Option<String>,
     #[serde(default)]
     pub money_cap: Option<u64>,
     pub status: RunStatus,
@@ -101,6 +105,10 @@ pub struct ActiveCall {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GateRequest {
     pub key: String,
+    /// Run that owns the actual decision. Ancestors retain this when a child
+    /// wait bubbles so approval is routed to the correct leaf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_run_id: Option<String>,
     pub label: String,
     pub question: String,
     #[serde(default)]
@@ -126,6 +134,7 @@ pub enum CallKind {
     Agent,
     Command,
     Gate,
+    Workflow,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -141,6 +150,10 @@ pub struct JournalEntry {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_run_id: Option<String>,
+    /// Persisted child identity for `CallKind::Workflow`. Kept separate from a
+    /// provider transport id so replay never needs to infer ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +251,7 @@ mod tests {
             result: None,
             error: None,
             transport_run_id: None,
+            child_run_id: None,
             phase: None,
             duration_ms: None,
             usage: None,
@@ -285,6 +299,8 @@ pub enum WorkflowEvent {
     },
     GateOpened {
         key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_run_id: Option<String>,
         label: String,
         question: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

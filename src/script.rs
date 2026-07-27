@@ -1,13 +1,14 @@
 use crate::agent::AgentOptions;
 use crate::command::CommandOptions;
 use crate::error::WorkflowError;
-use crate::model::{CallKind, GateRequest, RunStatus, WorkflowEvent};
+use crate::model::{CallKind, CallState, GateRequest, JournalEntry, RunStatus, WorkflowEvent};
 use crate::scheduler::{RuntimeHost, call_key};
 use boa_engine::{
     Context, JsArgs, JsNativeError, JsResult, JsValue, NativeFunction, Source,
     builtins::promise::PromiseState, js_string, object::JsData, object::builtins::JsPromise,
 };
 use boa_gc::{Finalize, Trace};
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -25,6 +26,8 @@ globalThis.command = async (program, argv = [], options = {}) =>
   JSON.parse(await __command(String(program), JSON.stringify(argv), JSON.stringify(options)));
 globalThis.gate = async (question, options = {}) =>
   JSON.parse(await __gate(String(question), JSON.stringify(options)));
+globalThis.workflow = async (path, args = {}, options = {}) =>
+  JSON.parse(await __workflow(String(path), JSON.stringify(args), JSON.stringify(options)));
 globalThis.supersede = async options =>
   JSON.parse(await __supersede(JSON.stringify(options || {})));
 globalThis.phase = name => __phase(String(name));
@@ -203,6 +206,7 @@ impl HostState {
                 "agent" => CallKind::Agent,
                 "command" => CallKind::Command,
                 "gate" => CallKind::Gate,
+                "workflow" => CallKind::Workflow,
                 _ => {
                     return Err("unknown call kind".to_owned());
                 }
@@ -643,6 +647,13 @@ fn execute_vm(
         .map_err(js_error)?;
     context
         .register_global_builtin_callable(
+            js_string!("__workflow"),
+            3,
+            NativeFunction::from_async_fn(host_workflow),
+        )
+        .map_err(js_error)?;
+    context
+        .register_global_builtin_callable(
             js_string!("__supersede"),
             1,
             NativeFunction::from_async_fn(host_supersede),
@@ -785,6 +796,205 @@ async fn host_command(
     )))
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowOptions {}
+
+async fn host_workflow(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &RefCell<&mut Context>,
+) -> JsResult<JsValue> {
+    let (path_text, args_json, options_json, host) = {
+        let context = &mut context.borrow_mut();
+        let host = context
+            .get_data::<HostState>()
+            .cloned()
+            .ok_or_else(|| JsNativeError::error().with_message("workflow host is missing"))?;
+        (
+            js_string_arg(args, 0, context)?,
+            js_string_arg(args, 1, context)?,
+            js_string_arg(args, 2, context)?,
+            host,
+        )
+    };
+    let child_args: Value = serde_json::from_str(&args_json).map_err(native_error)?;
+    let _: WorkflowOptions = serde_json::from_str(&options_json).map_err(native_error)?;
+    let path = std::path::PathBuf::from(&path_text);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        host.runtime.cwd.join(path)
+    };
+    let input = json!({"path": path, "args": child_args});
+    let key = host.key("workflow", &input).map_err(native_error)?;
+    let existing = host
+        .runtime
+        .store
+        .journal_index(&host.runtime.run_id)
+        .map_err(native_error)?
+        .remove(&key);
+    if let Some(entry) = existing.as_ref() {
+        match entry.state {
+            CallState::Succeeded => {
+                return Ok(JsValue::from(js_string!(
+                    serde_json::to_string(&entry.result.clone().unwrap_or(Value::Null))
+                        .map_err(native_error)?
+                )));
+            }
+            CallState::Failed | CallState::Cancelled => {
+                return Err(native_error(
+                    entry
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "child workflow failed".to_owned()),
+                ));
+            }
+            CallState::Submitted => {}
+        }
+    }
+    let engine = crate::engine::Engine::from_shared(
+        Arc::clone(&host.runtime.store),
+        Arc::clone(&host.runtime.transport),
+    );
+    let child = engine
+        .prepare_child(&host.runtime.run_id, &key, &path, child_args)
+        .map_err(native_error)?;
+    if existing.is_none() {
+        host.runtime
+            .store
+            .append(
+                &host.runtime.run_id,
+                &JournalEntry {
+                    at: Utc::now(),
+                    key: key.clone(),
+                    kind: CallKind::Workflow,
+                    state: CallState::Submitted,
+                    label: path.display().to_string(),
+                    result: None,
+                    error: None,
+                    transport_run_id: None,
+                    child_run_id: Some(child.run_id.clone()),
+                    phase: host
+                        .phase
+                        .lock()
+                        .map_err(|_| native_error("phase lock poisoned"))?
+                        .clone(),
+                    duration_ms: None,
+                    usage: None,
+                    schema_correction: None,
+                },
+            )
+            .map_err(native_error)?;
+    }
+    let child_run_id = child.run_id.clone();
+    let child_state = host
+        .runtime
+        .store
+        .load_state(&child_run_id)
+        .map_err(native_error)?;
+    let state = if child_state.status.is_terminal() {
+        child_state
+    } else {
+        let scheduler = Arc::clone(&host.runtime.scheduler);
+        let (sender, receiver) = futures_channel::oneshot::channel();
+        thread::spawn(move || {
+            let result = engine.execute_child(&child_run_id, scheduler);
+            let _ = sender.send(result);
+        });
+        receiver
+            .await
+            .map_err(|_| native_error("child workflow worker dropped"))?
+            .map_err(native_error)?
+    };
+    let (call_state, result, error) = match state.status {
+        RunStatus::Succeeded => (
+            CallState::Succeeded,
+            state.result.unwrap_or(Value::Null),
+            None,
+        ),
+        RunStatus::WaitingHuman => {
+            let gate = state
+                .waiting_gate
+                .clone()
+                .ok_or_else(|| native_error("waiting child has no gate"))?;
+            let origin_run_id = gate
+                .origin_run_id
+                .clone()
+                .unwrap_or_else(|| child.run_id.clone());
+            let bubbled = GateRequest {
+                origin_run_id: Some(origin_run_id.clone()),
+                ..gate
+            };
+            host.runtime
+                .transition(
+                    WorkflowEvent::GateOpened {
+                        key: bubbled.key.clone(),
+                        origin_run_id: Some(origin_run_id),
+                        label: bubbled.label.clone(),
+                        question: bubbled.question.clone(),
+                        expect: bubbled.expect.clone(),
+                        current: bubbled.current.clone(),
+                        hint: bubbled.hint.clone(),
+                    },
+                    |state| {
+                        state.status = RunStatus::WaitingHuman;
+                        state.waiting_gate = Some(bubbled);
+                    },
+                )
+                .map_err(native_error)?;
+            return Err(native_error("child workflow is waiting for human input"));
+        }
+        RunStatus::Paused | RunStatus::Pausing => {
+            return Err(native_error("child workflow is paused"));
+        }
+        _ => (
+            CallState::Failed,
+            Value::Null,
+            Some(
+                state
+                    .error
+                    .unwrap_or_else(|| "child workflow failed".to_owned()),
+            ),
+        ),
+    };
+    host.runtime
+        .store
+        .append(
+            &host.runtime.run_id,
+            &JournalEntry {
+                at: Utc::now(),
+                key: key.clone(),
+                kind: CallKind::Workflow,
+                state: call_state.clone(),
+                label: path.display().to_string(),
+                result: (call_state == CallState::Succeeded).then_some(result.clone()),
+                error: error.clone(),
+                transport_run_id: None,
+                child_run_id: Some(child.run_id),
+                phase: host
+                    .phase
+                    .lock()
+                    .map_err(|_| native_error("phase lock poisoned"))?
+                    .clone(),
+                duration_ms: None,
+                usage: None,
+                schema_correction: None,
+            },
+        )
+        .map_err(native_error)?;
+    if let Some(budget) = host.budget.as_ref() {
+        budget.settle(&key, None, 0).map_err(native_error)?;
+    }
+    host.remember_journal_key(&key).map_err(native_error)?;
+    match error {
+        Some(error) => Err(native_error(error)),
+        None => Ok(JsValue::from(js_string!(
+            serde_json::to_string(&result).map_err(native_error)?
+        ))),
+    }
+}
+
 async fn host_gate(
     _this: &JsValue,
     args: &[JsValue],
@@ -828,6 +1038,7 @@ async fn host_gate(
     }
     let request = GateRequest {
         key,
+        origin_run_id: None,
         label,
         question,
         expect: options.expect.clone(),
@@ -838,6 +1049,7 @@ async fn host_gate(
         .transition(
             WorkflowEvent::GateOpened {
                 key: request.key.clone(),
+                origin_run_id: request.origin_run_id.clone(),
                 label: request.label.clone(),
                 question: request.question.clone(),
                 expect: request.expect.clone(),
