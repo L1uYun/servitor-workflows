@@ -6,6 +6,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use servitor::{Input, Output, RunState as ServitorState, SubmitRequest};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -137,6 +138,9 @@ pub(crate) fn run(
         match entry.state {
             CallState::Succeeded => return Ok(entry.result.clone().unwrap_or(Value::Null)),
             CallState::Failed if correction_exhausted(entry) => {
+                if let Some(metadata) = entry.schema_correction.as_ref() {
+                    validate_correction_schema(metadata, options.schema.as_ref())?;
+                }
                 if let Some(transport_run_id) = entry.transport_run_id.as_deref()
                     && let Ok(Some((result, duration_ms, usage))) =
                         try_recover_structured(transport, transport_run_id, options.schema.as_ref())
@@ -226,6 +230,7 @@ pub(crate) fn run(
 
     let (first_duration_ms, first_usage) = record_metrics(&first_record);
     if let Some(mut metadata) = resumed_correction {
+        validate_correction_schema(&metadata, options.schema.as_ref())?;
         return match materialize_output(first_record.output.as_ref(), options.schema.as_ref()) {
             Ok(result) => {
                 append(
@@ -290,6 +295,7 @@ pub(crate) fn run(
                         attempted: true,
                         transport_run_ids: vec![first_run_id.clone()],
                         validation_errors: vec![first_error],
+                        schema_sha256: options.schema.as_ref().map(schema_sha256),
                     };
                     append(
                         CallState::Failed,
@@ -308,6 +314,7 @@ pub(crate) fn run(
                 attempted: true,
                 transport_run_ids: vec![first_run_id, correction_run_id.clone()],
                 validation_errors: vec![first_error.clone()],
+                schema_sha256: options.schema.as_ref().map(schema_sha256),
             };
             append(
                 CallState::Submitted,
@@ -394,6 +401,64 @@ fn correction_exhausted(entry: &JournalEntry) -> bool {
         .schema_correction
         .as_ref()
         .is_some_and(|metadata| metadata.attempted)
+}
+
+fn schema_sha256(schema: &Value) -> String {
+    let mut canonical = String::new();
+    write_canonical_json(schema, &mut canonical);
+    format!("{:x}", Sha256::digest(canonical))
+}
+
+fn write_canonical_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Array(values) => {
+            out.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(value, out);
+            }
+            out.push(']');
+        }
+        Value::Object(values) => {
+            out.push('{');
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(key).expect("JSON object key is serializable"));
+                out.push(':');
+                write_canonical_json(value, out);
+            }
+            out.push('}');
+        }
+        _ => out.push_str(&serde_json::to_string(value).expect("JSON value is serializable")),
+    }
+}
+
+fn validate_correction_schema(
+    metadata: &SchemaCorrectionMetadata,
+    schema: Option<&Value>,
+) -> Result<(), String> {
+    let Some(expected) = metadata.schema_sha256.as_deref() else {
+        // Historical V1/V2 journal entries predate schema identity. They retain
+        // their frozen replay semantics rather than being rewritten.
+        return Ok(());
+    };
+    let actual = schema
+        .map(schema_sha256)
+        .ok_or_else(|| "journaled schema correction has no active schema".to_owned())?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(
+            "schema changed after correction submission; refusing stale correction replay"
+                .to_owned(),
+        )
+    }
 }
 
 fn submit(
@@ -585,5 +650,29 @@ mod materialize_tests {
         };
         let value = materialize_output(Some(&output), Some(&schema)).unwrap();
         assert_eq!(value["ok"], true);
+    }
+
+    #[test]
+    fn correction_schema_hash_is_independent_of_object_key_order() {
+        let first = json!({"type":"object","properties":{"ok":{"type":"boolean"}}});
+        let reordered = json!({"properties":{"ok":{"type":"boolean"}},"type":"object"});
+        assert_eq!(schema_sha256(&first), schema_sha256(&reordered));
+    }
+
+    #[test]
+    fn correction_replay_rejects_a_changed_schema() {
+        let original = json!({"type":"object","required":["ok"]});
+        let metadata = SchemaCorrectionMetadata {
+            attempted: true,
+            transport_run_ids: vec!["provider-1".to_owned()],
+            validation_errors: vec!["$.ok is required".to_owned()],
+            schema_sha256: Some(schema_sha256(&original)),
+        };
+        let changed = json!({"type":"object","required":["ok", "score"]});
+        assert!(
+            validate_correction_schema(&metadata, Some(&changed))
+                .expect_err("schema mismatch")
+                .contains("schema changed")
+        );
     }
 }

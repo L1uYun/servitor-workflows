@@ -171,6 +171,10 @@ pub struct SchemaCorrectionMetadata {
     pub transport_run_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validation_errors: Vec<String>,
+    /// SHA-256 of the canonical schema used for this correction attempt. Replay
+    /// rejects a changed contract instead of accepting an old correction result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

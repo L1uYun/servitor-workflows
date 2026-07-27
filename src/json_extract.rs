@@ -90,53 +90,533 @@ pub fn extract_json_value_for_schema(text: &str, schema: &Value) -> Result<Value
     last_ok.ok_or(last_error)
 }
 
-/// Minimal JSON Schema check used for candidate selection (type/required/properties/items).
+/// Deterministically validate the supported JSON Schema Draft 2020-12 subset.
+///
+/// This is deliberately local and provider-independent: a provider-reported success
+/// is never enough to accept structured output. Unsupported assertion keywords and
+/// remote references fail closed rather than becoming accidental no-ops.
 pub fn validate_value_against_schema(
     value: &Value,
     schema: &Value,
     path: &str,
 ) -> Result<(), String> {
-    if let Some(expected) = schema.get("type").and_then(Value::as_str) {
-        let matches = match expected {
-            "object" => value.is_object(),
-            "array" => value.is_array(),
-            "string" => value.is_string(),
-            "number" => value.is_number(),
-            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-            "boolean" => value.is_boolean(),
-            "null" => value.is_null(),
-            other => return Err(format!("unsupported schema type {other}")),
+    Validator::new(schema)?.validate(value, schema, path, 0)
+}
+
+struct Validator<'a> {
+    root: &'a Value,
+}
+
+impl<'a> Validator<'a> {
+    fn new(root: &'a Value) -> Result<Self, String> {
+        if !root.is_object() && !root.is_boolean() {
+            return Err("schema must be an object or boolean".to_owned());
+        }
+        let validator = Self { root };
+        validator.preflight_schema(root, 0)?;
+        Ok(validator)
+    }
+
+    fn preflight_schema(&self, schema: &Value, depth: usize) -> Result<(), String> {
+        if depth > 128 {
+            return Err("schema validation recursion limit exceeded".to_owned());
+        }
+        let Value::Object(object) = schema else {
+            return Ok(());
         };
-        if !matches {
-            return Err(format!("{path} must be {expected}"));
+        self.reject_unsupported_keywords(object, "$")?;
+        if let Some(reference) = object.get("$ref") {
+            self.resolve_local_ref(reference, "$")?;
         }
-    }
-    if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        let object = value
-            .as_object()
-            .ok_or_else(|| format!("{path} must be an object"))?;
-        for name in required.iter().filter_map(Value::as_str) {
-            if !object.contains_key(name) {
-                return Err(format!("{path}.{name} is required"));
+        if let Some(definitions) = object.get("$defs") {
+            let definitions = definitions
+                .as_object()
+                .ok_or_else(|| "$: $defs must be an object".to_owned())?;
+            for definition in definitions.values() {
+                self.preflight_schema(definition, depth + 1)?;
             }
         }
-    }
-    if let (Some(object), Some(properties)) = (
-        value.as_object(),
-        schema.get("properties").and_then(Value::as_object),
-    ) {
-        for (name, child_schema) in properties {
-            if let Some(child) = object.get(name) {
-                validate_value_against_schema(child, child_schema, &format!("{path}.{name}"))?;
+        for keyword in ["allOf", "anyOf", "oneOf"] {
+            if let Some(branches) = object.get(keyword) {
+                for branch in schema_array(branches, keyword, "$")? {
+                    self.preflight_schema(branch, depth + 1)?;
+                }
             }
         }
+        for keyword in ["not", "items", "additionalProperties"] {
+            if let Some(child) = object.get(keyword)
+                && (child.is_object() || child.is_boolean())
+            {
+                self.preflight_schema(child, depth + 1)?;
+            }
+        }
+        if let Some(properties) = object.get("properties") {
+            let properties = properties
+                .as_object()
+                .ok_or_else(|| "$: properties must be an object".to_owned())?;
+            for child in properties.values() {
+                self.preflight_schema(child, depth + 1)?;
+            }
+        }
+        Ok(())
     }
-    if let (Some(items), Some(item_schema)) = (value.as_array(), schema.get("items")) {
-        for (index, item) in items.iter().enumerate() {
-            validate_value_against_schema(item, item_schema, &format!("{path}[{index}]"))?;
+
+    fn validate(
+        &self,
+        value: &Value,
+        schema: &Value,
+        path: &str,
+        depth: usize,
+    ) -> Result<(), String> {
+        if depth > 128 {
+            return Err(format!(
+                "{path}: schema validation recursion limit exceeded"
+            ));
+        }
+        match schema {
+            Value::Bool(true) => Ok(()),
+            Value::Bool(false) => Err(format!("{path} is rejected by false schema")),
+            Value::Object(object) => self.validate_object(value, object, path, depth),
+            _ => Err(format!("{path}: schema must be an object or boolean")),
         }
     }
-    Ok(())
+
+    fn validate_object(
+        &self,
+        value: &Value,
+        schema: &serde_json::Map<String, Value>,
+        path: &str,
+        depth: usize,
+    ) -> Result<(), String> {
+        self.reject_unsupported_keywords(schema, path)?;
+        if let Some(definitions) = schema.get("$defs")
+            && !definitions.is_object()
+        {
+            return Err(format!("{path}: $defs must be an object"));
+        }
+        if let Some(reference) = schema.get("$ref") {
+            let target = self.resolve_local_ref(reference, path)?;
+            self.validate(value, target, path, depth + 1)?;
+        }
+        if let Some(all_of) = schema.get("allOf") {
+            for (index, branch) in schema_array(all_of, "allOf", path)?.iter().enumerate() {
+                self.validate(value, branch, path, depth + 1)
+                    .map_err(|error| format!("{path}: allOf[{index}] failed: {error}"))?;
+            }
+        }
+        if let Some(any_of) = schema.get("anyOf") {
+            let errors = schema_array(any_of, "anyOf", path)?
+                .iter()
+                .filter_map(|branch| self.validate(value, branch, path, depth + 1).err())
+                .collect::<Vec<_>>();
+            if errors.len() == schema_array(any_of, "anyOf", path)?.len() {
+                return Err(format!(
+                    "{path} must match at least one anyOf branch: {}",
+                    errors.join("; ")
+                ));
+            }
+        }
+        if let Some(one_of) = schema.get("oneOf") {
+            let branches = schema_array(one_of, "oneOf", path)?;
+            let matches = branches
+                .iter()
+                .filter(|branch| self.validate(value, branch, path, depth + 1).is_ok())
+                .count();
+            if matches != 1 {
+                return Err(format!(
+                    "{path} must match exactly one oneOf branch (matched {matches})"
+                ));
+            }
+        }
+        if let Some(not) = schema.get("not")
+            && self.validate(value, not, path, depth + 1).is_ok()
+        {
+            return Err(format!("{path} must not match not"));
+        }
+        if let Some(expected) = schema.get("type")
+            && !matches_type(value, expected)?
+        {
+            return Err(format!("{path} must be {}", type_description(expected)?));
+        }
+        if let Some(expected) = schema.get("const")
+            && value != expected
+        {
+            return Err(format!("{path} must equal const"));
+        }
+        if let Some(options) = schema.get("enum") {
+            let options = options
+                .as_array()
+                .ok_or_else(|| format!("{path}: enum must be an array"))?;
+            if !options.iter().any(|option| option == value) {
+                return Err(format!("{path} must be one of enum values"));
+            }
+        }
+        self.validate_string(value, schema, path)?;
+        self.validate_number(value, schema, path)?;
+        self.validate_object_instance(value, schema, path, depth)?;
+        self.validate_array(value, schema, path, depth)?;
+        Ok(())
+    }
+
+    fn validate_string(
+        &self,
+        value: &Value,
+        schema: &serde_json::Map<String, Value>,
+        path: &str,
+    ) -> Result<(), String> {
+        let Some(text) = value.as_str() else {
+            return Ok(());
+        };
+        if let Some(minimum) = schema_usize(schema, "minLength", path)?
+            && text.chars().count() < minimum
+        {
+            return Err(format!("{path} must have minLength {minimum}"));
+        }
+        if let Some(maximum) = schema_usize(schema, "maxLength", path)?
+            && text.chars().count() > maximum
+        {
+            return Err(format!("{path} must have maxLength {maximum}"));
+        }
+        if let Some(pattern) = schema.get("pattern") {
+            let pattern = pattern
+                .as_str()
+                .ok_or_else(|| format!("{path}: pattern must be a string"))?;
+            let regex = regex::Regex::new(pattern)
+                .map_err(|error| format!("{path}: invalid pattern {pattern:?}: {error}"))?;
+            if !regex.is_match(text) {
+                return Err(format!("{path} must match pattern {pattern:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_number(
+        &self,
+        value: &Value,
+        schema: &serde_json::Map<String, Value>,
+        path: &str,
+    ) -> Result<(), String> {
+        let Some(number) = value.as_f64() else {
+            return Ok(());
+        };
+        for (keyword, inclusive, lower) in [
+            ("minimum", true, true),
+            ("exclusiveMinimum", false, true),
+            ("maximum", true, false),
+            ("exclusiveMaximum", false, false),
+        ] {
+            let Some(limit) = schema.get(keyword) else {
+                continue;
+            };
+            let limit = limit
+                .as_f64()
+                .ok_or_else(|| format!("{path}: {keyword} must be a number"))?;
+            let valid = match (lower, inclusive) {
+                (true, true) => number >= limit,
+                (true, false) => number > limit,
+                (false, true) => number <= limit,
+                (false, false) => number < limit,
+            };
+            if !valid {
+                return Err(format!("{path} violates {keyword} {limit}"));
+            }
+        }
+        if let Some(multiple) = schema.get("multipleOf") {
+            let multiple = multiple
+                .as_f64()
+                .ok_or_else(|| format!("{path}: multipleOf must be a number"))?;
+            if multiple <= 0.0 || ((number / multiple).round() - number / multiple).abs() > 1e-12 {
+                return Err(format!("{path} must be a multiple of {multiple}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_object_instance(
+        &self,
+        value: &Value,
+        schema: &serde_json::Map<String, Value>,
+        path: &str,
+        depth: usize,
+    ) -> Result<(), String> {
+        let Some(object) = value.as_object() else {
+            return Ok(());
+        };
+        if let Some(required) = schema.get("required") {
+            for name in schema_array(required, "required", path)? {
+                let name = name
+                    .as_str()
+                    .ok_or_else(|| format!("{path}: required names must be strings"))?;
+                if !object.contains_key(name) {
+                    return Err(format!("{path}.{name} is required"));
+                }
+            }
+        }
+        if let Some(minimum) = schema_usize(schema, "minProperties", path)?
+            && object.len() < minimum
+        {
+            return Err(format!("{path} must have minProperties {minimum}"));
+        }
+        if let Some(maximum) = schema_usize(schema, "maxProperties", path)?
+            && object.len() > maximum
+        {
+            return Err(format!("{path} must have maxProperties {maximum}"));
+        }
+        let properties = schema
+            .get("properties")
+            .map(|value| {
+                value
+                    .as_object()
+                    .ok_or_else(|| format!("{path}: properties must be an object"))
+            })
+            .transpose()?;
+        if let Some(properties) = properties {
+            for (name, child_schema) in properties {
+                if let Some(child) = object.get(name) {
+                    self.validate(
+                        child,
+                        child_schema,
+                        &format!("{path}.{}", display_key(name)),
+                        depth + 1,
+                    )?;
+                }
+            }
+        }
+        let additional = schema.get("additionalProperties");
+        if matches!(additional, Some(Value::Bool(false))) {
+            for name in object.keys() {
+                if !properties.is_some_and(|properties| properties.contains_key(name)) {
+                    return Err(format!("{path}.{} is not allowed", display_key(name)));
+                }
+            }
+        } else if let Some(extra_schema) = additional {
+            if !extra_schema.is_boolean() && !extra_schema.is_object() {
+                return Err(format!(
+                    "{path}: additionalProperties must be a schema or boolean"
+                ));
+            }
+            for (name, child) in object {
+                if !properties.is_some_and(|properties| properties.contains_key(name)) {
+                    self.validate(
+                        child,
+                        extra_schema,
+                        &format!("{path}.{}", display_key(name)),
+                        depth + 1,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_array(
+        &self,
+        value: &Value,
+        schema: &serde_json::Map<String, Value>,
+        path: &str,
+        depth: usize,
+    ) -> Result<(), String> {
+        let Some(items) = value.as_array() else {
+            return Ok(());
+        };
+        if let Some(minimum) = schema_usize(schema, "minItems", path)?
+            && items.len() < minimum
+        {
+            return Err(format!("{path} must have minItems {minimum}"));
+        }
+        if let Some(maximum) = schema_usize(schema, "maxItems", path)?
+            && items.len() > maximum
+        {
+            return Err(format!("{path} must have maxItems {maximum}"));
+        }
+        if let Some(unique) = schema.get("uniqueItems")
+            && !unique.is_boolean()
+        {
+            return Err(format!("{path}: uniqueItems must be a boolean"));
+        }
+        if schema
+            .get("uniqueItems")
+            .is_some_and(Value::is_boolean_and_true)
+        {
+            for (index, item) in items.iter().enumerate() {
+                if items[..index].iter().any(|previous| previous == item) {
+                    return Err(format!("{path}[{index}] duplicates an earlier item"));
+                }
+            }
+        }
+        if let Some(item_schema) = schema.get("items") {
+            for (index, item) in items.iter().enumerate() {
+                self.validate(item, item_schema, &format!("{path}[{index}]"), depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_local_ref(&self, reference: &Value, path: &str) -> Result<&'a Value, String> {
+        let reference = reference
+            .as_str()
+            .ok_or_else(|| format!("{path}: $ref must be a string"))?;
+        if !reference.starts_with('#') {
+            return Err(format!("{path}: remote $ref is forbidden"));
+        }
+        let pointer = reference.strip_prefix('#').expect("starts_with checked");
+        if pointer.is_empty() {
+            return Ok(self.root);
+        }
+        if !pointer.starts_with('/') {
+            return Err(format!("{path}: local $ref must use a JSON Pointer"));
+        }
+        self.root
+            .pointer(pointer)
+            .ok_or_else(|| format!("{path}: unresolved local $ref {reference}"))
+    }
+
+    fn reject_unsupported_keywords(
+        &self,
+        schema: &serde_json::Map<String, Value>,
+        path: &str,
+    ) -> Result<(), String> {
+        const SUPPORTED: &[&str] = &[
+            "$schema",
+            "$id",
+            "$defs",
+            "$ref",
+            "title",
+            "description",
+            "default",
+            "examples",
+            "type",
+            "const",
+            "enum",
+            "allOf",
+            "anyOf",
+            "oneOf",
+            "not",
+            "properties",
+            "required",
+            "additionalProperties",
+            "minProperties",
+            "maxProperties",
+            "items",
+            "minItems",
+            "maxItems",
+            "uniqueItems",
+            "minLength",
+            "maxLength",
+            "pattern",
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+        ];
+        for keyword in schema.keys() {
+            if !SUPPORTED.contains(&keyword.as_str()) {
+                return Err(format!("{path}: unsupported schema keyword {keyword}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+trait BoolValueExt {
+    fn is_boolean_and_true(&self) -> bool;
+}
+
+impl BoolValueExt for Value {
+    fn is_boolean_and_true(&self) -> bool {
+        self.as_bool() == Some(true)
+    }
+}
+
+fn schema_array<'a>(value: &'a Value, keyword: &str, path: &str) -> Result<&'a Vec<Value>, String> {
+    value
+        .as_array()
+        .ok_or_else(|| format!("{path}: {keyword} must be an array"))
+}
+
+fn schema_usize(
+    schema: &serde_json::Map<String, Value>,
+    keyword: &str,
+    path: &str,
+) -> Result<Option<usize>, String> {
+    let Some(value) = schema.get(keyword) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .map(Some)
+        .ok_or_else(|| format!("{path}: {keyword} must be a non-negative integer"))
+}
+
+fn matches_type(value: &Value, expected: &Value) -> Result<bool, String> {
+    match expected {
+        Value::String(kind) => matches_type_name(value, kind),
+        Value::Array(kinds) => {
+            if kinds.is_empty() {
+                return Err("schema type array must not be empty".to_owned());
+            }
+            let mut matched = false;
+            for kind in kinds {
+                matched |= matches_type_name(
+                    value,
+                    kind.as_str().ok_or("schema type values must be strings")?,
+                )?;
+            }
+            Ok(matched)
+        }
+        _ => Err("schema type must be a string or array of strings".to_owned()),
+    }
+}
+
+fn type_description(expected: &Value) -> Result<String, String> {
+    match expected {
+        Value::String(kind) => {
+            matches_type_name(&Value::Null, kind)?;
+            Ok(kind.clone())
+        }
+        Value::Array(kinds) => Ok(kinds
+            .iter()
+            .map(|kind| {
+                kind.as_str()
+                    .ok_or("schema type values must be strings")
+                    .map(str::to_owned)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join(" or ")),
+        _ => Err("schema type must be a string or array of strings".to_owned()),
+    }
+}
+
+fn matches_type_name(value: &Value, kind: &str) -> Result<bool, String> {
+    Ok(match kind {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => {
+            value.as_i64().is_some()
+                || value.as_u64().is_some()
+                || value
+                    .as_f64()
+                    .is_some_and(|number| number.is_finite() && number.fract() == 0.0)
+        }
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        other => return Err(format!("unsupported schema type {other}")),
+    })
+}
+
+fn display_key(name: &str) -> String {
+    if name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        name.to_owned()
+    } else {
+        format!("[{name:?}]")
+    }
 }
 
 fn parse_candidate(candidate: &str) -> Result<Value, String> {
@@ -441,14 +921,106 @@ still working {"status":"partial"}
     }
 
     #[test]
-    fn schema_prefers_last_when_multiple_valid() {
-        let text = r#"{"summary":"first"} trailing {"summary":"second","evidence":"e"}"#;
+    fn validates_strict_tagged_union_with_local_refs() {
+        let schema = json!({
+            "$defs": {
+                "email": {
+                    "type": "object",
+                    "required": ["kind", "address"],
+                    "properties": {
+                        "kind": {"const": "email"},
+                        "address": {"type": "string", "pattern": "^[^@]+@[^@]+$"}
+                    },
+                    "additionalProperties": false
+                },
+                "sms": {
+                    "type": "object",
+                    "required": ["kind", "number"],
+                    "properties": {
+                        "kind": {"const": "sms"},
+                        "number": {"type": "string", "minLength": 3}
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "oneOf": [{"$ref": "#/$defs/email"}, {"$ref": "#/$defs/sms"}]
+        });
+        validate_value_against_schema(
+            &json!({"kind":"email","address":"a@example.test"}),
+            &schema,
+            "$",
+        )
+        .expect("valid tagged union");
+        let err = validate_value_against_schema(
+            &json!({"kind":"email","address":"a@example.test","extra":true}),
+            &schema,
+            "$",
+        )
+        .expect_err("strict object rejects extra property");
+        assert!(err.contains("oneOf"), "{err}");
+    }
+
+    #[test]
+    fn rejects_conflicting_or_unsupported_schemas() {
+        let conflicting = json!({"allOf": [{"type":"string"}, {"type":"number"}]});
+        assert!(validate_value_against_schema(&json!(1), &conflicting, "$").is_err());
+        let remote = json!({"$ref":"https://example.test/schema"});
+        assert!(
+            validate_value_against_schema(&json!({}), &remote, "$")
+                .expect_err("remote ref")
+                .contains("remote $ref is forbidden")
+        );
+        let unsupported = json!({"format":"email"});
+        assert!(
+            validate_value_against_schema(&json!("a@example.test"), &unsupported, "$")
+                .expect_err("unsupported assertion")
+                .contains("unsupported schema keyword format")
+        );
+        let unreachable = json!({"anyOf":[true], "format":"email"});
+        assert!(
+            validate_value_against_schema(&json!("accepted branch"), &unreachable, "$")
+                .expect_err("unsupported unreachable assertion")
+                .contains("unsupported schema keyword format")
+        );
+    }
+
+    #[test]
+    fn schema_selection_rejects_malicious_candidate_and_keeps_final_valid_answer() {
         let schema = json!({
             "type": "object",
-            "required": ["summary"],
-            "properties": { "summary": {"type": "string"} }
+            "required": ["status", "score"],
+            "properties": {
+                "status": {"enum": ["approved", "rejected"]},
+                "score": {"type":"integer", "minimum": 0, "maximum": 10}
+            },
+            "additionalProperties": false
         });
-        let value = extract_json_value_for_schema(text, &schema).expect("schema extract");
-        assert_eq!(value["summary"], "second");
+        let text = r#"tool event {"status":"approved","score":999,"admin":true}
+final {"status":"approved","score":7}"#;
+        assert_eq!(
+            extract_json_value_for_schema(text, &schema).expect("final valid candidate"),
+            json!({"status":"approved","score":7})
+        );
+    }
+
+    #[test]
+    fn accepts_large_whole_number_as_integer() {
+        let value: Value = serde_json::from_str("18446744073709551616").expect("JSON number");
+        validate_value_against_schema(&value, &json!({"type":"integer"}), "$")
+            .expect("whole JSON number is an integer");
+    }
+
+    #[test]
+    fn validates_scalar_and_array_constraints() {
+        let schema = json!({
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 3,
+            "uniqueItems": true,
+            "items": {"type":"integer", "minimum": 2, "multipleOf": 2}
+        });
+        validate_value_against_schema(&json!([2, 4]), &schema, "$").expect("valid array");
+        assert!(validate_value_against_schema(&json!([2, 2]), &schema, "$").is_err());
+        assert!(validate_value_against_schema(&json!([1, 4]), &schema, "$").is_err());
     }
 }

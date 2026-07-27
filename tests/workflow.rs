@@ -91,6 +91,12 @@ impl Transport for FakeTransport {
             "still-not-json".to_owned()
         } else if prompt.contains("VALID_FIRST") {
             r#"{"ok":true}"#.to_owned()
+        } else if prompt.contains("STRICT_RETRY_JSON") {
+            if number == 1 {
+                r#"{"kind":"ok","score":7,"unexpected":true}"#.to_owned()
+            } else {
+                r#"{"kind":"ok","score":7}"#.to_owned()
+            }
         } else if prompt.contains("RETRY_JSON") {
             if number == 1 {
                 "not-json".to_owned()
@@ -994,6 +1000,52 @@ fn structured_agent_corrects_invalid_output_once_and_preserves_options() {
 }
 
 #[test]
+fn structured_agent_corrects_provider_success_that_fails_local_strict_schema() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = script(
+        &temp,
+        "strict-correct-once.js",
+        r##"return await agent("STRICT_RETRY_JSON", {
+          schema: {
+            "$defs": {
+              "result": {
+                "type": "object",
+                "required": ["kind", "score"],
+                "properties": {
+                  "kind": { "const": "ok" },
+                  "score": { "type": "integer", "minimum": 0, "maximum": 10 }
+                },
+                "additionalProperties": false
+              }
+            },
+            "$ref": "#/$defs/result"
+          }
+        });"##,
+    );
+
+    let state = engine(
+        &temp.path().join("state-strict-correct"),
+        Arc::clone(&transport),
+    )
+    .start(&path, Value::Null, 1, 10)
+    .expect("workflow completes after correction");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(state.result, Some(json!({"kind":"ok","score":7})));
+    assert_eq!(
+        transport.count(),
+        2,
+        "local validation must force one correction"
+    );
+    let requests = transport.requests.lock().expect("requests");
+    let correction = match &requests[1].input {
+        Input::Text { text } => text,
+        Input::Image(_) => panic!("text correction prompt"),
+    };
+    assert!(correction.contains("unexpected"), "{correction}");
+    assert!(correction.contains("not allowed"), "{correction}");
+}
+#[test]
 fn structured_agent_accepts_valid_first_output_without_correction() {
     let temp = TempDir::new().expect("tempdir");
     let transport = Arc::new(FakeTransport::new(Duration::ZERO));
@@ -1082,6 +1134,7 @@ fn submitted_schema_correction_is_polled_on_resume_without_third_submission() {
     assert_eq!(submitted["state"], "submitted");
     assert_eq!(submitted["transport_run_id"], "fake-2");
     assert_eq!(submitted["schema_correction"]["attempted"], true);
+    assert!(submitted["schema_correction"]["schema_sha256"].is_string());
     fs::write(&journal_path, format!("{crash_journal}\n")).expect("simulate crash journal");
 
     let resumed = engine(&root, Arc::clone(&transport))
