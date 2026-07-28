@@ -13,21 +13,22 @@ use futures_channel::oneshot;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 pub(crate) type JobResult = Result<Value, String>;
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-static BOUNDARY_SNAPSHOT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
 pub struct Scheduler {
     sender: mpsc::Sender<Job>,
+    process_tree: Result<Arc<crate::process_tree::ProcessTree>, String>,
+    boundary_snapshot_lock: Arc<Mutex<()>>,
     _workers: Vec<thread::JoinHandle<()>>,
 }
 
 impl Scheduler {
     pub fn new(parallelism: usize) -> Self {
+        let process_tree = crate::process_tree::ProcessTree::new().map(Arc::new);
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
         let workers = (0..parallelism.max(1))
@@ -49,8 +50,18 @@ impl Scheduler {
             .collect();
         Self {
             sender,
+            process_tree,
+            boundary_snapshot_lock: Arc::new(Mutex::new(())),
             _workers: workers,
         }
+    }
+
+    pub(crate) fn process_tree(&self) -> Result<Arc<crate::process_tree::ProcessTree>, String> {
+        self.process_tree.clone()
+    }
+
+    pub(crate) fn boundary_snapshot_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.boundary_snapshot_lock)
     }
 
     fn submit<F>(&self, operation: F) -> oneshot::Receiver<JobResult>
@@ -179,6 +190,15 @@ impl RuntimeHost {
         let store = Arc::clone(&self.store);
         let boundary = self.boundary.clone();
         let budget = self.budget.clone();
+        let process_tree = if boundary
+            .as_ref()
+            .is_some_and(|policy| policy.isolation == crate::boundary::IsolationLevel::Process)
+        {
+            Some(self.scheduler.process_tree())
+        } else {
+            None
+        };
+        let boundary_snapshot_lock = self.scheduler.boundary_snapshot_lock();
         self.scheduler.submit(move || {
             let result = with_active(
                 &store,
@@ -220,6 +240,9 @@ impl RuntimeHost {
                         .as_ref()
                         .map(|_| call.options.env.values().cloned().collect::<Vec<_>>())
                         .unwrap_or_default();
+                    let process_tree = process_tree
+                        .as_ref()
+                        .map_or_else(|| Ok(None), |process_tree| process_tree.clone().map(Some))?;
                     if boundary.is_none() {
                         return crate::command::run(
                             &store,
@@ -228,17 +251,25 @@ impl RuntimeHost {
                             call,
                             false,
                             &redacted_values,
+                            process_tree.as_deref(),
                         );
                     }
-                    let _snapshot_guard = BOUNDARY_SNAPSHOT_LOCK
+                    let _snapshot_guard = boundary_snapshot_lock
                         .lock()
                         .map_err(|_| "boundary snapshot lock poisoned".to_owned())?;
                     let before_files = snapshot_observable_files(
                         boundary.as_ref().expect("checked boundary presence"),
                     )?;
                     let before_git = snapshot_git(&resolved_cwd);
-                    let result =
-                        crate::command::run(&store, &run_id, &cwd, call, true, &redacted_values);
+                    let result = crate::command::run(
+                        &store,
+                        &run_id,
+                        &cwd,
+                        call,
+                        true,
+                        &redacted_values,
+                        process_tree.as_deref(),
+                    );
                     audit_command_snapshots(
                         &store,
                         &run_id,

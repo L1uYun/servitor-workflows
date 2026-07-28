@@ -1,5 +1,7 @@
 use crate::agent::Transport;
-use crate::boundary::{BoundaryEvent, BoundaryPolicy, ensure_child_narrows, resolve_policy};
+use crate::boundary::{
+    BoundaryEvent, BoundaryPolicy, IsolationLevel, ensure_child_narrows, resolve_policy,
+};
 use crate::budget::Budget;
 use crate::error::WorkflowError;
 use crate::model::{CallState, GateDecision, PublicRun, RunState, RunStatus, WorkflowEvent};
@@ -50,6 +52,7 @@ impl Engine {
         })?;
         let contract = validate_script(&source)?;
         let child_boundary = parse_meta_boundary(&source)?;
+        ensure_supported_isolation(&source)?;
         let cwd = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -70,6 +73,11 @@ impl Engine {
                 .map_err(WorkflowError::InvalidWorkflow)?;
         }
         let child_boundary = child_boundary.or_else(|| parent.boundary.clone());
+        let worktree = parent.worktree.clone();
+        let cwd = worktree
+            .as_ref()
+            .map(|worktree| worktree.path.clone())
+            .unwrap_or(cwd);
         let root_run_id = parent
             .root_run_id
             .clone()
@@ -132,6 +140,7 @@ impl Engine {
             parent_call_key: Some(parent_call_key.to_owned()),
             money_cap: parent.money_cap,
             boundary: child_boundary.clone(),
+            worktree,
             status: RunStatus::Running,
             created_at: now,
             updated_at: now,
@@ -255,6 +264,7 @@ impl Engine {
         // resumed from their persisted state and never pass through prepare().
         let contract = validate_script(&script)?;
         let declared_boundary = parse_meta_boundary(&script)?;
+        ensure_supported_isolation(&script)?;
         let version = 2;
         let cwd = path
             .parent()
@@ -267,13 +277,34 @@ impl Engine {
         let money_cap = contract
             .as_ref()
             .and_then(|_| parse_meta_money_cap(&script));
-        let boundary = declared_boundary
+        let mut boundary = declared_boundary
             .as_ref()
             .map(|policy| resolve_policy(policy, &cwd))
             .transpose()
             .map_err(WorkflowError::InvalidWorkflow)?;
         let now = Utc::now();
         let run_id = Uuid::now_v7().to_string();
+        let worktree = if boundary
+            .as_ref()
+            .is_some_and(|policy| policy.isolation == IsolationLevel::Worktree)
+        {
+            Some(
+                crate::isolation::create_worktree(&cwd, self.store.root(), &run_id)
+                    .map_err(WorkflowError::InvalidWorkflow)?,
+            )
+        } else {
+            None
+        };
+        let cwd = worktree
+            .as_ref()
+            .map(|worktree| worktree.path.clone())
+            .unwrap_or(cwd);
+        if let Some(boundary) = boundary.as_mut()
+            && boundary.isolation == IsolationLevel::Worktree
+        {
+            boundary.read_paths = vec![cwd.clone()];
+            boundary.write_paths = vec![cwd.clone()];
+        }
         let state = RunState {
             version,
             run_id: run_id.clone(),
@@ -295,6 +326,7 @@ impl Engine {
             parent_call_key: None,
             money_cap,
             boundary,
+            worktree,
             resume_count: 0,
             phase: None,
             active: Default::default(),
@@ -538,6 +570,7 @@ impl Engine {
         })?;
         validate_script(&script)?;
         parse_meta_boundary(&script)?;
+        ensure_supported_isolation(&script)?;
         Ok(serde_json::json!({
             "check": "ok",
             "workflow": path.display().to_string(),
@@ -887,6 +920,23 @@ impl Engine {
         if !state.status.is_terminal() {
             return Ok(state);
         }
+        let state = if state.parent_run_id.is_none()
+            && state
+                .worktree
+                .as_ref()
+                .is_some_and(|worktree| !worktree.finalized)
+        {
+            let worktree = state.worktree.as_ref().expect("checked worktree state");
+            crate::isolation::finalize_worktree(&self.store, &state.run_id, worktree)
+                .map_err(WorkflowError::InvalidOperation)?;
+            self.store.update_state(&state.run_id, |state| {
+                if let Some(worktree) = state.worktree.as_mut() {
+                    worktree.finalized = true;
+                }
+            })?
+        } else {
+            state
+        };
         if state.status == RunStatus::Succeeded && state.boundary.is_some() {
             let violations = self
                 .store
@@ -1040,6 +1090,18 @@ fn parse_meta_boundary(script: &str) -> Result<Option<BoundaryPolicy>, WorkflowE
         .map_err(|error| {
             WorkflowError::InvalidWorkflow(format!("meta.boundary is invalid: {error}"))
         })
+}
+
+fn ensure_supported_isolation(script: &str) -> Result<(), WorkflowError> {
+    if parse_meta_boundary(script)?
+        .is_some_and(|policy| policy.isolation == IsolationLevel::Container)
+    {
+        return Err(WorkflowError::InvalidWorkflow(
+            "meta.boundary.isolation=\"container\" is not implemented on this host; declare \"none\", \"worktree\", or \"process\" instead"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_script(script: &str) -> Result<Option<String>, WorkflowError> {

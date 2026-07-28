@@ -231,6 +231,7 @@ fn legacy_state(store: &WorkflowStore, path: &Path, status: RunStatus) -> RunSta
         parent_call_key: None,
         money_cap: None,
         boundary: None,
+        worktree: None,
         status,
         created_at: now,
         updated_at: now,
@@ -249,6 +250,127 @@ fn legacy_state(store: &WorkflowStore, path: &Path, status: RunStatus) -> RunSta
         run_summary: None,
         journal_path: store.journal_path(&run_id),
     }
+}
+
+#[test]
+fn container_isolation_is_refused_before_run_creation() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-container-refusal");
+    let path = temp.path().join("container.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "container",
+          contract: "workflow.v2",
+          boundary: { isolation: "container" }
+        }; return true;"#,
+    )
+    .expect("write script");
+    let runtime = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)));
+    let error = runtime.check(&path).expect_err("container refusal");
+    assert!(error.to_string().contains("not implemented on this host"));
+    assert!(!root.join("runs").exists());
+}
+
+#[test]
+fn child_cannot_weaken_parent_isolation() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-isolation-child");
+    fs::write(
+        temp.path().join("child.js"),
+        r#"export const meta = {
+          name: "child",
+          contract: "workflow.v2",
+          boundary: { isolation: "worktree" }
+        }; return true;"#,
+    )
+    .expect("write child");
+    let parent = temp.path().join("parent.js");
+    fs::write(
+        &parent,
+        r#"export const meta = {
+          name: "parent",
+          contract: "workflow.v2",
+          boundary: { isolation: "process" }
+        }; return await workflow("child.js");"#,
+    )
+    .expect("write parent");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&parent, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("child isolation widens parent boundary")
+    );
+}
+
+#[test]
+fn worktree_isolation_writes_patch_and_commit_evidence() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-worktree");
+    Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(temp.path())
+        .output()
+        .expect("git init");
+    Command::new("git")
+        .args(["config", "user.email", "tests@example.invalid"])
+        .current_dir(temp.path())
+        .output()
+        .expect("configure email");
+    Command::new("git")
+        .args(["config", "user.name", "Workflow Tests"])
+        .current_dir(temp.path())
+        .output()
+        .expect("configure name");
+    fs::write(temp.path().join("seed.txt"), "seed\n").expect("write seed");
+    Command::new("git")
+        .args(["add", "seed.txt"])
+        .current_dir(temp.path())
+        .output()
+        .expect("stage seed");
+    Command::new("git")
+        .args(["commit", "-m", "seed"])
+        .current_dir(temp.path())
+        .output()
+        .expect("commit seed");
+    let path = temp.path().join("worktree.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "worktree",
+          contract: "workflow.v2",
+          boundary: { isolation: "worktree" }
+        }; return await command("cmd", ["/D", "/C", "echo evidence>>seed.txt"]);"#,
+    )
+    .expect("write script");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let store = WorkflowStore::new(&root);
+    let run_dir = store.run_dir(&state.run_id);
+    assert!(
+        fs::read_to_string(run_dir.join("worktree.patch"))
+            .expect("patch evidence")
+            .contains("seed.txt")
+    );
+    assert!(
+        fs::read_to_string(run_dir.join("worktree.commit.txt"))
+            .expect("commit evidence")
+            .contains("base_commit:")
+    );
+    assert!(
+        store
+            .read_boundary_events(&state.run_id)
+            .expect("boundary events")
+            .iter()
+            .any(|event| matches!(event.event, BoundaryEvent::WorktreeFinalized { .. }))
+    );
 }
 
 #[test]
@@ -1905,6 +2027,46 @@ fn missing_delivery_report_fails_the_run() {
     assert_eq!(resumed.status, RunStatus::Succeeded);
     assert_eq!(resumed.resume_count, 1);
     assert_eq!(resumed.report.as_deref(), Some(missing.as_path()));
+}
+
+#[cfg(windows)]
+#[test]
+fn process_isolation_cancellation_terminates_descendants() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-process-isolation");
+    let marker = temp.path().join("descendant-marker.txt");
+    let escaped_marker = marker.display().to_string().replace('\\', "\\\\");
+    let path = temp.path().join("process-isolation.js");
+    fs::write(
+        &path,
+        format!(
+            r#"export const meta = {{
+              name: "process-isolation",
+              contract: "workflow.v2",
+              boundary: {{ isolation: "process", readPaths: ["."], writePaths: ["."] }}
+            }};
+            return await command("pwsh", ["-NoProfile", "-Command", "Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Milliseconds 750; Set-Content -LiteralPath ''{escaped_marker}'' -Value escaped'; Start-Sleep -Seconds 10"]);"#
+        ),
+    )
+    .expect("write process-isolation fixture");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let runner_root = root.clone();
+    let runner_transport = Arc::clone(&transport);
+    let path_copy = path.clone();
+    let runner = thread::spawn(move || {
+        engine(&runner_root, runner_transport).start(&path_copy, Value::Null, 1, 10)
+    });
+    let run_id = wait_for_active_run(&root);
+    engine(&root, Arc::clone(&transport))
+        .cancel(&run_id, "test process-tree cleanup".to_owned())
+        .expect("cancel process-isolated workflow");
+    let terminal = runner.join().expect("join").expect("terminal state");
+    assert_eq!(terminal.status, RunStatus::Cancelled);
+    thread::sleep(Duration::from_secs(1));
+    assert!(
+        !marker.exists(),
+        "descendant wrote after its process-isolated parent was cancelled"
+    );
 }
 
 #[test]

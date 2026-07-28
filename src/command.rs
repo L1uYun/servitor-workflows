@@ -90,6 +90,7 @@ pub(crate) fn run(
     call: CommandCall,
     clear_inherited_environment: bool,
     redacted_values: &[String],
+    process_tree: Option<&crate::process_tree::ProcessTree>,
 ) -> JobResult {
     let CommandCall {
         key,
@@ -143,11 +144,22 @@ pub(crate) fn run(
         .stderr(Stdio::from(stderr));
     hide_window(&mut command);
     let mut child = command.spawn().map_err(|error| error.to_string())?;
+    if let Some(process_tree) = process_tree
+        && let Err(error) = process_tree.assign(&child)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return fail(&journal, error);
+    }
     let started = Instant::now();
     let mut timed_out = false;
     let status = loop {
         if store.cancel_requested(run_id) || store.pause_requested(run_id) {
-            let _ = child.kill();
+            if let Some(process_tree) = process_tree {
+                let _ = process_tree.terminate();
+            } else {
+                let _ = child.kill();
+            }
             let _ = child.wait();
             journal.append(
                 CallState::Cancelled,
@@ -162,6 +174,9 @@ pub(crate) fn run(
             .is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
         {
             timed_out = true;
+            // A timeout belongs to this command, not to its sibling calls in
+            // the shared run-level process tree. Run cancellation still
+            // terminates the entire tree below.
             let _ = child.kill();
             let status = child.wait().map_err(|error| error.to_string())?;
             break status;

@@ -61,6 +61,10 @@ pub struct RunState {
     /// replay semantics.
     #[serde(default)]
     pub boundary: Option<crate::boundary::BoundaryPolicy>,
+    /// V2-F worktree identity. A child inherits its owning root worktree;
+    /// only the root finalizes lifecycle evidence.
+    #[serde(default)]
+    pub worktree: Option<WorktreeState>,
     pub status: RunStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -89,6 +93,14 @@ pub struct RunState {
     pub run_summary: Option<PathBuf>,
     #[serde(default)]
     pub journal_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeState {
+    pub path: PathBuf,
+    pub base_commit: String,
+    #[serde(default)]
+    pub finalized: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

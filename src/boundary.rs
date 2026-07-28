@@ -29,6 +29,18 @@ pub struct BoundaryPolicy {
     pub network: NetworkPolicy,
     #[serde(default)]
     pub environment: EnvironmentPolicy,
+    #[serde(default)]
+    pub isolation: IsolationLevel,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationLevel {
+    #[default]
+    None,
+    Worktree,
+    Process,
+    Container,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +92,12 @@ pub enum BoundaryEvent {
     ChildDeclared {
         key: String,
         policy: BoundaryPolicy,
+    },
+    WorktreeFinalized {
+        path: PathBuf,
+        patch_path: PathBuf,
+        commit: Option<String>,
+        status: String,
     },
     Violation {
         key: Option<String>,
@@ -138,6 +156,7 @@ pub fn resolve_policy(policy: &BoundaryPolicy, base: &Path) -> Result<BoundaryPo
         environment: EnvironmentPolicy {
             allow: normalize_environment_names(&policy.environment.allow)?,
         },
+        isolation: policy.isolation.clone(),
     })
 }
 
@@ -155,6 +174,12 @@ pub fn ensure_child_narrows(parent: &BoundaryPolicy, child: &BoundaryPolicy) -> 
     if parent.network == NetworkPolicy::Deny && child.network == NetworkPolicy::Allow {
         return Err("child network policy widens parent boundary".to_owned());
     }
+    if isolation_rank(&child.isolation) < isolation_rank(&parent.isolation) {
+        return Err(format!(
+            "child isolation widens parent boundary: {:?} is weaker than {:?}",
+            child.isolation, parent.isolation
+        ));
+    }
     for name in &child.environment.allow {
         if !parent.environment.allow.contains(name) {
             return Err(format!(
@@ -163,6 +188,15 @@ pub fn ensure_child_narrows(parent: &BoundaryPolicy, child: &BoundaryPolicy) -> 
         }
     }
     Ok(())
+}
+
+fn isolation_rank(isolation: &IsolationLevel) -> u8 {
+    match isolation {
+        IsolationLevel::None => 0,
+        IsolationLevel::Worktree => 1,
+        IsolationLevel::Process => 2,
+        IsolationLevel::Container => 3,
+    }
 }
 
 pub fn ensure_cwd_allowed(policy: &BoundaryPolicy, cwd: &Path) -> Result<(), String> {
@@ -460,6 +494,7 @@ mod tests {
             environment: EnvironmentPolicy {
                 allow: vec!["safe_var".to_owned()],
             },
+            isolation: IsolationLevel::None,
         }
     }
 
@@ -473,6 +508,7 @@ mod tests {
             environment: EnvironmentPolicy {
                 allow: vec!["SAFE_VAR".to_owned()],
             },
+            isolation: IsolationLevel::None,
         };
         assert!(ensure_child_narrows(&parent, &child).is_ok());
 
@@ -482,6 +518,16 @@ mod tests {
             ensure_child_narrows(&parent, &widened)
                 .expect_err("network widening")
                 .contains("widens")
+        );
+
+        let mut weaker_isolation = parent.clone();
+        weaker_isolation.isolation = IsolationLevel::None;
+        let mut process_parent = parent;
+        process_parent.isolation = IsolationLevel::Process;
+        assert!(
+            ensure_child_narrows(&process_parent, &weaker_isolation)
+                .expect_err("isolation weakening")
+                .contains("isolation")
         );
     }
 

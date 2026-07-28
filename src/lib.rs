@@ -4,8 +4,10 @@ mod budget;
 mod command;
 mod engine;
 mod error;
+mod isolation;
 mod json_extract;
 mod model;
+mod process_tree;
 mod run_summary;
 mod scheduler;
 mod script;
@@ -13,7 +15,8 @@ mod store;
 
 pub use agent::{ServitorTransport, Transport};
 pub use boundary::{
-    BoundaryEnvelope, BoundaryEvent, BoundaryPolicy, EnvironmentPolicy, NetworkPolicy,
+    BoundaryEnvelope, BoundaryEvent, BoundaryPolicy, EnvironmentPolicy, IsolationLevel,
+    NetworkPolicy,
 };
 pub use budget::Budget;
 pub use engine::{Engine, Inspection};
