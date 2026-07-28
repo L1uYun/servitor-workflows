@@ -1,7 +1,7 @@
 export const meta = {
   name: "negotiate-2body",
   description: "Two-body proposal/review loop with synthesizer decision (C6 canary)",
-  contract: "workflow.v2",
+  contract: "workflow",
 };
 
 // args:
@@ -145,7 +145,7 @@ if (requireHumanGate) {
 }
 
 return {
-  protocol: "negotiate-2body.v1",
+  protocol: "negotiate-2body",
   topic,
   maxRounds,
   stopReason,

@@ -1,4 +1,4 @@
-//! V2-E boundary declarations and append-only audit evidence.
+//! Boundary declarations and append-only audit evidence.
 //!
 //! This module deliberately records and verifies only observable facts at the
 //! workflow host boundary. It is not an OS security sandbox: command children

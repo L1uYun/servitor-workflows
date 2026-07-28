@@ -60,7 +60,7 @@ impl WorkflowStore {
         self.run_dir(run_id).join("journal.jsonl")
     }
     /// Path of the versioned append-only event stream. Written only for
-    /// `workflow.v2` runs; v1 runs never create this file.
+    /// current runs; legacy runs never create this file.
     pub fn events_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("events.jsonl")
     }
@@ -222,22 +222,21 @@ impl WorkflowStore {
                 Ok(entry) => {
                     index.insert(entry.key.clone(), entry);
                 }
-                // Fault tolerance (V2-J): a host kill mid-append leaves only the
+                // Fault tolerance: a host kill mid-append leaves only the
                 // FINAL line torn. Drop that one incomplete tail entry and keep
                 // every complete line before it, so reconstruction and resume
                 // survive the crash. A malformed line anywhere but the tail is
                 // genuine corruption, not a torn write, and still errors.
                 //
-                // This reader is shared by v1 and v2 runs. The relaxation is
-                // intentional and safe for the frozen v1 path: `append` is the
-                // only journal writer and always terminates a complete line with
-                // `\n`, so a parse failure on the final line can ONLY be a torn
-                // write — never a complete v1 entry. No journal entry that
-                // previously parsed is ever dropped, so no v1 reconstruction
-                // that previously succeeded changes result; the only behavior
-                // change is that a v1 journal with a torn tail now reconstructs
-                // instead of erroring. This reads tolerantly; it never rewrites
-                // a v1 journal.
+                // This reader is shared by all runs. The relaxation is safe:
+                // `append` is the only journal writer and always terminates a
+                // complete line with `\n`, so a parse failure on the final line
+                // can ONLY be a torn write — never a complete entry. No journal
+                // entry that previously parsed is ever dropped, so no
+                // reconstruction that previously succeeded changes result; the
+                // only behavior change is that a journal with a torn tail now
+                // reconstructs instead of erroring. This reads tolerantly; it
+                // never rewrites a journal.
                 Err(_source) if position == last => {
                     break;
                 }
@@ -247,7 +246,7 @@ impl WorkflowStore {
         Ok(index)
     }
 
-    /// Persist one secret-safe V2-E boundary observation. The event carries
+    /// Persist one secret-safe boundary observation. The event carries
     /// declared paths and variable *names*, never environment values.
     pub fn append_boundary_event(
         &self,
@@ -441,10 +440,10 @@ impl WorkflowStore {
 
     /// Append one lifecycle event to `events.jsonl`. The envelope is stamped
     /// with the event schema version, a monotonic per-run sequence, the wall
-    /// time, the run id, and the parent run id (foundation only; `None` in
-    /// V2-A). The file is append-only and `sync_data`'d so a crash leaves a
-    /// clean tail. Returns `Ok(())` even when the run is v1 (no event stream)
-    /// so callers can gate on a single v2 check upstream.
+    /// time, the run id, and the parent run id (`None` at the tree root). The
+    /// file is append-only and `sync_data`'d so a crash leaves a clean tail.
+    /// Returns `Ok(())` even when the run has no event stream so callers can
+    /// gate on a single contract check upstream.
     pub fn append_event(
         &self,
         run_id: &str,
@@ -500,7 +499,7 @@ impl WorkflowStore {
         result.and(unlock)
     }
 
-    /// Persist a v2 lifecycle event before applying its matching state mutation.
+    /// Persist a lifecycle event before applying its matching state mutation.
     /// A caller can use this when an event/state pair has a single transition
     /// boundary; reconstruction remains authoritative after a crash between the
     /// two durable writes.
@@ -537,8 +536,8 @@ impl WorkflowStore {
         self.update_state(run_id, update)
     }
 
-    /// for v1 runs (no `events.jsonl`) and for v2 runs that have not yet
-    /// recorded any events.
+    /// for legacy runs (no `events.jsonl`) and for current runs that have not
+    /// yet recorded any events.
     pub fn read_events(&self, run_id: &str) -> Result<Vec<WorkflowEventEnvelope>, WorkflowError> {
         let path = self.events_path(run_id);
         let text = match fs::read_to_string(&path) {
@@ -592,7 +591,7 @@ impl WorkflowStore {
     }
 
     // ------------------------------------------------------------------
-    // V2-B: shared multidimensional budget ledger (budget.jsonl)
+    // Shared multidimensional budget ledger (budget.jsonl)
     // ------------------------------------------------------------------
 
     pub fn reserve_budget(
@@ -851,16 +850,17 @@ impl WorkflowStore {
     /// Reconstruct run state purely from persisted artifacts: the versioned
     /// event stream (`events.jsonl`) for lifecycle/phase/gate, the journal
     /// (`journal.jsonl`) for call outcomes and active calls, and the static
-    /// identity fields recorded at run creation. V2-A foundation: this never
-    /// consults in-memory runtime state.
+    /// identity fields recorded at run creation. This never consults
+    /// in-memory runtime state.
     pub fn reconstruct_state(&self, run_id: &str) -> Result<ReconstructedState, WorkflowError> {
         let state = self.load_state(run_id)?;
         let events = self.read_events(run_id)?;
         let journal = self.journal_index(run_id)?;
 
-        // Seed from the persisted state so v1 runs (which have no event
-        // stream) reconstruct their true status. For v2 runs the `RunStarted`
-        // lifecycle event overwrites this immediately, so behavior is unchanged.
+        // Seed from the persisted state so legacy runs (which have no event
+        // stream) reconstruct their true status. For current runs the
+        // `RunStarted` lifecycle event overwrites this immediately, so behavior
+        // is unchanged.
         let mut rs = ReconstructedState {
             version: state.version,
             contract: state.contract.clone(),
@@ -1108,7 +1108,7 @@ impl WorkflowStore {
                 source,
             })?;
         }
-        // Fault tolerance (V2-J): write to a temp file, `sync_data` it, then
+        // Fault tolerance: write to a temp file, `sync_data` it, then
         // rename over the target. A rename over an existing file is atomic on
         // POSIX and Windows, so a host kill mid-write leaves either the old
         // complete file or the new complete file — never a torn state.json that
@@ -1120,7 +1120,7 @@ impl WorkflowStore {
         // `%TEMP%` is on `C:`, so a `%TEMP%` temp file would make `fs::rename`
         // fail with ERROR_NOT_SAME_DEVICE on every production write and force a
         // non-atomic copy fallback — silently voiding the guarantee above. A
-        // temp file here is also invisible to a V2-E boundary audit, which
+        // temp file here is also invisible to a boundary audit, which
         // fingerprints only the workflow's declared read/write paths, not this
         // crate's state root.
         //

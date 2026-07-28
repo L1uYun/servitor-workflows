@@ -1,4 +1,4 @@
-//! V2-G declared capability registry, deterministic routing, and audit evidence.
+//! Declared capability registry, deterministic routing, and audit evidence.
 //!
 //! The workflow contract declares the candidates that may be selected. This
 //! module does not probe providers or manufacture fallbacks: an explicit choice

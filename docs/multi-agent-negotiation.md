@@ -1,7 +1,7 @@
 # Multi-agent negotiation (canary)
 
 > Owner: `servitor-workflows` only. Servitor stays transport.
-> Protocol: `negotiate-2body.v1` · 2026-07-26
+> Protocol: `negotiate-2body` · 2026-07-26
 
 ## Purpose
 

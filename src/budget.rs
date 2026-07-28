@@ -5,8 +5,8 @@ use serde_json::Value;
 use std::sync::Arc;
 
 /// Shared multidimensional budget handle. One per run; wraps the store so every
-/// reserve / settle / release is durably recorded to `budget.jsonl`. V2-C
-/// children share the parent's ledger by setting `owner_run_id` to the parent.
+/// reserve / settle / release is durably recorded to `budget.jsonl`. Children
+/// share the parent's ledger by setting `owner_run_id` to the parent.
 ///
 /// Money is in cents (1 = 0.01 USD). `None` means unlimited — the default when
 /// the run has no `money_cap`.
@@ -117,18 +117,18 @@ impl Budget {
 }
 
 // ---------------------------------------------------------------------------
-// V2-G placeholder: per-kind cost table
+// Per-kind cost table
 // ---------------------------------------------------------------------------
 
-/// Flat cost table. V2-G replaces this with a configurable provider-aware table;
-/// for V2-B every call kind costs zero money (only call count is gated). Token
+/// Flat cost table. A configurable provider-aware table can replace this; today
+/// every call kind costs zero money (only call count is gated). Token
 /// attribution is still tracked per call via `settle`.
 ///
 /// Returns `None` when the cost is zero or money tracking is disabled (i.e.
 /// `money_cap` is `None`).
 fn cost_estimate(_kind: &CallKind, _input: &Value, money_cap: Option<u64>) -> Option<u64> {
     money_cap?;
-    // V2-G: wire real cost estimates per kind / model / input size.
+    // Wire real cost estimates per kind / model / input size here.
     // For now, every call costs zero — only call-count gating applies.
     Some(0)
 }

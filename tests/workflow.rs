@@ -49,7 +49,7 @@ impl FakeTransport {
             emit_usage: true,
         }
     }
-    /// Fault injection (V2-J): a provider that reports no usage diagnostics,
+    /// Fault injection: a provider that reports no usage diagnostics,
     /// so settlement must still succeed with zero attributed tokens.
     fn without_usage(delay: Duration) -> Self {
         Self {
@@ -76,7 +76,7 @@ impl FakeTransport {
         self.peak_inspections.load(Ordering::SeqCst)
     }
     /// The transport run ids currently held by the provider, in sorted order.
-    /// Used by the V2-J fault tests to assert which submissions persisted.
+    /// Used by the fault tests to assert which submissions persisted.
     fn record_ids(&self) -> Vec<String> {
         self.records
             .lock()
@@ -158,12 +158,12 @@ impl Transport for FakeTransport {
         } else if prompt.contains("GOALCHAIN_SEMANTIC") {
             r#"{"approved":true,"rationale":"meaning holds"}"#.to_owned()
         } else if prompt.contains("JUDGE_CASE") {
-            // V2-J judge panel: each independent candidate returns a score.
+            // Judge panel: each independent candidate returns a score.
             r#"{"score":8,"rationale":"candidate approach"}"#.to_owned()
         } else if prompt.contains("JUDGE_SYNTH") {
             r#"{"winner":"beta","rationale":"highest judged score"}"#.to_owned()
         } else if prompt.contains("FIND_NEW") {
-            // V2-J loop-until-dry: first discovery finds items, every later
+            // Loop-until-dry: first discovery finds items, every later
             // round finds nothing new so the loop converges.
             let round = self.loop_rounds.fetch_add(1, Ordering::SeqCst);
             if round == 0 {
@@ -172,7 +172,7 @@ impl Transport for FakeTransport {
                 r#"{"items":[]}"#.to_owned()
             }
         } else if prompt.contains("VANISH") {
-            // V2-J fault: the provider accepts the submission but loses the
+            // Fault: the provider accepts the submission but loses the
             // record before the result is persisted. Handled below by removing
             // the just-inserted record so the first `inspect` fails "missing".
             "ok".to_owned()
@@ -213,7 +213,7 @@ impl Transport for FakeTransport {
                 },
             );
         if prompt.contains("VANISH") {
-            // Fault injection (V2-J): submitted transport without persisted
+            // Fault injection: submitted transport without persisted
             // result — the provider accepted the run but lost the record, so
             // the first `inspect` fails with "missing".
             self.records
@@ -275,7 +275,7 @@ fn script(temp: &TempDir, name: &str, body: &str) -> std::path::PathBuf {
     let path = temp.path().join(name);
     fs::write(
         &path,
-        format!("export const meta = {{ name: \"test\", contract: \"workflow.v2\" }};\n{body}"),
+        format!("export const meta = {{ name: \"test\", contract: \"workflow\" }};\n{body}"),
     )
     .expect("write fixture");
     path
@@ -283,7 +283,7 @@ fn script(temp: &TempDir, name: &str, body: &str) -> std::path::PathBuf {
 
 fn legacy_state(store: &WorkflowStore, path: &Path, status: RunStatus) -> RunState {
     let now = Utc::now();
-    let run_id = "legacy-v1-fixture".to_owned();
+    let run_id = "legacy-fixture".to_owned();
     RunState {
         version: 1,
         run_id: run_id.clone(),
@@ -326,7 +326,7 @@ fn container_isolation_is_refused_before_run_creation() {
         &path,
         r#"export const meta = {
           name: "container",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { isolation: "container" }
         }; return true;"#,
     )
@@ -345,7 +345,7 @@ fn child_cannot_weaken_parent_isolation() {
         temp.path().join("child.js"),
         r#"export const meta = {
           name: "child",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { isolation: "worktree" }
         }; return true;"#,
     )
@@ -355,7 +355,7 @@ fn child_cannot_weaken_parent_isolation() {
         &parent,
         r#"export const meta = {
           name: "parent",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { isolation: "process" }
         }; return await workflow("child.js");"#,
     )
@@ -408,7 +408,7 @@ fn worktree_isolation_writes_patch_and_commit_evidence() {
         &path,
         r#"export const meta = {
           name: "worktree",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { isolation: "worktree" }
         }; return await command("cmd", ["/D", "/C", "echo evidence>>seed.txt"]);"#,
     )
@@ -447,7 +447,7 @@ fn boundary_metadata_is_checked_and_persisted() {
         &path,
         r#"export const meta = {
           name: "boundary",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], writePaths: ["./out"], network: "allow", environment: { allow: ["SAFE_VAR"] } }
         }; return { done: true };"#,
     )
@@ -472,7 +472,7 @@ fn check_rejects_invalid_boundary_metadata() {
         &path,
         r#"export const meta = {
           name: "invalid",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], unexpected: true }
         }; return true;"#,
     )
@@ -495,7 +495,7 @@ fn boundary_rejects_undeclared_environment_without_persisting_values() {
         &path,
         r#"export const meta = {
           name: "boundary-env",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], network: "deny", environment: { allow: ["SAFE_VAR"] } }
         };
         return await command("cmd", ["/C", "exit 0"], { env: { SAFE_VAR: "safe-value", TOKEN: "secret-value" } });"#,
@@ -528,7 +528,7 @@ fn boundary_rejects_declared_network_when_denied() {
         &path,
         r#"export const meta = {
           name: "boundary-network",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], network: "deny" }
         };
         return await command("cmd", ["/C", "exit 0"], { network: true });"#,
@@ -556,7 +556,7 @@ fn child_boundary_narrows_and_is_audited() {
         temp.path().join("child-narrow.js"),
         r#"export const meta = {
           name: "child",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["./sub"], network: "deny", environment: { allow: ["SAFE_VAR"] } }
         }; return true;"#,
     )
@@ -566,7 +566,7 @@ fn child_boundary_narrows_and_is_audited() {
         &parent,
         r#"export const meta = {
           name: "parent",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], network: "allow", environment: { allow: ["SAFE_VAR", "PARENT_ONLY"] } }
         }; return await workflow("child-narrow.js");"#,
     )
@@ -612,7 +612,7 @@ fn child_capability_policy_cannot_weaken_parent_requirements() {
         temp.path().join("child-capability.js"),
         r#"export const meta = {
           name: "child",
-          contract: "workflow.v2",
+          contract: "workflow",
           capabilities: {
             providers: [{ agent: "claude", model: "claude-opus-5", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 }],
             roles: { reviewer: { requires: ["reasoning"], effort: "medium", contextTokens: 64000 } }
@@ -625,7 +625,7 @@ fn child_capability_policy_cannot_weaken_parent_requirements() {
         &parent,
         r#"export const meta = {
           name: "parent",
-          contract: "workflow.v2",
+          contract: "workflow",
           capabilities: {
             providers: [{ agent: "claude", model: "claude-opus-5", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 }],
             roles: { reviewer: { requires: ["reasoning"], effort: "high", contextTokens: 100000 } }
@@ -661,7 +661,7 @@ fn boundary_failure_releases_budget_reservation() {
         &path,
         r#"export const meta = {
           name: "boundary-release",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], network: "deny" }
         };
         return await command("cmd", ["/C", "exit 0"], { network: true });"#,
@@ -686,7 +686,7 @@ fn child_boundary_cannot_widen_parent_network_policy() {
         temp.path().join("child.js"),
         r#"export const meta = {
           name: "child",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], network: "allow" }
         }; return true;"#,
     )
@@ -696,7 +696,7 @@ fn child_boundary_cannot_widen_parent_network_policy() {
         &parent,
         r#"export const meta = {
           name: "parent",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], network: "deny" }
         }; return await workflow("child.js");"#,
     )
@@ -729,7 +729,7 @@ fn boundary_command_clears_inherited_environment() {
         &path,
         r#"export const meta = {
           name: "boundary-inheritance",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], network: "deny", environment: { allow: ["SAFE_VAR"] } }
         };
         return await command("cmd", ["/D", "/C", "if defined PATH exit /b 7"], { env: { SAFE_VAR: "declared" } });"#,
@@ -751,7 +751,7 @@ fn boundary_snapshots_declared_writes_and_git_state() {
         &path,
         r#"export const meta = {
           name: "boundary-snapshot",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], writePaths: ["./allowed"], network: "deny" }
         };
         return await command("cmd", ["/D", "/C", "echo recorded>allowed\\output.txt"]);"#,
@@ -798,7 +798,7 @@ fn boundary_blocks_observed_write_outside_declared_paths() {
         &path,
         r#"export const meta = {
           name: "boundary-write-violation",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], writePaths: ["./allowed"], network: "deny" }
         };
         return await command("cmd", ["/D", "/C", "echo blocked>undeclared.txt"]);"#,
@@ -840,7 +840,7 @@ fn boundary_blocks_observed_deletion_outside_declared_paths() {
         &path,
         r#"export const meta = {
           name: "boundary-delete-violation",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], network: "deny" }
         };
         return await command("cmd", ["/D", "/C", "del undeclared.txt"]);"#,
@@ -869,7 +869,7 @@ fn boundary_resume_does_not_duplicate_completed_call_audit() {
         &path,
         r#"export const meta = {
           name: "boundary-resume",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], network: "deny" }
         };
         return await command("cmd", ["/D", "/C", "exit 0"]);"#,
@@ -905,7 +905,7 @@ fn boundary_redacts_explicit_environment_values_from_command_journal() {
         &path,
         r#"export const meta = {
           name: "boundary-redaction",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], network: "deny", environment: { allow: ["TOKEN"] } }
         };
         return await command("cmd", ["/D", "/C", "echo %TOKEN%"], { env: { TOKEN: "secret-value" } });"#,
@@ -930,7 +930,7 @@ fn boundary_violation_caught_by_script_still_blocks_success() {
         &path,
         r#"export const meta = {
           name: "boundary-caught-violation",
-          contract: "workflow.v2",
+          contract: "workflow",
           boundary: { readPaths: ["."], network: "deny", environment: { allow: [] } }
         };
         try {
@@ -953,9 +953,9 @@ fn boundary_violation_caught_by_script_still_blocks_success() {
 }
 
 #[test]
-fn v1_resume_does_not_create_boundary_audit() {
+fn legacy_resume_does_not_create_boundary_audit() {
     let temp = TempDir::new().expect("tempdir");
-    let root = temp.path().join("state-v1-boundary");
+    let root = temp.path().join("state-legacy-boundary");
     let store = WorkflowStore::new(&root);
     let path = temp.path().join("legacy.js");
     fs::write(&path, "return true;").expect("write legacy script");
@@ -971,7 +971,7 @@ fn v1_resume_does_not_create_boundary_audit() {
 }
 
 #[test]
-fn v2_budget_ledger_reserves_and_settles_each_host_call() {
+fn budget_ledger_reserves_and_settles_each_host_call() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("state-budget-ledger");
     let path = script(
@@ -1002,13 +1002,13 @@ fn v2_budget_ledger_reserves_and_settles_each_host_call() {
 }
 
 #[test]
-fn v2_meta_money_cap_is_persisted_and_emitted() {
+fn meta_money_cap_is_persisted_and_emitted() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("state-money-cap");
     let path = temp.path().join("money-cap.js");
     fs::write(
         &path,
-        r#"export const meta = { name: "cap", contract: "workflow.v2", moneyCap: 123 }; return { done: true };"#,
+        r#"export const meta = { name: "cap", contract: "workflow", moneyCap: 123 }; return { done: true };"#,
     )
     .expect("write script");
     let state = engine(
@@ -1024,7 +1024,7 @@ fn v2_meta_money_cap_is_persisted_and_emitted() {
     assert_eq!(reconstructed.money_cap, Some(123));
 }
 #[test]
-fn v2_budget_released_reservation_cannot_settle() {
+fn budget_released_reservation_cannot_settle() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("state-budget-release");
     let path = script(&temp, "budget-release.js", r#"return { done: true };"#);
@@ -1076,7 +1076,7 @@ fn v2_budget_released_reservation_cannot_settle() {
 }
 
 #[test]
-fn v2_resume_preserves_submitted_reservation() {
+fn resume_preserves_submitted_reservation() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("state-budget-resume");
     let path = script(&temp, "budget-resume.js", r#"return { done: true };"#);
@@ -1129,7 +1129,7 @@ fn v2_resume_preserves_submitted_reservation() {
 }
 
 #[test]
-fn v2_rejects_invalid_money_cap() {
+fn rejects_invalid_money_cap() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("state-invalid-money-cap");
     for (name, money_cap) in [("zero", "0"), ("negative", "-1"), ("fraction", "1.5")] {
@@ -1137,7 +1137,7 @@ fn v2_rejects_invalid_money_cap() {
         fs::write(
             &path,
             format!(
-                "export const meta = {{ name: \"cap\", contract: \"workflow.v2\", moneyCap: {money_cap} }}; return {{}};"
+                "export const meta = {{ name: \"cap\", contract: \"workflow\", moneyCap: {money_cap} }}; return {{}};"
             ),
         )
         .expect("write script");
@@ -1149,7 +1149,7 @@ fn v2_rejects_invalid_money_cap() {
 }
 
 #[test]
-fn new_runs_require_explicit_v2_contract() {
+fn new_runs_require_explicit_contract() {
     let temp = TempDir::new().expect("tempdir");
     let missing = temp.path().join("missing.js");
     fs::write(
@@ -1170,8 +1170,8 @@ fn new_runs_require_explicit_v2_contract() {
 
     let missing_error = runtime
         .start(&missing, Value::Null, 1, 10)
-        .expect_err("missing v2 contract must fail");
-    assert!(missing_error.to_string().contains("workflow.v2"));
+        .expect_err("missing contract must fail");
+    assert!(missing_error.to_string().contains("workflow"));
     let wrong_error = runtime
         .start(&wrong, Value::Null, 1, 10)
         .expect_err("wrong contract must fail");
@@ -1195,7 +1195,7 @@ fn computed_metadata_initializer_is_rejected() {
     fs::write(
         &path,
         r#"
-        export const meta = makeMeta({ contract: "workflow.v2" });
+        export const meta = makeMeta({ contract: "workflow" });
         return {};
         "#,
     )
@@ -1206,8 +1206,8 @@ fn computed_metadata_initializer_is_rejected() {
         Arc::new(FakeTransport::new(Duration::ZERO)),
     )
     .start(&path, Value::Null, 1, 10)
-    .expect_err("computed metadata must not satisfy v2 contract");
-    assert!(error.to_string().contains("workflow.v2"));
+    .expect_err("computed metadata must not satisfy the contract");
+    assert!(error.to_string().contains("workflow"));
 }
 
 #[test]
@@ -1218,7 +1218,7 @@ fn metadata_decoy_before_real_declaration_is_ignored() {
         &path,
         r#"
         // export const meta = { name: "decoy" };
-        const text = "export const meta = { contract: 'workflow.v2' };";
+        const text = "export const meta = { contract: 'workflow' };";
         export const meta = { name: "missing-contract" };
         return {};
         "#,
@@ -1229,8 +1229,8 @@ fn metadata_decoy_before_real_declaration_is_ignored() {
         Arc::new(FakeTransport::new(Duration::ZERO)),
     )
     .start(&path, Value::Null, 1, 10)
-    .expect_err("decoy metadata must not satisfy v2 contract");
-    assert!(error.to_string().contains("workflow.v2"));
+    .expect_err("decoy metadata must not satisfy the contract");
+    assert!(error.to_string().contains("workflow"));
 }
 
 #[test]
@@ -1240,7 +1240,7 @@ fn regex_metadata_decoy_is_ignored() {
     fs::write(
         &path,
         r#"
-        const marker = /export const meta = { contract: "workflow.v2" }/;
+        const marker = /export const meta = { contract: "workflow" }/;
         return { accepted: marker.test("meta") };
         "#,
     )
@@ -1251,8 +1251,8 @@ fn regex_metadata_decoy_is_ignored() {
         Arc::new(FakeTransport::new(Duration::ZERO)),
     )
     .start(&path, Value::Null, 1, 10)
-    .expect_err("regex text must not satisfy v2 contract");
-    assert!(error.to_string().contains("workflow.v2"));
+    .expect_err("regex text must not satisfy the contract");
+    assert!(error.to_string().contains("workflow"));
 }
 
 #[test]
@@ -1262,7 +1262,7 @@ fn nested_metadata_declaration_is_ignored() {
     fs::write(
         &path,
         r#"
-        function unused() { export const meta = { contract: "workflow.v2" }; }
+        function unused() { export const meta = { contract: "workflow" }; }
         return { ok: true };
         "#,
     )
@@ -1273,7 +1273,7 @@ fn nested_metadata_declaration_is_ignored() {
         Arc::new(FakeTransport::new(Duration::ZERO)),
     )
     .start(&path, Value::Null, 1, 10)
-    .expect_err("nested metadata must not satisfy v2 contract");
+    .expect_err("nested metadata must not satisfy the contract");
     assert!(
         !error.to_string().is_empty(),
         "nested export declaration must be rejected before execution"
@@ -1288,7 +1288,7 @@ fn metadata_declaration_allows_comments_before_assignment() {
         &path,
         r#"
         export const meta /* note = { decoy } */ = {
-          contract: "workflow.v2",
+          contract: "workflow",
         };
         return {};
         "#,
@@ -1301,11 +1301,11 @@ fn metadata_declaration_allows_comments_before_assignment() {
     )
     .start(&path, Value::Null, 1, 10)
     .expect("comments before assignment must be supported");
-    assert_eq!(state.contract.as_deref(), Some("workflow.v2"));
+    assert_eq!(state.contract.as_deref(), Some("workflow"));
 }
 
 #[test]
-fn v2_contract_metadata_accepts_json5_comments() {
+fn contract_metadata_accepts_json5_comments() {
     let temp = TempDir::new().expect("tempdir");
     let path = temp.path().join("commented-meta.js");
     fs::write(
@@ -1314,7 +1314,7 @@ fn v2_contract_metadata_accepts_json5_comments() {
           // this comment has a closing brace: }
           name: "commented",
           /* and this one has a quote: " */
-          contract: "workflow.v2",
+          contract: "workflow",
         };
         return { ok: true };"#,
     )
@@ -1325,13 +1325,13 @@ fn v2_contract_metadata_accepts_json5_comments() {
         Arc::new(FakeTransport::new(Duration::ZERO)),
     )
     .start(&path, Value::Null, 1, 10)
-    .expect("JSON5 comments must not break v2 metadata extraction");
-    assert_eq!(state.contract.as_deref(), Some("workflow.v2"));
+    .expect("JSON5 comments must not break metadata extraction");
+    assert_eq!(state.contract.as_deref(), Some("workflow"));
     assert_eq!(state.status, RunStatus::Succeeded);
 }
 
 #[test]
-fn legacy_nonterminal_run_resumes_without_rewriting_v1_journal() {
+fn legacy_nonterminal_run_resumes_without_rewriting_journal() {
     let temp = TempDir::new().expect("tempdir");
     let state_root = temp.path().join("state");
     let store = WorkflowStore::new(&state_root);
@@ -1344,7 +1344,7 @@ fn legacy_nonterminal_run_resumes_without_rewriting_v1_journal() {
         .expect("persist legacy run");
     let journal = br#"{"at":"2026-01-01T00:00:00Z","key":"old#0","kind":"command","state":"succeeded","label":"old","result":{"ok":true}}
 "#;
-    fs::write(store.journal_path(&state.run_id), journal).expect("write frozen v1 journal");
+    fs::write(store.journal_path(&state.run_id), journal).expect("write frozen journal");
     let before = fs::read(store.journal_path(&state.run_id)).expect("read journal before resume");
 
     let resumed = engine(&state_root, Arc::new(FakeTransport::new(Duration::ZERO)))
@@ -1363,7 +1363,7 @@ fn legacy_nonterminal_run_resumes_without_rewriting_v1_journal() {
 }
 
 #[test]
-fn v2_events_are_append_only_and_reconstruct_terminal_state() {
+fn events_are_append_only_and_reconstruct_terminal_state() {
     let temp = TempDir::new().expect("tempdir");
     let state_root = temp.path().join("state");
     let path = script(
@@ -1373,12 +1373,12 @@ fn v2_events_are_append_only_and_reconstruct_terminal_state() {
     );
     let state = engine(&state_root, Arc::new(FakeTransport::new(Duration::ZERO)))
         .start(&path, json!({"input": 1}), 2, 12)
-        .expect("run v2 workflow");
+        .expect("run workflow");
     let store = WorkflowStore::new(&state_root);
-    let events = store.read_events(&state.run_id).expect("read v2 events");
+    let events = store.read_events(&state.run_id).expect("read events");
 
     assert_eq!(state.version, 2);
-    assert_eq!(state.contract.as_deref(), Some("workflow.v2"));
+    assert_eq!(state.contract.as_deref(), Some("workflow"));
     assert_eq!(events.len(), 3);
     assert_eq!(
         events
@@ -1423,7 +1423,7 @@ fn v2_events_are_append_only_and_reconstruct_terminal_state() {
 }
 
 #[test]
-fn v2_gate_rejection_is_recorded_as_terminal_event() {
+fn gate_rejection_is_recorded_as_terminal_event() {
     let temp = TempDir::new().expect("tempdir");
     let state_root = temp.path().join("state");
     let path = script(
@@ -1462,14 +1462,14 @@ fn v2_gate_rejection_is_recorded_as_terminal_event() {
 }
 
 #[test]
-fn v2_cancellation_is_recorded_as_terminal_event() {
+fn cancellation_is_recorded_as_terminal_event() {
     let temp = TempDir::new().expect("tempdir");
     let state_root = temp.path().join("state");
     let path = script(&temp, "cancel.js", "return { unused: true };");
     let runtime = engine(&state_root, Arc::new(FakeTransport::new(Duration::ZERO)));
     let prepared = runtime
         .prepare(&path, Value::Null, 1, 10)
-        .expect("prepare v2 run");
+        .expect("prepare run");
     let cancelled = runtime
         .cancel(&prepared.run_id, "operator cancelled".to_owned())
         .expect("cancel prepared run");
@@ -1494,7 +1494,7 @@ fn pending_cancellation_reason_survives_resume() {
     let runtime = engine(&state_root, Arc::new(FakeTransport::new(Duration::ZERO)));
     let prepared = runtime
         .prepare(&path, Value::Null, 1, 10)
-        .expect("prepare v2 run");
+        .expect("prepare run");
     let state_path = runtime.store().state_path(&prepared.run_id);
     let mut persisted: Value =
         serde_json::from_slice(&fs::read(&state_path).expect("read prepared state"))
@@ -1532,7 +1532,7 @@ fn pending_cancellation_reason_survives_resume() {
 }
 
 #[test]
-fn v2_pause_resume_and_supersede_reconstruct_from_events() {
+fn pause_resume_and_supersede_reconstruct_from_events() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("state");
     let transport = Arc::new(FakeTransport::new(Duration::from_millis(250)));
@@ -1544,12 +1544,12 @@ fn v2_pause_resume_and_supersede_reconstruct_from_events() {
     let runtime = engine(&root, Arc::clone(&transport));
     let prepared = runtime
         .prepare(&path, Value::Null, 1, 10)
-        .expect("prepare v2 run");
+        .expect("prepare run");
     let run_id = prepared.run_id;
-    let paused = runtime.pause(&run_id).expect("pause v2 run");
+    let paused = runtime.pause(&run_id).expect("pause run");
     assert_eq!(paused.status, RunStatus::Paused);
 
-    let resumed = runtime.resume(&run_id).expect("resume v2 run");
+    let resumed = runtime.resume(&run_id).expect("resume run");
     assert_eq!(resumed.status, RunStatus::Succeeded, "{:?}", resumed.error);
     let store = WorkflowStore::new(&root);
     let events = store.read_events(&run_id).expect("read lifecycle events");
@@ -1571,7 +1571,7 @@ fn v2_pause_resume_and_supersede_reconstruct_from_events() {
 
     let redirect = runtime
         .prepare(&path, Value::Null, 1, 10)
-        .expect("prepare v2 supersede run");
+        .expect("prepare supersede run");
     let superseded = runtime
         .supersede(
             &redirect.run_id,
@@ -1579,7 +1579,7 @@ fn v2_pause_resume_and_supersede_reconstruct_from_events() {
             Some("evidence.md".to_owned()),
             Some("next-contract.md".to_owned()),
         )
-        .expect("supersede v2 run");
+        .expect("supersede run");
     let reconstructed = store
         .reconstruct_state(&redirect.run_id)
         .expect("reconstruct superseded run");
@@ -2155,7 +2155,7 @@ fn process_isolation_cancellation_terminates_descendants() {
         format!(
             r#"export const meta = {{
               name: "process-isolation",
-              contract: "workflow.v2",
+              contract: "workflow",
               boundary: {{ isolation: "process", readPaths: ["."], writePaths: ["."] }}
             }};
             return await command("pwsh", ["-NoProfile", "-Command", "Start-Process pwsh -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Milliseconds 750; Set-Content -LiteralPath ''{escaped_marker}'' -Value escaped'; Start-Sleep -Seconds 10"]);"#
@@ -3422,7 +3422,7 @@ fn negotiate_two_body_reaches_accept_after_revise() {
         .expect("run negotiation");
     assert_eq!(state.status, RunStatus::Succeeded);
     let result = state.result.expect("result");
-    assert_eq!(result["protocol"], "negotiate-2body.v1");
+    assert_eq!(result["protocol"], "negotiate-2body");
     assert_eq!(result["stopReason"], "reviewer_accept");
     assert_eq!(result["rounds"], 2);
     assert_eq!(result["decision"]["accepted"], true);
@@ -3552,7 +3552,7 @@ fn capability_routing_preserves_pinned_provider_and_model() {
         &path,
         r#"export const meta = {
           name: "pinned capability",
-          contract: "workflow.v2",
+          contract: "workflow",
           capabilities: {
             providers: [
               { agent: "claude", model: "claude-opus-5", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 },
@@ -3594,7 +3594,7 @@ fn missing_capability_fails_before_transport_submission() {
         &path,
         r#"export const meta = {
           name: "missing capability",
-          contract: "workflow.v2",
+          contract: "workflow",
           capabilities: {
             providers: [{ agent: "pi", capabilities: ["text"], maxEffort: "medium", contextTokens: 32000 }],
             roles: { reviewer: { requires: ["vision"], effort: "high", contextTokens: 64000 } }
@@ -3630,7 +3630,7 @@ fn automatic_capability_degradation_records_exclusions() {
         &path,
         r#"export const meta = {
           name: "degraded capability",
-          contract: "workflow.v2",
+          contract: "workflow",
           capabilities: {
             providers: [
               { agent: "pi", model: "small", capabilities: ["text"], maxEffort: "low", contextTokens: 16000 },
@@ -3665,7 +3665,7 @@ fn independent_roles_cannot_share_the_same_model_choice() {
         &path,
         r#"export const meta = {
           name: "independent capability",
-          contract: "workflow.v2",
+          contract: "workflow",
           capabilities: {
             providers: [{ agent: "claude", model: "claude-opus-5", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 }],
             roles: {
@@ -4130,32 +4130,32 @@ fn watch_reports_failed_recovery_and_budget_usage() {
         view.recovery
     );
     // Budget/usage is reconstructed from budget.jsonl; the agent call settled.
-    let budget = view.budget.expect("v2 run has a budget ledger");
+    let budget = view.budget.expect("run has a budget ledger");
     assert!(budget.attributed_tokens > 0, "usage tokens attributed");
 }
 
 #[test]
-fn watch_reports_true_status_for_v1_run_without_event_stream() {
+fn watch_reports_true_status_for_legacy_run_without_event_stream() {
     use servitor_workflows::reconstruct_watch;
     let temp = TempDir::new().expect("tempdir");
-    let root = temp.path().join("state-v1-watch");
+    let root = temp.path().join("state-legacy-watch");
     let store = WorkflowStore::new(&root);
     let path = temp.path().join("legacy-watch.js");
     fs::write(&path, "return true;").expect("write legacy script");
-    // A v1 run has no events.jsonl; watch must not silently report "running".
+    // A legacy run has no events.jsonl; watch must not silently report "running".
     let state = legacy_state(&store, &path, RunStatus::Cancelled);
     store
         .create_run(&state, "return true;")
         .expect("persist legacy run");
 
-    let view = reconstruct_watch(&store, &state.run_id).expect("watch v1 run");
+    let view = reconstruct_watch(&store, &state.run_id).expect("watch legacy run");
     assert_eq!(
         view.status,
         RunStatus::Cancelled,
-        "v1 watch must reflect the persisted status, not a hardcoded running"
+        "legacy watch must reflect the persisted status, not a hardcoded running"
     );
     assert_eq!(view.tree.category, "cancelled");
-    assert!(view.budget.is_none(), "v1 run has no budget ledger");
+    assert!(view.budget.is_none(), "legacy run has no budget ledger");
 }
 
 #[test]
@@ -4193,20 +4193,20 @@ fn watch_rejects_corrupted_parent_child_cycle_instead_of_crashing() {
 }
 
 #[test]
-fn goalchain_v2_delivery_completes_dual_gates_child_review_cost_and_boundary() {
+fn goalchain_delivery_completes_dual_gates_child_review_cost_and_boundary() {
     use servitor_workflows::reconstruct_watch;
     let temp = TempDir::new().expect("tempdir");
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     // Copy the migrated chain + its independent reviewer child into the temp
-    // cwd so the relative `workflow("goalchain-v2-review.workflow.js")` resolves.
+    // cwd so the relative `workflow("goalchain-review.workflow.js")` resolves.
     fs::copy(
-        examples.join("goalchain-v2.workflow.js"),
-        temp.path().join("goalchain-v2.workflow.js"),
+        examples.join("goalchain.workflow.js"),
+        temp.path().join("goalchain.workflow.js"),
     )
     .expect("copy chain");
     fs::copy(
-        examples.join("goalchain-v2-review.workflow.js"),
-        temp.path().join("goalchain-v2-review.workflow.js"),
+        examples.join("goalchain-review.workflow.js"),
+        temp.path().join("goalchain-review.workflow.js"),
     )
     .expect("copy reviewer child");
     // Frozen contract carrying the mechanical acceptance identifiers (G15).
@@ -4221,7 +4221,7 @@ fn goalchain_v2_delivery_completes_dual_gates_child_review_cost_and_boundary() {
     let eng = engine(&root_dir, Arc::clone(&transport));
     let waiting = eng
         .start(
-            &temp.path().join("goalchain-v2.workflow.js"),
+            &temp.path().join("goalchain.workflow.js"),
             json!({
                 "contractPath": "contract.md",
                 "evidencePath": "./out/evidence.json",
@@ -4231,7 +4231,7 @@ fn goalchain_v2_delivery_completes_dual_gates_child_review_cost_and_boundary() {
             1,
             20,
         )
-        .expect("start goalchain v2");
+        .expect("start goalchain");
     // readiness -> dispatch -> child review -> mechanical gate -> human gate.
     assert_eq!(
         waiting.status,
@@ -4250,7 +4250,7 @@ fn goalchain_v2_delivery_completes_dual_gates_child_review_cost_and_boundary() {
     // Dual gates: the mechanical gate (identifier tokens read back from disk)
     // and the semantic gate (independent meaning review) both passed.
     let result = done.result.clone().expect("result");
-    assert_eq!(result["protocol"], "goalchain.v2");
+    assert_eq!(result["protocol"], "goalchain");
     assert_eq!(result["semantic"]["approved"], true);
     assert_eq!(result["review"]["verdict"], "approve");
     assert_eq!(result["human"]["approved"], true);
@@ -4297,10 +4297,10 @@ fn goalchain_v2_delivery_completes_dual_gates_child_review_cost_and_boundary() {
         "reviewer must be read-only"
     );
 
-    // Cost attribution (V2-B): worker + reviewer + semantic = 3 agent calls,
+    // Cost attribution: worker + reviewer + semantic = 3 agent calls,
     // all attributed to the shared root ledger with tokens settled. The ledger
     // also counts command/gate/workflow host calls, so assert the agent
-    // Cost attribution (V2-B): the shared root ledger counts EVERY host call,
+    // Cost attribution: the shared root ledger counts EVERY host call,
     // not just agents — 3 agents (worker + reviewer-child + semantic) + 3
     // commands (readiness + write-evidence + read-evidence) + 1 gate (human) +
     // 1 workflow (review child) = 8 settled keys. Pin the exact count so a
@@ -4321,7 +4321,7 @@ fn goalchain_v2_delivery_completes_dual_gates_child_review_cost_and_boundary() {
         .expect("child reservation in root ledger");
     assert!(ledger.reservations[child_reservation].settled);
 
-    // Boundary audit (V2-E): declared policy, child narrowing, and a file
+    // Boundary audit: declared policy, child narrowing, and a file
     // snapshot that observed the evidence land inside ./out — no violations.
     let boundary = store
         .read_boundary_events(&root_run_id)
@@ -4353,14 +4353,14 @@ fn goalchain_v2_delivery_completes_dual_gates_child_review_cost_and_boundary() {
         "no boundary violations in a clean delivery"
     );
 
-    // Crash recovery (V2-H): a restarted process rebuilds the identical tree,
+    // Crash recovery: a restarted process rebuilds the identical tree,
     // status, and budget exclusively from persisted events.
     let restarted = WorkflowStore::new(&root_dir);
     let view = reconstruct_watch(&restarted, &root_run_id).expect("watch reconstructs");
     assert_eq!(view.source, "persisted_events");
     assert_eq!(view.status, RunStatus::Succeeded);
     assert_eq!(view.tree.children.len(), 1, "reviewer child in the tree");
-    assert!(view.budget.is_some(), "v2 run reconstructs its budget");
+    assert!(view.budget.is_some(), "run reconstructs its budget");
 }
 
 // Negative control for the mechanical gate: a worker that claims success but
@@ -4370,17 +4370,17 @@ fn goalchain_v2_delivery_completes_dual_gates_child_review_cost_and_boundary() {
 // this test pins the failure path. The BADWORKER transport branch returns
 // evidence {"dual-gate":true,"boundary-audit":false}.
 #[test]
-fn goalchain_v2_mechanical_gate_fails_when_landed_evidence_token_is_false() {
+fn goalchain_mechanical_gate_fails_when_landed_evidence_token_is_false() {
     let temp = TempDir::new().expect("tempdir");
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     fs::copy(
-        examples.join("goalchain-v2.workflow.js"),
-        temp.path().join("goalchain-v2.workflow.js"),
+        examples.join("goalchain.workflow.js"),
+        temp.path().join("goalchain.workflow.js"),
     )
     .expect("copy chain");
     fs::copy(
-        examples.join("goalchain-v2-review.workflow.js"),
-        temp.path().join("goalchain-v2-review.workflow.js"),
+        examples.join("goalchain-review.workflow.js"),
+        temp.path().join("goalchain-review.workflow.js"),
     )
     .expect("copy reviewer child");
     // Contract carries the BADWORKER identifier so readiness passes and the
@@ -4398,7 +4398,7 @@ fn goalchain_v2_mechanical_gate_fails_when_landed_evidence_token_is_false() {
     // parking; the gate must fail the run before any human decision.
     let failed = eng
         .start(
-            &temp.path().join("goalchain-v2.workflow.js"),
+            &temp.path().join("goalchain.workflow.js"),
             json!({
                 "contractPath": "contract.md",
                 "evidencePath": "./out/evidence.json",
@@ -4408,7 +4408,7 @@ fn goalchain_v2_mechanical_gate_fails_when_landed_evidence_token_is_false() {
             1,
             20,
         )
-        .expect("start goalchain v2 negative control");
+        .expect("start goalchain negative control");
     assert_eq!(failed.status, RunStatus::Failed, "{:?}", failed.result);
     let err = failed.error.expect("failure error");
     assert!(
@@ -4418,7 +4418,7 @@ fn goalchain_v2_mechanical_gate_fails_when_landed_evidence_token_is_false() {
 }
 
 // ===========================================================================
-// V2-J — Superiority benchmark and fault-injection release gate
+// Superiority benchmark and fault-injection release gate
 //
 // Fixed behavioral cases (Claude-native-expressible) and fault-injection cases
 // (local-only). Every input is fixed and every assertion is a machine verdict,
@@ -4847,7 +4847,7 @@ fn fault_host_kill_mid_run_recovers_via_replay_without_resubmission() {
     // FRESH engine with no shared memory can reconstruct the run purely from
     // persisted journal/state and drive it to completion WITHOUT resubmitting
     // any already-settled call. The torn journal tail appended below exercises
-    // the V2-J torn-tail tolerance on top of that reconstruction. The
+    // the torn-tail tolerance on top of that reconstruction. The
     // no-resubmission assertion is robust regardless of the pause/inspect race
     // because `transport.count()` counts submissions only, not inspections.
     wait_for_call_count(&transport, 2);

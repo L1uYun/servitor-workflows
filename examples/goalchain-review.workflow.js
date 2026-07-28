@@ -1,12 +1,12 @@
 export const meta = {
-  name: "goalchain-v2-review",
+  name: "goalchain-review",
   description: "Independent per-slice reviewer (G13): its own run, read-only boundary",
-  contract: "workflow.v2",
-  // V2-E narrowing: the reviewer is read-only. writePaths is empty, which is a
-  // strict narrowing of the parent chain's ./out write surface — the reviewer
-  // cannot land files, only judge. network stays "allow" because the reviewer
-  // agent is itself a transport submission (audited as network use). This is an
-  // audit boundary, not an OS sandbox.
+  contract: "workflow",
+  // The reviewer is read-only. writePaths is empty, which is a strict narrowing
+  // of the parent chain's ./out write surface — the reviewer cannot land files,
+  // only judge. network stays "allow" because the reviewer agent is itself a
+  // transport submission (audited as network use). This is an audit boundary,
+  // not an OS sandbox.
   boundary: {
     readPaths: ["."],
     writePaths: [],
@@ -21,7 +21,7 @@ export const meta = {
   // events.
 };
 
-// args (passed by the parent goalchain-v2.workflow.js):
+// args (passed by the parent goalchain.workflow.js):
 //   contractPath: string
 //   evidencePath: string
 
@@ -30,10 +30,8 @@ const evidencePath = String((args && args.evidencePath) || "./out/evidence.json"
 
 phase("review");
 // G13 + G3: an independent reviewer judges the slice and ends schema-valid.
-// It reads the contract and evidence through host tools (no body inlining —
-// karma #474); path-only references are the contract, the model does the
-// reading. Runtime schema handling supersedes the v1 template's manual
-// VERDICT-line retry.
+// It reads the contract and evidence through host tools (no body inlining);
+// path-only references are the contract, the model does the reading.
 const reviewSchema = {
   type: "object",
   required: ["verdict", "critique", "must_fix"],
@@ -56,7 +54,7 @@ const review = await agent(
 );
 
 return {
-  protocol: "goalchain-review.v2",
+  protocol: "goalchain-review",
   verdict: review.verdict,
   critique: review.critique,
   must_fix: review.must_fix,

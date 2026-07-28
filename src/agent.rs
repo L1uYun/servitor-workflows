@@ -446,7 +446,7 @@ fn validate_correction_schema(
     schema: Option<&Value>,
 ) -> Result<(), String> {
     let Some(expected) = metadata.schema_sha256.as_deref() else {
-        // Historical V1/V2 journal entries predate schema identity. They retain
+        // Historical journal entries predate schema identity. They retain
         // their frozen replay semantics rather than being rewritten.
         return Ok(());
     };

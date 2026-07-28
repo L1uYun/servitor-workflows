@@ -26,6 +26,7 @@ Rust binary; Node, Deno, V8, and Python are not runtime dependencies.
 ```javascript
 export const meta = {
   name: "audit-routes",
+  contract: "workflow",
 };
 
 phase("discover");
@@ -48,18 +49,22 @@ const results = await pipeline(
 return results;
 ```
 
-Available globals:
+Every workflow declares `meta.contract: "workflow"`. A run that omits the
+contract or supplies any other value is rejected before a run directory is
+created. Available globals:
 
 ```text
 args
 agent(prompt, options?)
 command(program, args?, options?)
+workflow(path, args?, options?)
 gate(question, options?)
 phase(name)
 parallel(promises)
-pipeline(items, worker)
+pipeline(items, ...stages)
 retry(fn, options?)
 supersede(options)
+log(message)
 ```
 
 JavaScript has no direct filesystem or process API. External work crosses the
@@ -181,6 +186,127 @@ readiness gate skips already-produced artifacts. This is continue-as-new, never
 in-place script edits. CLI equivalent: `supersede RUN_ID --reason TEXT
 [--evidence PATH] [--new-contract TEXT]`.
 
+## Child workflows
+
+`workflow(path, args?, options?)` runs another workflow script as a child of
+the current run. Children form a persistent structured-concurrency tree: each
+child has its own run id, journal, and boundary, while sharing the root's
+concurrency scheduler and budget ledger. A child's outcome is persisted in the
+tree and attributed to the shared budget.
+
+```javascript
+const review = await workflow("review.workflow.js", {
+  contractPath,
+  evidencePath,
+});
+```
+
+Rules:
+
+- Children inherit the parent's budget, boundary, capabilities, and isolation,
+  and may only tighten them, never widen.
+- A child failure rejects only that `workflow()` call; the parent script
+  decides the policy (catch, retry, or fail the chain).
+- Human waiting bubbles visibly through the tree: approving the root resumes
+  the waiting descendant.
+- Cycles and unbounded recursion are rejected before any dispatch.
+- Cancellation propagates from a parent to all live descendants.
+
+This is how independent review is expressed: the reviewer runs as a child
+workflow with its own narrowed (read-only) boundary, so the maker's output is
+never self-graded in the same run.
+
+## Budget
+
+Every run has a shared multidimensional budget ledger persisted to
+`budget.jsonl`. It accounts call count, optional money, and token usage across
+the whole tree.
+
+- `max_calls` is a shared hard limit across the workflow tree (CLI `--max-calls`,
+  default 1000). Every host call — agent, command, gate, and child workflow —
+  consumes it.
+- `meta.moneyCap` (cents) is optional and defaults to unlimited. It becomes a
+  hard limit only when the contract explicitly supplies it.
+- Token usage is measured for attribution only; it never stops a run. There is
+  no token limit.
+- Accounting is reservation → settlement → release. A crash after reservation
+  and before settlement neither double-charges nor loses the reservation.
+  Resume grants no fresh capacity and replay never charges twice.
+
+## Boundary audit
+
+A contract may declare its observable write surface up front:
+
+```javascript
+export const meta = {
+  name: "chain",
+  contract: "workflow",
+  boundary: {
+    readPaths: ["."],
+    writePaths: ["./out"],
+    network: "allow",
+    environment: { allow: ["EVIDENCE"] },
+  },
+};
+```
+
+The host audits every command against this declaration and records the evidence
+in `boundary.jsonl`. An undeclared write, excess environment inheritance, or
+child permission widening is recorded as a violation and blocks success. This
+is an audit boundary, not an OS sandbox; it observes and records, it does not
+confine at the kernel level. The journal never stores credential values —
+secret bodies cross via allowlisted environment variables and are redacted in
+the journal.
+
+## Capability registry and routing
+
+A contract may declare explicit provider/model candidates and role
+requirements:
+
+```javascript
+capabilities: {
+  providers: [
+    { agent: "pi", model: "local", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 },
+  ],
+  roles: {
+    maker: { requires: ["reasoning"], effort: "high", contextTokens: 100000 },
+    reviewer: { requires: ["reasoning"], effort: "high", contextTokens: 100000 },
+  },
+},
+```
+
+Routing is capability based and explainable. An explicit provider/model choice
+is never silently replaced; an inadmissible choice fails before transport
+submission rather than probing a provider or manufacturing a fallback. Children
+inherit the declared candidate set and may only narrow it. Maker/checker
+independence is structural: the reviewer runs in a separate child run, so the
+maker's model choice is never a candidate in the reviewer's run.
+
+## Events and watch
+
+Every lifecycle transition, call, gate, budget movement, and boundary event is
+appended to a versioned, append-only `events.jsonl`. `watch` reconstructs the
+live tree view — status, active phases, budget/usage, waiting categories,
+critical path, and recovery commands — exclusively from those persisted events,
+with no in-memory state:
+
+```text
+servitor-workflows watch RUN_ID
+servitor-workflows --output jsonl watch RUN_ID
+```
+
+A killed-and-restarted controller rebuilds the identical tree from events and
+resumes from the first incomplete call. Malformed or torn event tails are
+rejected during reconstruction; only a final torn line is tolerated as a crash
+artifact.
+
+## Isolation
+
+Isolation levels are `none`, `worktree`, `process`, and explicitly requested
+`container`. Worktree isolation produces patch/commit evidence and is not a
+security sandbox. Cancellation leaves no task-owned child process. A child
+cannot weaken its parent's isolation.
+
 ## CLI
 
 ```text
@@ -195,6 +321,7 @@ servitor-workflows pause RUN_ID [--dry-run]
 servitor-workflows cancel RUN_ID --reason TEXT [--dry-run]
 servitor-workflows supersede RUN_ID --reason TEXT [--evidence PATH] [--new-contract TEXT] [--dry-run]
 servitor-workflows inspect RUN_ID
+servitor-workflows watch RUN_ID
 servitor-workflows schema
 ```
 
@@ -251,6 +378,9 @@ Each run owns:
 runs/<RUN_ID>/workflow.js
 runs/<RUN_ID>/state.json
 runs/<RUN_ID>/journal.jsonl
+runs/<RUN_ID>/events.jsonl
+runs/<RUN_ID>/budget.jsonl
+runs/<RUN_ID>/boundary.jsonl
 runs/<RUN_ID>/run-summary.html
 runs/<RUN_ID>/pause.request
 runs/<RUN_ID>/cancel.request
@@ -328,9 +458,14 @@ Real example:
 ```powershell
 servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\dynamic.workflow.js
 
-# Two-body negotiation canary (C6 script composition; see docs/multi-agent-negotiation.md)
+# Two-body negotiation canary (script composition; see docs/multi-agent-negotiation.md)
 servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\negotiate-2body.workflow.js `
   --args '{"topic":"pick a 30s local canary","maxRounds":2}'
+
+# Demand-to-delivery goalchain: readiness → dispatch → independent review child →
+# mechanical gate → human gate → semantic gate → writeback.
+servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\goalchain.workflow.js `
+  --args '{"contractPath":"contract.md","mechanicalTokens":["dual-gate","boundary-audit"]}'
 ```
 
 Pause/resume evidence uses the original run id:

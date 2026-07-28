@@ -1,4 +1,4 @@
-//! V2-H live observability: reconstruct a run tree, budget/usage, waiting
+//! Live observability: reconstruct a run tree, budget/usage, waiting
 //! categories, critical path, and recovery instructions exclusively from
 //! persisted artifacts (`state.json`, `events.jsonl`, `journal.jsonl`,
 //! `budget.jsonl`). No in-memory runtime state is consulted, so a fresh
@@ -10,7 +10,7 @@ use crate::store::WorkflowStore;
 use serde::Serialize;
 
 /// Where the view came from. Always persisted artifacts: the defining
-/// property of V2-H is that a restarted process sees the same tree.
+/// property of `watch` is that a restarted process sees the same tree.
 pub const WATCH_SOURCE: &str = "persisted_events";
 
 /// A full observability snapshot of one run and its child tree.
@@ -22,7 +22,7 @@ pub struct WatchView {
     pub status: RunStatus,
     pub source: &'static str,
     pub tree: WatchNode,
-    /// Aggregate root budget ledger (V2-B). `None` for v1 runs.
+    /// Aggregate root budget ledger. `None` for legacy runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetLedger>,
     /// Every node currently blocked, categorized.
@@ -86,7 +86,7 @@ pub fn reconstruct(
     let tree = build_node(store, run_id, &mut visited, &mut waiting, &mut recovery)?;
     let status = tree.status.clone();
 
-    let budget = (state.contract.as_deref() == Some("workflow.v2"))
+    let budget = crate::script::is_current_contract(state.contract.as_deref())
         .then(|| store.reconstruct_budget(&root_run_id))
         .transpose()?;
 

@@ -39,17 +39,16 @@ pub struct RunState {
     pub run_id: String,
     pub name: String,
     pub cwd: PathBuf,
-    /// Contract version string. `Some("workflow.v2")` for new v2 runs; `None`
-    /// for v1 runs (the frozen compatibility path). Drives whether the
+    /// Contract string. `Some("workflow")` for current runs; `None` for legacy
+    /// runs persisted before the contract field existed. Drives whether the
     /// versioned event stream is written.
     #[serde(default)]
     pub contract: Option<String>,
-    /// Parent run id for structured-concurrency children. `None` in V2-A;
-    /// foundation only, exercised by V2-C.
+    /// Parent run id for structured-concurrency children.
     #[serde(default)]
     pub parent_run_id: Option<String>,
     /// Stable root of a structured workflow tree. Root runs point to themselves;
-    /// v1 records omit it and remain readable.
+    /// legacy records omit it and remain readable.
     #[serde(default)]
     pub root_run_id: Option<String>,
     /// The deterministic parent workflow call which owns this child run.
@@ -57,14 +56,14 @@ pub struct RunState {
     pub parent_call_key: Option<String>,
     #[serde(default)]
     pub money_cap: Option<u64>,
-    /// V2-E audit-mode host boundary. V1 records omit it and preserve frozen
+    /// Audit-mode host boundary. Legacy records omit it and preserve frozen
     /// replay semantics.
     #[serde(default)]
     pub boundary: Option<crate::boundary::BoundaryPolicy>,
-    /// V2-G declared provider/model candidates and role contracts.
+    /// Declared provider/model candidates and role contracts.
     #[serde(default)]
     pub capabilities: Option<crate::capabilities::CapabilityPolicy>,
-    /// V2-F worktree identity. A child inherits its owning root worktree;
+    /// Worktree identity. A child inherits its owning root worktree;
     /// only the root finalizes lifecycle evidence.
     #[serde(default)]
     pub worktree: Option<WorktreeState>,
@@ -289,20 +288,18 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// V2-A: versioned append-only event stream + event-to-state reconstruction
+// Versioned append-only event stream + event-to-state reconstruction
 // ---------------------------------------------------------------------------
 
 /// Schema version stamped on every `WorkflowEventEnvelope`. Bumped only on a
-/// breaking change to the event shape. `workflow.v2` runs emit envelopes with
-/// this version; v1 runs never emit events (they keep the frozen journal path).
+/// breaking change to the event shape. Current runs emit envelopes with this
+/// version; legacy runs never emit events (they keep the frozen journal path).
 pub const EVENT_SCHEMA_VERSION: u32 = 2;
 
-/// Lifecycle event recorded to `events.jsonl` for `workflow.v2` runs. Call
-/// outcomes remain in `journal.jsonl` (the v1 call-event stream); the lifecycle
-/// stream here carries run-level transitions, phases, and gates so a run can
-/// be reconstructed without in-memory state. V2-A deliberately records only
-/// what the foundation needs; budgets, children, isolation, routing, and watch
-/// arrive in later slices.
+/// Lifecycle event recorded to `events.jsonl` for current runs. Call outcomes
+/// remain in `journal.jsonl` (the call-event stream); the lifecycle stream here
+/// carries run-level transitions, phases, and gates so a run can be
+/// reconstructed without in-memory state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowEvent {
@@ -369,8 +366,8 @@ pub enum WorkflowEvent {
 }
 
 /// One append-only line of `events.jsonl`. `sequence` is monotonic per run;
-/// `parent_run_id` is `None` in V2-A and exists so V2-C can grow the tree
-/// without reshaping the envelope.
+/// `parent_run_id` carries the owning parent for child runs and is `None` at
+/// the tree root.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowEventEnvelope {
     pub version: u32,
@@ -409,13 +406,14 @@ pub struct ReconstructedState {
 }
 
 // ---------------------------------------------------------------------------
-// V2-B: shared multidimensional budget ledger (budget.jsonl per run)
+// ---------------------------------------------------------------------------
+// Shared multidimensional budget ledger (budget.jsonl per run)
 // ---------------------------------------------------------------------------
 
 /// Schema version stamped on every `BudgetEnvelope`.
 pub const BUDGET_SCHEMA_VERSION: u32 = 1;
 
-/// Budget events recorded to `budget.jsonl` for `workflow.v2` runs. Each
+/// Budget events recorded to `budget.jsonl` for current runs. Each
 /// entry is idempotent by call `key` — reserve scans the existing ledger
 /// before writing so a crash after reservation never double-charges.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -442,8 +440,7 @@ pub enum BudgetEvent {
 }
 
 /// One append-only line of `budget.jsonl`. `owner_run_id` is the run whose
-/// ledger is charged (in V2-B this equals `run_id`; V2-C children write
-/// into their parent's ledger).
+/// ledger is charged; children write into their parent's ledger.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BudgetEnvelope {
     pub version: u32,

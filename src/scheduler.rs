@@ -88,17 +88,17 @@ pub struct RuntimeHost {
     /// Shared tree scheduler. Child orchestration itself runs outside this pool,
     /// so `maxParallel=1` cannot deadlock when the child invokes a host call.
     pub scheduler: Arc<Scheduler>,
-    /// `Some("workflow.v2")` for v2 runs; `None` for v1 runs. Host functions
-    /// use this to decide whether to append lifecycle events to the versioned
-    /// stream. V2-A only — children inherit via V2-C.
+    /// `Some("workflow")` for current runs; `None` for legacy runs. Host
+    /// functions use this to decide whether to append lifecycle events to the
+    /// versioned stream.
     pub contract: Option<String>,
     pub parent_run_id: Option<String>,
-    /// Declared V2-E audit boundary. Enforcement is at host-call boundaries,
+    /// Declared audit boundary. Enforcement is at host-call boundaries,
     /// not a claim that command processes are sandboxed.
     pub boundary: Option<BoundaryPolicy>,
-    /// V2-G provider/model candidates and role contracts.
+    /// Provider/model candidates and role contracts.
     pub capabilities: Option<CapabilityPolicy>,
-    /// Shared budget handle (V2-B+). `None` for v1 runs.
+    /// Shared budget handle. `None` for legacy runs.
     pub budget: Option<Budget>,
 }
 
@@ -107,7 +107,7 @@ impl RuntimeHost {
     where
         F: FnOnce(&mut crate::model::RunState),
     {
-        if self.contract.as_deref() != Some("workflow.v2") {
+        if !crate::script::is_current_contract(self.contract.as_deref()) {
             self.store
                 .update_state(&self.run_id, update)
                 .map_err(|error| error.to_string())?;
@@ -537,7 +537,7 @@ fn settle_budget(
         }
         return Err(result_error);
     }
-    // V2-B does not price calls yet. Agent token totals are already normalized
+    // Calls are not priced in money yet. Agent token totals are already normalized
     // into the durable journal by `agent::run`, so attribute them at settlement.
     let actual_tokens = store
         .journal_index(budget.run_id())

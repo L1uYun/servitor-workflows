@@ -199,8 +199,8 @@ impl HostState {
             }
         }
 
-        // V2-B: when a budget handle is present, gate through the durable
-        // budget.jsonl ledger; otherwise fall back to the v1 in-memory counter.
+        // When a budget handle is present, gate through the durable
+        // budget.jsonl ledger; otherwise fall back to the in-memory counter.
         if let Some(ref budget) = self.budget {
             let call_kind = match kind {
                 "agent" => CallKind::Agent,
@@ -293,26 +293,45 @@ pub fn parse_meta(script: &str) -> Result<Option<Value>, WorkflowError> {
     })
 }
 
+/// The contract string every workflow declares in `meta.contract`.
+pub const CURRENT_CONTRACT: &str = "workflow";
+
+/// A persisted alias kept only so runs created before the rename still resume.
+/// New runs can never carry this value; nothing writes it anymore.
+const LEGACY_CONTRACT_ALIAS: &str = "workflow.v2";
+
+/// Whether a persisted `contract` value selects the current runtime behavior
+/// (versioned event stream, shared budget, boundary audit, capability routing).
+/// Accepts the live contract string plus the one frozen alias so already-persisted
+/// runs resume unchanged; no state file is ever rewritten to drop the alias.
+pub fn is_current_contract(contract: Option<&str>) -> bool {
+    matches!(
+        contract,
+        Some(CURRENT_CONTRACT) | Some(LEGACY_CONTRACT_ALIAS)
+    )
+}
+
 /// Resolve the workflow contract from its `meta` declaration.
 ///
-/// - `Some("workflow.v2")` when `meta.contract` is the string `"workflow.v2"`;
-///   the run becomes a v2 run with the versioned event stream.
-/// - `None` when `meta` omits `contract` — the run stays on the frozen v1
-///   compatibility path (no event stream, journal-only replay).
-/// - `Err` when `contract` is present but not the string `"workflow.v2"`
-///   (null, number, bool, or any other string). New v2 runs must not accept
-///   missing or non-v2 contract metadata.
-pub fn contract_of(script: &str) -> Result<Option<String>, WorkflowError> {
+/// - `Ok("workflow")` when `meta.contract` is the string `"workflow"`.
+/// - `Err` when `meta` is absent, omits `contract`, or supplies any other value
+///   (null, number, bool, or any other string). Every new run must declare the
+///   contract explicitly.
+pub fn contract_of(script: &str) -> Result<String, WorkflowError> {
     let Some(meta) = parse_meta(script)? else {
-        return Ok(None);
+        return Err(WorkflowError::InvalidWorkflow(
+            "workflows must declare `meta.contract: \"workflow\"`".to_owned(),
+        ));
     };
     match meta.get("contract") {
-        None => Ok(None),
-        Some(Value::String(s)) if s == "workflow.v2" => Ok(Some(s.clone())),
+        Some(Value::String(s)) if s == CURRENT_CONTRACT => Ok(s.clone()),
         Some(other) => Err(WorkflowError::InvalidWorkflow(format!(
-            "unsupported workflow `contract` metadata: {} — expected the string \"workflow.v2\" or omit the field for a v1 run",
+            "unsupported workflow `contract` metadata: {} — expected the string \"workflow\"",
             summarize_contract(other)
         ))),
+        None => Err(WorkflowError::InvalidWorkflow(
+            "workflows must declare `meta.contract: \"workflow\"`".to_owned(),
+        )),
     }
 }
 

@@ -1,7 +1,7 @@
 export const meta = {
   name: "dynamic-real-chain",
   description: "Discover work, fan out, and summarize",
-  contract: "workflow.v2",
+  contract: "workflow",
 };
 
 phase("discover");

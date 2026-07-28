@@ -1,19 +1,19 @@
 export const meta = {
-  name: "goalchain-v2",
-  description: "Work-delivery chain migrated onto workflow.v2 runtime guarantees",
-  contract: "workflow.v2",
-  // V2-E boundary: the chain names its observable write surface up front; the
-  // host audits every command against it and records the evidence. This is an
-  // audit boundary, not an OS sandbox (see docs/workflow-v2-contract.md).
-  // network is "allow" because every agent() call is a transport submission,
-  // which the host audits as network use; the write surface stays ./out only.
+  name: "goalchain",
+  description: "Demand-to-delivery work chain with dual gates and independent review",
+  contract: "workflow",
+  // Boundary: the chain names its observable write surface up front; the host
+  // audits every command against it and records the evidence. This is an audit
+  // boundary, not an OS sandbox. network is "allow" because every agent() call
+  // is a transport submission, which the host audits as network use; the write
+  // surface stays ./out only.
   boundary: {
     readPaths: ["."],
     writePaths: ["./out"],
     network: "allow",
     environment: { allow: ["EVIDENCE"] },
   },
-  // V2-G capability registry: explicit candidates only. Routing never probes a
+  // Capability registry: explicit candidates only. Routing never probes a
   // provider or manufactures a silent fallback; an inadmissible choice fails
   // before transport submission. `reviewer` is declared here (and inherited by
   // the review child) so the independent-review contract is part of the policy;
@@ -38,36 +38,28 @@ export const meta = {
   },
 };
 
-// Migrated goalchain dispatcher. The v1 template (loop-engineering
-// templates/goalchain-dispatcher.js) hand-built recovery, schema handling, and
-// boundary fingerprinting in controller JavaScript. The v2 runtime now owns
-// those, so this chain keeps only the G1-G16 discipline that runtime guarantees
-// do not supersede:
+// Demand-to-delivery goalchain dispatcher. Envelope recovery, schema handling,
+// boundary fingerprinting, resume, and cost accounting are owned by the
+// workflow runtime; this chain keeps only the controller discipline the runtime
+// does not supersede:
 //
-//   dropped (runtime-guaranteed now):
-//     - manual envelope / format-recovery retry  -> agent schema + V2-D correction
-//     - no-tools body inlining (karma #474)      -> reviewer reads via host tools
-//     - scout before/after path fingerprinting   -> meta.boundary audit (V2-E)
-//     - hand-rolled resume / continue-as-new     -> journal replay + resume (V2-A)
-//     - manual cost accounting                   -> shared budget ledger (V2-B)
-//   kept (controller discipline, not a runtime guarantee):
-//     - G1  chain entry is instantiating this script per task
-//     - G3  every agent ends schema-valid JSON (the `schema` option enforces it)
-//     - G13 independent review as a child workflow, never self-review
-//     - G15 mechanical tokens bound to contract text and evidence keys
-//     - G16 `servitor-workflows check` before run
+//   - G1  chain entry is instantiating this script per task
+//   - G3  every agent ends schema-valid JSON (the `schema` option enforces it)
+//   - G13 independent review as a child workflow, never self-review
+//   - G15 mechanical tokens bound to contract text and evidence keys
+//   - G16 `servitor-workflows check` before run
 //
 // args:
 //   contractPath: string       confirmed contract the delivery must satisfy
 //   evidencePath: string       machine evidence file the chain produces
 //   mechanicalTokens: string[] tokens that must appear in contract + evidence
-//   reviewScript: string       independent reviewer child (default goalchain-v2-review.workflow.js)
+//   reviewScript: string       independent reviewer child (default goalchain-review.workflow.js)
 //   requireHumanGate: boolean  park for human acceptance before the semantic gate (default true)
 
 const contractPath = String((args && args.contractPath) || "contract.md");
 const evidencePath = String((args && args.evidencePath) || "./out/evidence.json");
 const mechanicalTokens = Array.isArray(args && args.mechanicalTokens) ? args.mechanicalTokens : [];
-const reviewScript = String((args && args.reviewScript) || "goalchain-v2-review.workflow.js");
+const reviewScript = String((args && args.reviewScript) || "goalchain-review.workflow.js");
 const requireHumanGate = !(args && args.requireHumanGate === false);
 
 // ---------------------------------------------------------------------------
@@ -96,9 +88,8 @@ if (readiness.exitCode !== 0 || readiness.timedOut) {
 phase("dispatch");
 // Bounded worker. One objective, one evidence class, explicit write boundary.
 // The schema option is the G3 contract: the final channel is schema-valid JSON
-// only. On an invalid first output the runtime runs V2-D schema correction
-// automatically — the manual format-recovery retry the v1 template carried is
-// gone because the runtime supersedes it.
+// only. On an invalid first output the runtime runs schema correction
+// automatically.
 const workerSchema = {
   type: "object",
   required: ["summary", "evidence"],
@@ -119,8 +110,8 @@ const worker = await agent(
 // passed via the EVIDENCE environment variable (declared in the boundary
 // allowlist), never interpolated into the script text, so quoting in the
 // evidence cannot break the command; the value is redacted in the journal. The
-// command is audited against meta.boundary (V2-E): a write outside ./out would
-// be recorded as a violation and block success.
+// command is audited against meta.boundary: a write outside ./out would be
+// recorded as a violation and block success.
 const writeEvidence = await command("pwsh", [
   "-NoProfile", "-Command",
   "$ErrorActionPreference='Stop';" +
@@ -202,8 +193,7 @@ if (requireHumanGate) {
 phase("semantic-gate");
 // The second half of the dual gate: an independent reviewer judges meaning, not
 // identifiers. It reads through host tools (no body inlining) and returns a
-// schema-valid verdict. Runtime schema handling supersedes the v1 template's
-// manual VERDICT-line retry.
+// schema-valid verdict.
 const semanticSchema = {
   type: "object",
   required: ["approved", "rationale"],
@@ -230,7 +220,7 @@ phase("writeback");
 // Liber Null writeback and the reader-facing report stay controller-owned; this
 // run returns the evidence the controller needs to close the item.
 return {
-  protocol: "goalchain.v2",
+  protocol: "goalchain",
   contractPath,
   evidencePath,
   mechanicalTokens,
