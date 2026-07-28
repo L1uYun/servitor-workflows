@@ -53,8 +53,8 @@ impl Transport for ServitorTransport {
 pub struct AgentOptions {
     #[serde(default)]
     pub label: Option<String>,
-    #[serde(default = "default_agent")]
-    pub agent: String,
+    #[serde(default)]
+    pub agent: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -67,10 +67,12 @@ pub struct AgentOptions {
     pub native_args: Vec<String>,
     #[serde(default)]
     pub schema: Option<Value>,
-}
-
-fn default_agent() -> String {
-    "pi".to_owned()
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub effort: Option<crate::capabilities::Effort>,
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
 }
 
 pub(crate) struct AgentCall {
@@ -469,7 +471,7 @@ fn submit(
 ) -> Result<servitor::SubmitResponse, String> {
     transport
         .submit(SubmitRequest {
-            agent: options.agent.clone(),
+            agent: options.agent.clone().unwrap_or_else(|| "pi".to_owned()),
             model: options.model.clone(),
             input: Input::Text { text },
             cwd: resolve_cwd(default_cwd, options.cwd.as_deref()),

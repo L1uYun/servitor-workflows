@@ -3,6 +3,10 @@ use crate::boundary::{
     BoundaryEvent, BoundaryPolicy, IsolationLevel, ensure_child_narrows, resolve_policy,
 };
 use crate::budget::Budget;
+use crate::capabilities::{
+    CapabilityEvent, CapabilityPolicy, ensure_child_narrows as ensure_child_capabilities_narrow,
+    validate_policy as validate_capability_policy,
+};
 use crate::error::WorkflowError;
 use crate::model::{CallState, GateDecision, PublicRun, RunState, RunStatus, WorkflowEvent};
 use crate::run_summary;
@@ -52,6 +56,7 @@ impl Engine {
         })?;
         let contract = validate_script(&source)?;
         let child_boundary = parse_meta_boundary(&source)?;
+        let child_capabilities = parse_meta_capabilities(&source)?;
         ensure_supported_isolation(&source)?;
         let cwd = path
             .parent()
@@ -73,6 +78,13 @@ impl Engine {
                 .map_err(WorkflowError::InvalidWorkflow)?;
         }
         let child_boundary = child_boundary.or_else(|| parent.boundary.clone());
+        if let (Some(parent_capabilities), Some(child_capabilities)) =
+            (parent.capabilities.as_ref(), child_capabilities.as_ref())
+        {
+            ensure_child_capabilities_narrow(parent_capabilities, child_capabilities)
+                .map_err(WorkflowError::InvalidWorkflow)?;
+        }
+        let child_capabilities = child_capabilities.or_else(|| parent.capabilities.clone());
         let worktree = parent.worktree.clone();
         let cwd = worktree
             .as_ref()
@@ -140,6 +152,7 @@ impl Engine {
             parent_call_key: Some(parent_call_key.to_owned()),
             money_cap: parent.money_cap,
             boundary: child_boundary.clone(),
+            capabilities: child_capabilities.clone(),
             worktree,
             status: RunStatus::Running,
             created_at: now,
@@ -172,6 +185,10 @@ impl Engine {
                     policy,
                 },
             )?;
+        }
+        if let Some(policy) = state.capabilities.clone() {
+            self.store
+                .append_capability_event(&state.run_id, CapabilityEvent::Declared { policy })?;
         }
         self.store.append_event(
             &state.run_id,
@@ -264,6 +281,7 @@ impl Engine {
         // resumed from their persisted state and never pass through prepare().
         let contract = validate_script(&script)?;
         let declared_boundary = parse_meta_boundary(&script)?;
+        let capabilities = parse_meta_capabilities(&script)?;
         ensure_supported_isolation(&script)?;
         let version = 2;
         let cwd = path
@@ -326,6 +344,7 @@ impl Engine {
             parent_call_key: None,
             money_cap,
             boundary,
+            capabilities: capabilities.clone(),
             worktree,
             resume_count: 0,
             phase: None,
@@ -343,6 +362,10 @@ impl Engine {
         if let Some(policy) = state.boundary.clone() {
             self.store
                 .append_boundary_event(&state.run_id, BoundaryEvent::Declared { policy })?;
+        }
+        if let Some(policy) = state.capabilities.clone() {
+            self.store
+                .append_capability_event(&state.run_id, CapabilityEvent::Declared { policy })?;
         }
         if state.contract.as_deref() == Some("workflow.v2") {
             self.store.append_event(
@@ -570,6 +593,7 @@ impl Engine {
         })?;
         validate_script(&script)?;
         parse_meta_boundary(&script)?;
+        parse_meta_capabilities(&script)?;
         ensure_supported_isolation(&script)?;
         Ok(serde_json::json!({
             "check": "ok",
@@ -666,6 +690,14 @@ impl Engine {
             .as_ref()
             .map(|_| self.store.read_boundary_events(run_id))
             .transpose()?;
+        let capabilities_path = state
+            .capabilities
+            .is_some()
+            .then(|| self.store.capabilities_path(run_id));
+        let capability_events = capabilities_path
+            .as_ref()
+            .map(|_| self.store.read_capability_events(run_id))
+            .transpose()?;
         Ok(Inspection {
             state,
             script_path: self.store.script_path(run_id),
@@ -675,6 +707,8 @@ impl Engine {
             budget,
             boundary_path,
             boundary_events,
+            capabilities_path,
+            capability_events,
             run_summary_path: self.store.run_summary_path(run_id),
         })
     }
@@ -825,6 +859,7 @@ impl Engine {
             contract: initial.contract.clone(),
             parent_run_id: initial.parent_run_id.clone(),
             boundary: initial.boundary.clone(),
+            capabilities: initial.capabilities.clone(),
             budget,
         });
         let result = script::execute(runtime, &source, &initial.args, initial.max_calls);
@@ -1028,6 +1063,10 @@ pub struct Inspection {
     pub boundary_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boundary_events: Option<Vec<crate::boundary::BoundaryEnvelope>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_events: Option<Vec<crate::capabilities::CapabilityEnvelope>>,
     pub run_summary_path: PathBuf,
 }
 
@@ -1090,6 +1129,20 @@ fn parse_meta_boundary(script: &str) -> Result<Option<BoundaryPolicy>, WorkflowE
         .map_err(|error| {
             WorkflowError::InvalidWorkflow(format!("meta.boundary is invalid: {error}"))
         })
+}
+
+fn parse_meta_capabilities(script: &str) -> Result<Option<CapabilityPolicy>, WorkflowError> {
+    let Some(meta) = script::parse_meta(script)? else {
+        return Ok(None);
+    };
+    let Some(value) = meta.get("capabilities") else {
+        return Ok(None);
+    };
+    let policy: CapabilityPolicy = serde_json::from_value(value.clone()).map_err(|error| {
+        WorkflowError::InvalidWorkflow(format!("meta.capabilities is invalid: {error}"))
+    })?;
+    validate_capability_policy(&policy).map_err(WorkflowError::InvalidWorkflow)?;
+    Ok(Some(policy))
 }
 
 fn ensure_supported_isolation(script: &str) -> Result<(), WorkflowError> {

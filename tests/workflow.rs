@@ -6,8 +6,8 @@ use servitor::{
     SubmitResponse,
 };
 use servitor_workflows::{
-    BoundaryEvent, BudgetEvent, CallKind, CallState, Engine, JournalEntry, NetworkPolicy, RunState,
-    RunStatus, Transport, WorkflowStore,
+    BoundaryEvent, BudgetEvent, CallKind, CallState, CapabilityEvent, Engine, JournalEntry,
+    NetworkPolicy, RunState, RunStatus, Transport, WorkflowStore,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -231,6 +231,7 @@ fn legacy_state(store: &WorkflowStore, path: &Path, status: RunStatus) -> RunSta
         parent_call_key: None,
         money_cap: None,
         boundary: None,
+        capabilities: None,
         worktree: None,
         status,
         created_at: now,
@@ -537,6 +538,54 @@ fn child_boundary_narrows_and_is_audited() {
             .map(|event| &event.event),
         Some(BoundaryEvent::Declared { .. })
     ));
+}
+
+#[test]
+fn child_capability_policy_cannot_weaken_parent_requirements() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-capability-child-narrow");
+    fs::write(
+        temp.path().join("child-capability.js"),
+        r#"export const meta = {
+          name: "child",
+          contract: "workflow.v2",
+          capabilities: {
+            providers: [{ agent: "claude", model: "claude-opus-5", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 }],
+            roles: { reviewer: { requires: ["reasoning"], effort: "medium", contextTokens: 64000 } }
+          }
+        }; return true;"#,
+    )
+    .expect("write child");
+    let parent = temp.path().join("parent-capability.js");
+    fs::write(
+        &parent,
+        r#"export const meta = {
+          name: "parent",
+          contract: "workflow.v2",
+          capabilities: {
+            providers: [{ agent: "claude", model: "claude-opus-5", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 }],
+            roles: { reviewer: { requires: ["reasoning"], effort: "high", contextTokens: 100000 } }
+          }
+        }; return await workflow("child-capability.js");"#,
+    )
+    .expect("write parent");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&parent, Value::Null, 1, 2)
+        .expect("terminal parent");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("weakens parent")
+    );
+    assert!(
+        WorkflowStore::new(&root)
+            .child_run_ids(&state.run_id)
+            .expect("children")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -3428,6 +3477,178 @@ fn argless_new_date_throws_and_explicit_date_survives() {
     assert_eq!(result["parsed"], json!(1577934245000i64));
     assert_eq!(result["utc"], json!(1577923200000i64));
     assert_eq!(result["inst"], true);
+}
+
+#[test]
+fn capability_routing_preserves_pinned_provider_and_model() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = temp.path().join("pinned-capability.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "pinned capability",
+          contract: "workflow.v2",
+          capabilities: {
+            providers: [
+              { agent: "claude", model: "claude-opus-5", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 },
+              { agent: "pi", model: "fallback", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 }
+            ],
+            roles: { maker: { requires: ["reasoning"], effort: "high", contextTokens: 100000 } }
+          }
+        };
+        return await agent("pinned", { agent: "claude", model: "claude-opus-5", role: "maker" });"#,
+    )
+    .expect("write script");
+    let state = engine(&temp.path().join("state"), Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let requests = transport.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].agent, "claude");
+    assert_eq!(requests[0].model.as_deref(), Some("claude-opus-5"));
+    drop(requests);
+    let events = WorkflowStore::new(temp.path().join("state"))
+        .read_capability_events(&state.run_id)
+        .expect("capability events");
+    assert!(matches!(
+        events.first().map(|event| &event.event),
+        Some(CapabilityEvent::Declared { .. })
+    ));
+    assert!(
+        matches!(events.get(1).map(|event| &event.event), Some(CapabilityEvent::Selected { requested: Some(requested), chosen, .. }) if requested.agent == "claude" && requested.model.as_deref() == Some("claude-opus-5") && chosen == requested)
+    );
+}
+
+#[test]
+fn missing_capability_fails_before_transport_submission() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = temp.path().join("missing-capability.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "missing capability",
+          contract: "workflow.v2",
+          capabilities: {
+            providers: [{ agent: "pi", capabilities: ["text"], maxEffort: "medium", contextTokens: 32000 }],
+            roles: { reviewer: { requires: ["vision"], effort: "high", contextTokens: 64000 } }
+          }
+        };
+        return await agent("must not submit", { role: "reviewer" });"#,
+    )
+    .expect("write script");
+    let state = engine(&temp.path().join("state"), Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("terminal state");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing capability for call")
+    );
+    assert_eq!(
+        transport.count(),
+        0,
+        "routing failure must precede transport"
+    );
+}
+
+#[test]
+fn automatic_capability_degradation_records_exclusions() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = temp.path().join("degraded-capability.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "degraded capability",
+          contract: "workflow.v2",
+          capabilities: {
+            providers: [
+              { agent: "pi", model: "small", capabilities: ["text"], maxEffort: "low", contextTokens: 16000 },
+              { agent: "claude", model: "claude-sonnet-5", capabilities: ["text"], maxEffort: "high", contextTokens: 200000 }
+            ],
+            roles: { analyst: { requires: ["text"], effort: "high", contextTokens: 100000 } }
+          }
+        };
+        return await agent("route automatically", { role: "analyst" });"#,
+    )
+    .expect("write script");
+    let state = engine(&temp.path().join("state"), Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let events = WorkflowStore::new(temp.path().join("state"))
+        .read_capability_events(&state.run_id)
+        .expect("capability events");
+    assert!(
+        events.iter().any(|event| {
+            matches!(&event.event, CapabilityEvent::Selected { requested: None, chosen, excluded, degradation: Some(message), .. } if chosen.agent == "claude" && chosen.model.as_deref() == Some("claude-sonnet-5") && excluded.len() == 1 && message.contains("claude/claude-sonnet-5"))
+        })
+    );
+}
+
+#[test]
+fn independent_roles_cannot_share_the_same_model_choice() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let path = temp.path().join("independent-capability.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "independent capability",
+          contract: "workflow.v2",
+          capabilities: {
+            providers: [{ agent: "claude", model: "claude-opus-5", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 }],
+            roles: {
+              maker: { requires: ["reasoning"] },
+              reviewer: { requires: ["reasoning"], independentFrom: ["maker"] }
+            }
+          }
+        };
+        const maker = await agent("make", { role: "maker" });
+        return await agent("review", { role: "reviewer" });"#,
+    )
+    .expect("write script");
+    let state = engine(&temp.path().join("state"), Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("terminal state");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("must be independent")
+    );
+    assert_eq!(
+        transport.count(),
+        1,
+        "reviewer must be rejected before submission"
+    );
+    let events = WorkflowStore::new(temp.path().join("state"))
+        .read_capability_events(&state.run_id)
+        .expect("capability events");
+    assert!(
+        matches!(events.last().map(|event| &event.event), Some(CapabilityEvent::IndependenceViolation { role, conflict_role, .. }) if role == "reviewer" && conflict_role == "maker")
+    );
+    let resumed = engine(&temp.path().join("state"), Arc::clone(&transport))
+        .resume(&state.run_id)
+        .expect("resume failed run");
+    assert_eq!(resumed.status, RunStatus::Failed);
+    assert_eq!(transport.count(), 1, "resume must not submit reviewer");
+    let resumed_events = WorkflowStore::new(temp.path().join("state"))
+        .read_capability_events(&state.run_id)
+        .expect("capability events after resume");
+    assert_eq!(
+        resumed_events.len(),
+        events.len(),
+        "resume must not duplicate routing evidence"
+    );
 }
 
 #[test]

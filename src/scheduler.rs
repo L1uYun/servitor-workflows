@@ -5,6 +5,7 @@ use crate::boundary::{
     validate_command_environment,
 };
 use crate::budget::Budget;
+use crate::capabilities::{CapabilityPolicy, ModelChoice, resolve as resolve_capability};
 use crate::command::{CommandCall, CommandOptions};
 use crate::model::{ActiveCall, CallKind, CallState, JournalEntry, WorkflowEvent};
 use crate::store::WorkflowStore;
@@ -95,6 +96,8 @@ pub struct RuntimeHost {
     /// Declared V2-E audit boundary. Enforcement is at host-call boundaries,
     /// not a claim that command processes are sandboxed.
     pub boundary: Option<BoundaryPolicy>,
+    /// V2-G provider/model candidates and role contracts.
+    pub capabilities: Option<CapabilityPolicy>,
     /// Shared budget handle (V2-B+). `None` for v1 runs.
     pub budget: Option<Budget>,
 }
@@ -123,7 +126,7 @@ impl RuntimeHost {
         options: AgentOptions,
         phase: Option<String>,
     ) -> oneshot::Receiver<JobResult> {
-        let call = AgentCall::new(key, prompt, options, phase);
+        let mut call = AgentCall::new(key, prompt, options, phase);
         let active_key = call.key.clone();
         let active_label = call.label.clone();
         let agent_cwd = call.options.cwd.clone();
@@ -132,6 +135,7 @@ impl RuntimeHost {
         let store = Arc::clone(&self.store);
         let transport = Arc::clone(&self.transport);
         let boundary = self.boundary.clone();
+        let capabilities = self.capabilities.clone();
         let budget = self.budget.clone();
         self.scheduler.submit(move || {
             let result = with_active(
@@ -148,6 +152,17 @@ impl RuntimeHost {
                         && entry.state == CallState::Succeeded
                     {
                         return Ok(entry.result.clone().unwrap_or(Value::Null));
+                    }
+                    if let Some(policy) = capabilities.as_ref() {
+                        let ModelChoice { agent, model } = resolve_capability(
+                            &store,
+                            &run_id,
+                            &active_key,
+                            policy,
+                            &call.options,
+                        )?;
+                        call.options.agent = Some(agent);
+                        call.options.model = model;
                     }
                     let resolved_cwd = agent_cwd
                         .as_deref()

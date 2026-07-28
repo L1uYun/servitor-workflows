@@ -61,6 +61,9 @@ pub struct RunState {
     /// replay semantics.
     #[serde(default)]
     pub boundary: Option<crate::boundary::BoundaryPolicy>,
+    /// V2-G declared provider/model candidates and role contracts.
+    #[serde(default)]
+    pub capabilities: Option<crate::capabilities::CapabilityPolicy>,
     /// V2-F worktree identity. A child inherits its owning root worktree;
     /// only the root finalizes lifecycle evidence.
     #[serde(default)]

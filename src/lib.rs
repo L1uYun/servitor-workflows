@@ -1,6 +1,7 @@
 mod agent;
 mod boundary;
 mod budget;
+mod capabilities;
 mod command;
 mod engine;
 mod error;
@@ -19,6 +20,10 @@ pub use boundary::{
     NetworkPolicy,
 };
 pub use budget::Budget;
+pub use capabilities::{
+    CAPABILITY_SCHEMA_VERSION, CapabilityEnvelope, CapabilityEvent, CapabilityPolicy, Effort,
+    ModelChoice, ProviderCapability, RoleContract,
+};
 pub use engine::{Engine, Inspection};
 pub use error::{ErrorPayload, WorkflowError};
 pub use model::{
