@@ -73,21 +73,20 @@ Offline proof: `cargo test negotiate_two_body_reaches_accept_after_revise` in th
 
 ## Goalchain embedding (一条龙)
 
-Negotiation is an **internal** step of loop-engineering 	emplates/goalchain-dispatcher.js, not a parallel product.
+Negotiation is an **optional internal** step of the loop-engineering goalchain
+(`templates/goalchain.workflow.js`), added to a task instance only when the
+contract needs it — not a parallel product.
 
 Outer sequential shell:
 
-`	ext
-readiness → scout? → negotiate? → dispatch → review-gate → verification → semantic-gate → release? → writeback
+```text
+readiness → scout? → negotiate? → dispatch → review-gate → verification → human-gate? → semantic-gate → release? → writeback
 → (controller) neat-freak Closure after human final acceptance
-`
+```
 
-- CONFIG.negotiation.topic empty/null → negotiate skipped (behavior-preserving).
+- `args.negotiation.topic` empty/null → negotiate skipped (behavior-preserving).
 - topic set → multi-body propose/review/synth; decision written to decisionPath (default <scratch>/negotiation-decision.json).
-- 
-equireAccept default true: ccepted=false fails the chain (
-egotiate-gate / supersede → Grill), does not silently implement.
+- `requireAccept` default true: `accepted=false` fails the chain (negotiate-gate / supersede → Grill), does not silently implement.
 - Worker prompt receives the decision path; implement follows it, does not re-litigate without new evidence.
-- CONFIG.release.commands optional post dual-gate install/blue-green/skills-sync; empty skips.
+- `args.release.commands` optional post dual-gate install/blue-green/skills-sync; empty skips.
 - neat-freak is **not** a workflow phase; controller runs Closure after acceptance.
-
