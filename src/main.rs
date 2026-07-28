@@ -40,6 +40,9 @@ enum OutputMode {
     Json,
     Human,
     Quiet,
+    /// One JSON object per line (JSONL). Used by `watch` to stream the
+    /// reconstructed view; other commands treat it like `json`.
+    Jsonl,
 }
 
 #[derive(Subcommand)]
@@ -116,6 +119,11 @@ enum Command {
         dry_run: bool,
     },
     Inspect {
+        run_id: String,
+    },
+    /// Reconstruct a live tree view (status, budget/usage, waiting categories,
+    /// critical path, recovery) exclusively from persisted events.
+    Watch {
         run_id: String,
     },
     Schema,
@@ -342,6 +350,9 @@ fn main() {
             }
         }
         Command::Inspect { run_id } => engine.inspect(&run_id).and_then(to_value),
+        Command::Watch { run_id } => {
+            servitor_workflows::reconstruct_watch(engine.store(), &run_id).and_then(to_value)
+        }
         Command::Schema => Ok(schema_value()),
         Command::Completions { shell } => {
             emit_completions(shell);
@@ -566,7 +577,7 @@ fn schema_value() -> Value {
             }
         },
         "commands": [
-            "run", "check", "resume", "get", "list", "approve", "reject", "pause", "cancel", "supersede", "inspect", "schema", "completions"
+            "run", "check", "resume", "get", "list", "approve", "reject", "pause", "cancel", "supersede", "inspect", "watch", "schema", "completions"
         ],
         "public_run": {
             "run_id": "string",
@@ -586,6 +597,8 @@ fn schema_value() -> Value {
             "servitor-workflows get RUN_ID --wait --timeout-seconds 300",
             "servitor-workflows list --limit 20 --status failed",
             "servitor-workflows cancel RUN_ID --reason 'why' --dry-run",
+            "servitor-workflows watch RUN_ID",
+            "servitor-workflows --output jsonl watch RUN_ID",
             "servitor-workflows schema",
             "servitor-workflows completions powershell"
         ]
@@ -596,6 +609,12 @@ fn emit(envelope: &Envelope, mode: OutputMode) -> Result<(), WorkflowError> {
     match mode {
         OutputMode::Quiet => Ok(()),
         OutputMode::Json => emit_json(envelope),
+        OutputMode::Jsonl => {
+            // JSONL: one compact JSON object per line. The record IS the full
+            // envelope (ok/data/meta/error) so the schema contract holds for
+            // every command; consumers read `.data` for the payload.
+            emit_json(envelope)
+        }
         OutputMode::Human => {
             if let Some(data) = envelope.data.as_ref() {
                 println!("{}", human(data));

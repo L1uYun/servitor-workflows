@@ -3866,3 +3866,264 @@ fn check_rejects_syntax_errors_and_module_only_syntax_without_creating_runs() {
         "refused scripts must not leave run directories"
     );
 }
+
+#[test]
+fn watch_reconstructs_tree_and_critical_path_from_persisted_events() {
+    use servitor_workflows::reconstruct_watch;
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let _grandchild = script(
+        &temp,
+        "watch-grandchild.js",
+        r#"
+        const decision = await gate("continue?", { label: "child gate" });
+        return { approved: decision.approved };
+    "#,
+    );
+    let _child = script(
+        &temp,
+        "watch-child.js",
+        r#"
+        return await workflow("watch-grandchild.js");
+    "#,
+    );
+    let root = script(
+        &temp,
+        "watch-root.js",
+        r#"
+        return await workflow("watch-child.js");
+    "#,
+    );
+    let root_dir = temp.path().join("state");
+    let eng = engine(&root_dir, Arc::clone(&transport));
+    let waiting = eng
+        .start(&root, Value::Null, 1, 10)
+        .expect("reach bubbled gate");
+    assert_eq!(
+        waiting.status,
+        RunStatus::WaitingHuman,
+        "{:?}",
+        waiting.error
+    );
+    let root_run_id = waiting.run_id.clone();
+
+    // A brand-new store over the same root simulates a killed-and-restarted
+    // CLI process: no in-memory runtime state survives, only persisted events.
+    let restarted = WorkflowStore::new(&root_dir);
+    let view = reconstruct_watch(&restarted, &root_run_id).expect("watch reconstructs");
+
+    assert_eq!(view.source, "persisted_events");
+    assert_eq!(view.status, RunStatus::WaitingHuman);
+    assert_eq!(view.root_run_id, root_run_id);
+
+    // Tree: root -> child -> grandchild, each reconstructed with a category.
+    // A bubbled gate leaves every ancestor in WaitingHuman (the gate request
+    // is recorded on each, with origin pointing at the grandchild).
+    assert_eq!(view.tree.run_id, root_run_id);
+    assert_eq!(view.tree.category, "waiting_human");
+    assert_eq!(view.tree.children.len(), 1, "root has one child workflow");
+    let child = &view.tree.children[0];
+    assert_eq!(child.status, RunStatus::WaitingHuman);
+    assert_eq!(child.category, "waiting_human");
+    assert_eq!(child.children.len(), 1, "child has one grandchild workflow");
+    let grandchild = &child.children[0];
+    assert_eq!(grandchild.status, RunStatus::WaitingHuman);
+    assert_eq!(grandchild.category, "waiting_human");
+
+    // Critical path descends to the deepest non-terminal branch (the gate).
+    assert_eq!(view.critical_path.len(), 3);
+    assert_eq!(view.critical_path[0], root_run_id);
+    assert_eq!(view.critical_path[2], grandchild.run_id);
+
+    // Waiting categories surface every blocked node; the gate decision is
+    // routed to its origin (the grandchild), not the bubbled ancestors.
+    assert!(
+        view.waiting
+            .iter()
+            .any(|entry| entry.category == "waiting_human" && entry.run_id == grandchild.run_id),
+        "gate node must be categorized waiting_human: {:?}",
+        view.waiting
+    );
+    let recovery = view
+        .recovery
+        .iter()
+        .find(|step| step.command.contains("approve"))
+        .expect("gate recovery step");
+    assert!(
+        recovery.command.contains(&grandchild.run_id),
+        "approval must target the gate origin: {}",
+        recovery.command
+    );
+}
+
+#[test]
+fn watch_after_restart_matches_live_reconstruction_and_jsonl_output() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let _grandchild = script(
+        &temp,
+        "watch2-grandchild.js",
+        r#"
+        const decision = await gate("continue?", { label: "child gate" });
+        return { approved: decision.approved };
+    "#,
+    );
+    let _child = script(
+        &temp,
+        "watch2-child.js",
+        r#"
+        return await workflow("watch2-grandchild.js");
+    "#,
+    );
+    let root = script(
+        &temp,
+        "watch2-root.js",
+        r#"
+        return await workflow("watch2-child.js");
+    "#,
+    );
+    let root_dir = temp.path().join("state");
+    let eng = engine(&root_dir, Arc::clone(&transport));
+    let waiting = eng
+        .start(&root, Value::Null, 1, 10)
+        .expect("reach bubbled gate");
+    let root_run_id = waiting.run_id.clone();
+
+    // Live in-process reconstruction.
+    let live =
+        servitor_workflows::reconstruct_watch(eng.store(), &root_run_id).expect("live watch");
+
+    // Restarted-process reconstruction via the real CLI binary over the same
+    // state root: this is the acceptance test — a fresh process rebuilds the
+    // identical tree and critical path exclusively from persisted events.
+    let output = cli(&root_dir, &["watch", &root_run_id]);
+    assert!(output.status.success(), "watch CLI failed");
+    let restarted = cli_json(&output)["data"].clone();
+
+    let live_value = serde_json::to_value(&live).expect("serialize live view");
+    assert_eq!(
+        restarted["tree"], live_value["tree"],
+        "restarted CLI tree must equal live reconstruction"
+    );
+    assert_eq!(
+        restarted["criticalPath"], live_value["criticalPath"],
+        "restarted CLI critical path must equal live reconstruction"
+    );
+    assert_eq!(restarted["source"], "persisted_events");
+
+    // JSONL output streams one envelope per line; the schema contract (ok/meta
+    // present) holds even in jsonl mode, and `.data` carries the view.
+    let jsonl = cli(&root_dir, &["--output", "jsonl", "watch", &root_run_id]);
+    assert!(jsonl.status.success(), "watch --output jsonl failed");
+    let lines: Vec<Value> = String::from_utf8_lossy(&jsonl.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("jsonl line"))
+        .collect();
+    assert_eq!(lines.len(), 1, "watch emits exactly one JSONL record");
+    assert_eq!(
+        lines[0]["ok"], true,
+        "jsonl record keeps the envelope contract"
+    );
+    assert_eq!(lines[0]["data"]["tree"], live_value["tree"]);
+    assert_eq!(lines[0]["data"]["criticalPath"], live_value["criticalPath"]);
+}
+
+#[test]
+fn watch_reports_failed_recovery_and_budget_usage() {
+    use servitor_workflows::reconstruct_watch;
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let root = script(
+        &temp,
+        "watch-fail.js",
+        r#"
+        await agent("WATCH_FAIL");
+        throw new Error("boom");
+    "#,
+    );
+    let root_dir = temp.path().join("state");
+    let eng = engine(&root_dir, Arc::clone(&transport));
+    let failed = eng
+        .start(&root, Value::Null, 1, 10)
+        .expect("start returns state");
+    assert_eq!(failed.status, RunStatus::Failed, "{:?}", failed.error);
+
+    // The run record persists even though execution failed; a restarted
+    // process finds it by listing the state root.
+    let restarted = WorkflowStore::new(&root_dir);
+    let ids = restarted.list_run_ids().expect("list runs");
+    assert_eq!(ids.len(), 1);
+    let view = reconstruct_watch(&restarted, &ids[0]).expect("watch failed run");
+
+    assert_eq!(view.status, RunStatus::Failed);
+    assert_eq!(view.tree.category, "failed");
+    assert!(
+        view.recovery
+            .iter()
+            .any(|step| step.command.contains("resume") && step.run_id == ids[0]),
+        "failed run must offer a resume recovery step: {:?}",
+        view.recovery
+    );
+    // Budget/usage is reconstructed from budget.jsonl; the agent call settled.
+    let budget = view.budget.expect("v2 run has a budget ledger");
+    assert!(budget.attributed_tokens > 0, "usage tokens attributed");
+}
+
+#[test]
+fn watch_reports_true_status_for_v1_run_without_event_stream() {
+    use servitor_workflows::reconstruct_watch;
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-v1-watch");
+    let store = WorkflowStore::new(&root);
+    let path = temp.path().join("legacy-watch.js");
+    fs::write(&path, "return true;").expect("write legacy script");
+    // A v1 run has no events.jsonl; watch must not silently report "running".
+    let state = legacy_state(&store, &path, RunStatus::Cancelled);
+    store
+        .create_run(&state, "return true;")
+        .expect("persist legacy run");
+
+    let view = reconstruct_watch(&store, &state.run_id).expect("watch v1 run");
+    assert_eq!(
+        view.status,
+        RunStatus::Cancelled,
+        "v1 watch must reflect the persisted status, not a hardcoded running"
+    );
+    assert_eq!(view.tree.category, "cancelled");
+    assert!(view.budget.is_none(), "v1 run has no budget ledger");
+}
+
+#[test]
+fn watch_rejects_corrupted_parent_child_cycle_instead_of_crashing() {
+    use servitor_workflows::reconstruct_watch;
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-cycle-watch");
+    let store = WorkflowStore::new(&root);
+    let path = temp.path().join("cycle.js");
+    fs::write(&path, "return true;").expect("write script");
+
+    // Hand-corrupt two records into a parent/child cycle. The engine can never
+    // produce this (depth + digest checks), but persisted state is the trust
+    // boundary for watch, so it must error, not overflow the stack.
+    let mut a = legacy_state(&store, &path, RunStatus::Running);
+    a.run_id = "cycle-a".to_owned();
+    a.parent_run_id = Some("cycle-b".to_owned());
+    a.journal_path = store.journal_path("cycle-a");
+    let mut b = legacy_state(&store, &path, RunStatus::Running);
+    b.run_id = "cycle-b".to_owned();
+    b.parent_run_id = Some("cycle-a".to_owned());
+    b.journal_path = store.journal_path("cycle-b");
+    store
+        .create_run(&a, "return true;")
+        .expect("persist cycle-a");
+    store
+        .create_run(&b, "return true;")
+        .expect("persist cycle-b");
+
+    let err = reconstruct_watch(&store, "cycle-a").expect_err("cycle must be rejected");
+    assert!(
+        matches!(err, servitor_workflows::WorkflowError::Invariant(_)),
+        "expected Invariant cycle error, got {err:?}"
+    );
+}

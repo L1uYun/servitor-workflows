@@ -824,6 +824,9 @@ impl WorkflowStore {
         let events = self.read_events(run_id)?;
         let journal = self.journal_index(run_id)?;
 
+        // Seed from the persisted state so v1 runs (which have no event
+        // stream) reconstruct their true status. For v2 runs the `RunStarted`
+        // lifecycle event overwrites this immediately, so behavior is unchanged.
         let mut rs = ReconstructedState {
             version: state.version,
             contract: state.contract.clone(),
@@ -833,15 +836,15 @@ impl WorkflowStore {
             max_parallel: state.max_parallel,
             max_calls: state.max_calls,
             money_cap: state.money_cap,
-            status: RunStatus::Running,
-            phase: None,
+            status: state.status.clone(),
+            phase: state.phase.clone(),
             active: BTreeMap::new(),
-            waiting_gate: None,
-            supersede: None,
+            waiting_gate: state.waiting_gate.clone(),
+            supersede: state.supersede.clone(),
             decisions: BTreeMap::new(),
-            result: None,
-            error: None,
-            resume_count: 0,
+            result: state.result.clone(),
+            error: state.error.clone(),
+            resume_count: state.resume_count,
             call_count: journal.len(),
         };
 

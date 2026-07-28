@@ -13,6 +13,7 @@ mod run_summary;
 mod scheduler;
 mod script;
 mod store;
+mod watch;
 
 pub use agent::{ServitorTransport, Transport};
 pub use boundary::{
@@ -31,6 +32,7 @@ pub use model::{
     ReconstructedState, RunState, RunStatus, WorkflowEvent, WorkflowEventEnvelope,
 };
 pub use store::WorkflowStore;
+pub use watch::{Recovery, WaitingEntry, WatchNode, WatchView, reconstruct as reconstruct_watch};
 
 pub fn default_engine() -> Engine {
     Engine::new(

@@ -205,7 +205,7 @@ fn format_duration(ms: Option<u64>) -> String {
     }
 }
 
-fn usage_tokens(usage: Option<&Value>) -> Option<u64> {
+pub fn usage_tokens(usage: Option<&Value>) -> Option<u64> {
     let usage = usage?.as_object()?;
     for key in ["total_tokens", "totalTokens", "total"] {
         if let Some(total) = usage.get(key).and_then(Value::as_u64) {
