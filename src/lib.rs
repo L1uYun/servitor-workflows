@@ -1,4 +1,5 @@
 mod agent;
+mod boundary;
 mod budget;
 mod command;
 mod engine;
@@ -11,6 +12,9 @@ mod script;
 mod store;
 
 pub use agent::{ServitorTransport, Transport};
+pub use boundary::{
+    BoundaryEnvelope, BoundaryEvent, BoundaryPolicy, EnvironmentPolicy, NetworkPolicy,
+};
 pub use budget::Budget;
 pub use engine::{Engine, Inspection};
 pub use error::{ErrorPayload, WorkflowError};

@@ -127,9 +127,7 @@ impl Budget {
 /// Returns `None` when the cost is zero or money tracking is disabled (i.e.
 /// `money_cap` is `None`).
 fn cost_estimate(_kind: &CallKind, _input: &Value, money_cap: Option<u64>) -> Option<u64> {
-    if money_cap.is_none() {
-        return None;
-    }
+    money_cap?;
     // V2-G: wire real cost estimates per kind / model / input size.
     // For now, every call costs zero — only call-count gating applies.
     Some(0)

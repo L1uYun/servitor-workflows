@@ -25,6 +25,10 @@ pub struct CommandOptions {
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Declaration of network use by this command. Audit mode can reject a
+    /// declared network operation when the workflow boundary denies it.
+    #[serde(default)]
+    pub network: bool,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
 }
@@ -32,9 +36,9 @@ pub struct CommandOptions {
 pub(crate) struct CommandCall {
     pub key: String,
     pub label: String,
-    program: String,
-    args: Vec<String>,
-    options: CommandOptions,
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) options: CommandOptions,
     pub phase: Option<String>,
 }
 
@@ -84,6 +88,8 @@ pub(crate) fn run(
     run_id: &str,
     default_cwd: &Path,
     call: CommandCall,
+    clear_inherited_environment: bool,
+    redacted_values: &[String],
 ) -> JobResult {
     let CommandCall {
         key,
@@ -125,6 +131,9 @@ pub(crate) fn run(
         .chain(args.iter().cloned())
         .collect();
     let mut command = Command::new(&program);
+    if clear_inherited_environment {
+        command.env_clear();
+    }
     command
         .args(&args)
         .envs(&options.env)
@@ -168,6 +177,8 @@ pub(crate) fn run(
     let duration_ms = started.elapsed().as_millis() as u64;
     let (stdout, stdout_truncated) = read_tail(&stdout_path).map_err(|error| error.to_string())?;
     let (stderr, stderr_truncated) = read_tail(&stderr_path).map_err(|error| error.to_string())?;
+    let stdout = redact_values(stdout, redacted_values);
+    let stderr = redact_values(stderr, redacted_values);
     let result = CommandResult {
         argv,
         cwd: resolved_cwd,
@@ -290,6 +301,15 @@ fn resolve_cwd(default: &Path, requested: Option<&Path>) -> PathBuf {
         Some(path) => default.join(path),
         None => default.to_path_buf(),
     }
+}
+
+fn redact_values(mut output: String, values: &[String]) -> String {
+    for value in values {
+        if !value.is_empty() {
+            output = output.replace(value, "[REDACTED]");
+        }
+    }
+    output
 }
 
 fn read_tail(path: &Path) -> Result<(String, bool), WorkflowError> {

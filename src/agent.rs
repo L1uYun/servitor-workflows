@@ -77,7 +77,7 @@ pub(crate) struct AgentCall {
     pub key: String,
     pub label: String,
     prompt: String,
-    options: AgentOptions,
+    pub(crate) options: AgentOptions,
     pub phase: Option<String>,
 }
 

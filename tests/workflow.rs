@@ -6,8 +6,8 @@ use servitor::{
     SubmitResponse,
 };
 use servitor_workflows::{
-    BudgetEvent, CallKind, CallState, Engine, JournalEntry, RunState, RunStatus, Transport,
-    WorkflowStore,
+    BoundaryEvent, BudgetEvent, CallKind, CallState, Engine, JournalEntry, NetworkPolicy, RunState,
+    RunStatus, Transport, WorkflowStore,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -230,6 +230,7 @@ fn legacy_state(store: &WorkflowStore, path: &Path, status: RunStatus) -> RunSta
         root_run_id: None,
         parent_call_key: None,
         money_cap: None,
+        boundary: None,
         status,
         created_at: now,
         updated_at: now,
@@ -248,6 +249,490 @@ fn legacy_state(store: &WorkflowStore, path: &Path, status: RunStatus) -> RunSta
         run_summary: None,
         journal_path: store.journal_path(&run_id),
     }
+}
+
+#[test]
+fn boundary_metadata_is_checked_and_persisted() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-declared");
+    let path = temp.path().join("boundary.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "boundary",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], writePaths: ["./out"], network: "allow", environment: { allow: ["SAFE_VAR"] } }
+        }; return { done: true };"#,
+    )
+    .expect("write script");
+    let engine = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)));
+    engine.check(&path).expect("check valid boundary");
+    let state = engine.start(&path, Value::Null, 1, 1).expect("run");
+    let events = WorkflowStore::new(&root)
+        .read_boundary_events(&state.run_id)
+        .expect("read boundary events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].sequence, 1);
+    assert_eq!(events[0].run_id, state.run_id);
+    assert!(matches!(events[0].event, BoundaryEvent::Declared { .. }));
+}
+
+#[test]
+fn check_rejects_invalid_boundary_metadata() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("invalid-boundary.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "invalid",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], unexpected: true }
+        }; return true;"#,
+    )
+    .expect("write script");
+    let error = engine(
+        &temp.path().join("state-invalid-boundary"),
+        Arc::new(FakeTransport::new(Duration::ZERO)),
+    )
+    .check(&path)
+    .expect_err("reject invalid boundary");
+    assert!(error.to_string().contains("meta.boundary is invalid"));
+}
+
+#[test]
+fn boundary_rejects_undeclared_environment_without_persisting_values() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-env");
+    let path = temp.path().join("boundary-env.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "boundary-env",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], network: "deny", environment: { allow: ["SAFE_VAR"] } }
+        };
+        return await command("cmd", ["/C", "exit 0"], { env: { SAFE_VAR: "safe-value", TOKEN: "secret-value" } });"#,
+    )
+    .expect("write script");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("environment variable is not declared: TOKEN")
+    );
+    let boundary = fs::read_to_string(WorkflowStore::new(&root).boundary_path(&state.run_id))
+        .expect("boundary audit");
+    assert!(boundary.contains("TOKEN"));
+    assert!(!boundary.contains("secret-value"));
+    assert!(!boundary.contains("safe-value"));
+}
+
+#[test]
+fn boundary_rejects_declared_network_when_denied() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-network");
+    let path = temp.path().join("boundary-network.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "boundary-network",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], network: "deny" }
+        };
+        return await command("cmd", ["/C", "exit 0"], { network: true });"#,
+    )
+    .expect("write script");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("network policy denies it")
+    );
+}
+
+#[test]
+fn child_boundary_narrows_and_is_audited() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-child-narrow");
+    fs::create_dir(temp.path().join("sub")).expect("create child directory");
+    fs::write(
+        temp.path().join("child-narrow.js"),
+        r#"export const meta = {
+          name: "child",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["./sub"], network: "deny", environment: { allow: ["SAFE_VAR"] } }
+        }; return true;"#,
+    )
+    .expect("write child");
+    let parent = temp.path().join("parent-narrow.js");
+    fs::write(
+        &parent,
+        r#"export const meta = {
+          name: "parent",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], network: "allow", environment: { allow: ["SAFE_VAR", "PARENT_ONLY"] } }
+        }; return await workflow("child-narrow.js");"#,
+    )
+    .expect("write parent");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&parent, Value::Null, 1, 2)
+        .expect("run parent");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let store = WorkflowStore::new(&root);
+    let child_id = store
+        .child_run_ids(&state.run_id)
+        .expect("children")
+        .into_iter()
+        .next()
+        .expect("child");
+    let child = store.load_state(&child_id).expect("child state");
+    assert_eq!(
+        child.boundary.as_ref().expect("child boundary").network,
+        NetworkPolicy::Deny
+    );
+    assert!(
+        store
+            .read_boundary_events(&state.run_id)
+            .expect("parent boundary events")
+            .iter()
+            .any(|event| matches!(event.event, BoundaryEvent::ChildDeclared { .. }))
+    );
+    assert!(matches!(
+        store
+            .read_boundary_events(&child_id)
+            .expect("child boundary events")
+            .first()
+            .map(|event| &event.event),
+        Some(BoundaryEvent::Declared { .. })
+    ));
+}
+
+#[test]
+fn boundary_failure_releases_budget_reservation() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-release");
+    let path = temp.path().join("boundary-release.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "boundary-release",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], network: "deny" }
+        };
+        return await command("cmd", ["/C", "exit 0"], { network: true });"#,
+    )
+    .expect("write script");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Failed);
+    let budget = WorkflowStore::new(&root)
+        .read_budget_events(&state.run_id)
+        .expect("read budget events");
+    assert!(matches!(budget[0].event, BudgetEvent::Reserved { .. }));
+    assert!(matches!(budget[1].event, BudgetEvent::Released { .. }));
+}
+
+#[test]
+fn child_boundary_cannot_widen_parent_network_policy() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-child");
+    fs::write(
+        temp.path().join("child.js"),
+        r#"export const meta = {
+          name: "child",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], network: "allow" }
+        }; return true;"#,
+    )
+    .expect("write child");
+    let parent = temp.path().join("parent.js");
+    fs::write(
+        &parent,
+        r#"export const meta = {
+          name: "parent",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], network: "deny" }
+        }; return await workflow("child.js");"#,
+    )
+    .expect("write parent");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&parent, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("child network policy widens parent boundary")
+    );
+    assert!(
+        WorkflowStore::new(&root)
+            .child_run_ids(&state.run_id)
+            .expect("children")
+            .is_empty()
+    );
+}
+
+#[test]
+fn boundary_command_clears_inherited_environment() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-inheritance");
+    let path = temp.path().join("boundary-inheritance.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "boundary-inheritance",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], network: "deny", environment: { allow: ["SAFE_VAR"] } }
+        };
+        return await command("cmd", ["/D", "/C", "if defined PATH exit /b 7"], { env: { SAFE_VAR: "declared" } });"#,
+    )
+    .expect("write script");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+}
+
+#[test]
+fn boundary_snapshots_declared_writes_and_git_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-snapshot");
+    let path = temp.path().join("boundary-snapshot.js");
+    fs::create_dir(temp.path().join("allowed")).expect("create allowed output");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "boundary-snapshot",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], writePaths: ["./allowed"], network: "deny" }
+        };
+        return await command("cmd", ["/D", "/C", "echo recorded>allowed\\output.txt"]);"#,
+    )
+    .expect("write script");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let events = WorkflowStore::new(&root)
+        .read_boundary_events(&state.run_id)
+        .expect("boundary audit");
+    let file_snapshot = events.iter().find_map(|event| match &event.event {
+        BoundaryEvent::FileSnapshot { before, after, .. } => Some((before, after)),
+        _ => None,
+    });
+    let (before, after) = file_snapshot.expect("file snapshot");
+    assert!(
+        before
+            .files
+            .iter()
+            .all(|entry| !entry.path.ends_with("output.txt"))
+    );
+    assert!(
+        after
+            .files
+            .iter()
+            .any(|entry| entry.path.ends_with("output.txt"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, BoundaryEvent::GitSnapshot { .. }))
+    );
+}
+
+#[test]
+fn boundary_blocks_observed_write_outside_declared_paths() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-write-violation");
+    let path = temp.path().join("boundary-write-violation.js");
+    fs::create_dir(temp.path().join("allowed")).expect("create allowed output");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "boundary-write-violation",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], writePaths: ["./allowed"], network: "deny" }
+        };
+        return await command("cmd", ["/D", "/C", "echo blocked>undeclared.txt"]);"#,
+    )
+    .expect("write script");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("observed write outside declared writePaths")
+    );
+    let events = WorkflowStore::new(&root)
+        .read_boundary_events(&state.run_id)
+        .expect("boundary audit");
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        BoundaryEvent::FileSnapshot { after, .. }
+            if after.observed_undeclared_writes.iter().any(|path| path.ends_with("undeclared.txt"))
+    )));
+    let budget = WorkflowStore::new(&root)
+        .read_budget_events(&state.run_id)
+        .expect("budget audit");
+    assert!(matches!(budget[0].event, BudgetEvent::Reserved { .. }));
+    assert!(matches!(budget[1].event, BudgetEvent::Settled { .. }));
+}
+
+#[test]
+fn boundary_blocks_observed_deletion_outside_declared_paths() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-delete-violation");
+    let path = temp.path().join("boundary-delete-violation.js");
+    fs::write(temp.path().join("undeclared.txt"), "before").expect("write input");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "boundary-delete-violation",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], network: "deny" }
+        };
+        return await command("cmd", ["/D", "/C", "del undeclared.txt"]);"#,
+    )
+    .expect("write script");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Failed);
+    let events = WorkflowStore::new(&root)
+        .read_boundary_events(&state.run_id)
+        .expect("boundary audit");
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        BoundaryEvent::FileSnapshot { after, .. }
+            if after.observed_undeclared_writes.iter().any(|path| path.ends_with("undeclared.txt"))
+    )));
+}
+
+#[test]
+fn boundary_resume_does_not_duplicate_completed_call_audit() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-resume");
+    let path = temp.path().join("boundary-resume.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "boundary-resume",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], network: "deny" }
+        };
+        return await command("cmd", ["/D", "/C", "exit 0"]);"#,
+    )
+    .expect("write script");
+    let runtime = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)));
+    let state = runtime
+        .start(&path, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let store = WorkflowStore::new(&root);
+    let before = store
+        .read_boundary_events(&state.run_id)
+        .expect("initial audit")
+        .len();
+    let resumed = runtime.resume(&state.run_id).expect("resume workflow");
+    assert_eq!(resumed.status, RunStatus::Succeeded, "{:?}", resumed.error);
+    assert_eq!(
+        store
+            .read_boundary_events(&state.run_id)
+            .expect("resumed audit")
+            .len(),
+        before
+    );
+}
+
+#[test]
+fn boundary_redacts_explicit_environment_values_from_command_journal() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-redaction");
+    let path = temp.path().join("boundary-redaction.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "boundary-redaction",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], network: "deny", environment: { allow: ["TOKEN"] } }
+        };
+        return await command("cmd", ["/D", "/C", "echo %TOKEN%"], { env: { TOKEN: "secret-value" } });"#,
+    )
+    .expect("write script");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let journal =
+        fs::read_to_string(WorkflowStore::new(&root).journal_path(&state.run_id)).expect("journal");
+    assert!(!journal.contains("secret-value"));
+    assert!(journal.contains("[REDACTED]"));
+}
+
+#[test]
+fn boundary_violation_caught_by_script_still_blocks_success() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-boundary-caught-violation");
+    let path = temp.path().join("boundary-caught-violation.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "boundary-caught-violation",
+          contract: "workflow.v2",
+          boundary: { readPaths: ["."], network: "deny", environment: { allow: [] } }
+        };
+        try {
+          await command("cmd", ["/D", "/C", "exit 0"], { env: { TOKEN: "secret-value" } });
+        } catch (_) {}
+        return { done: true };"#,
+    )
+    .expect("write script");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 2)
+        .expect("terminal workflow");
+    assert_eq!(state.status, RunStatus::Failed);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("boundary violation blocked success")
+    );
+}
+
+#[test]
+fn v1_resume_does_not_create_boundary_audit() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-v1-boundary");
+    let store = WorkflowStore::new(&root);
+    let path = temp.path().join("legacy.js");
+    fs::write(&path, "return true;").expect("write legacy script");
+    let state = legacy_state(&store, &path, RunStatus::Succeeded);
+    store
+        .create_run(&state, "return true;")
+        .expect("persist legacy run");
+    let resumed = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .resume(&state.run_id)
+        .expect("resume legacy run");
+    assert_eq!(resumed.status, RunStatus::Succeeded);
+    assert!(!store.boundary_path(&state.run_id).exists());
 }
 
 #[test]
@@ -1900,17 +2385,17 @@ fn workflow_pause_propagates_and_resume_replays_child_tree() {
 fn wait_for_root_run(root: &Path) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Ok(entries) = fs::read_dir(root.join("runs")) {
-            if let Some(run_id) = entries.flatten().find_map(|entry| {
+        if let Ok(entries) = fs::read_dir(root.join("runs"))
+            && let Some(run_id) = entries.flatten().find_map(|entry| {
                 let run_id = entry.file_name().to_string_lossy().into_owned();
                 WorkflowStore::new(root)
                     .load_state(&run_id)
                     .ok()
                     .filter(|state| state.parent_run_id.is_none())
                     .map(|_| run_id)
-            }) {
-                return run_id;
-            }
+            })
+        {
+            return run_id;
         }
         assert!(Instant::now() < deadline, "root run was not created");
         thread::sleep(Duration::from_millis(20));
@@ -1943,17 +2428,17 @@ fn cancelling_root_propagates_to_active_child() {
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     let root_run_id = loop {
-        if let Ok(entries) = fs::read_dir(root_dir.join("runs")) {
-            if let Some(run_id) = entries.flatten().find_map(|entry| {
+        if let Ok(entries) = fs::read_dir(root_dir.join("runs"))
+            && let Some(run_id) = entries.flatten().find_map(|entry| {
                 let run_id = entry.file_name().to_string_lossy().into_owned();
                 WorkflowStore::new(&root_dir)
                     .load_state(&run_id)
                     .ok()
                     .filter(|state| state.parent_run_id.is_none())
                     .map(|_| run_id)
-            }) {
-                break run_id;
-            }
+            })
+        {
+            break run_id;
         }
         assert!(Instant::now() < deadline, "root run was not created");
         thread::sleep(Duration::from_millis(20));
@@ -2270,7 +2755,7 @@ fn workflow_cycle_is_rejected_before_child_dispatch() {
         state.error
     );
     assert!(
-        WorkflowStore::new(&temp.path().join("state"))
+        WorkflowStore::new(temp.path().join("state"))
             .child_run_ids(&state.run_id)
             .expect("children")
             .is_empty()

@@ -1,18 +1,25 @@
 use crate::agent::{AgentCall, AgentOptions, Transport};
+use crate::boundary::{
+    BoundaryEvent, BoundaryPolicy, NetworkEvidenceSource, ensure_command_policy,
+    observed_undeclared_writes, snapshot_git, snapshot_observable_files,
+    validate_command_environment,
+};
 use crate::budget::Budget;
 use crate::command::{CommandCall, CommandOptions};
-use crate::model::{ActiveCall, CallKind, WorkflowEvent};
+use crate::model::{ActiveCall, CallKind, CallState, JournalEntry, WorkflowEvent};
 use crate::store::WorkflowStore;
 use chrono::Utc;
 use futures_channel::oneshot;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::thread;
 
 pub(crate) type JobResult = Result<Value, String>;
 type Job = Box<dyn FnOnce() + Send + 'static>;
+
+static BOUNDARY_SNAPSHOT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 pub struct Scheduler {
     sender: mpsc::Sender<Job>,
@@ -74,6 +81,9 @@ pub struct RuntimeHost {
     /// stream. V2-A only — children inherit via V2-C.
     pub contract: Option<String>,
     pub parent_run_id: Option<String>,
+    /// Declared V2-E audit boundary. Enforcement is at host-call boundaries,
+    /// not a claim that command processes are sandboxed.
+    pub boundary: Option<BoundaryPolicy>,
     /// Shared budget handle (V2-B+). `None` for v1 runs.
     pub budget: Option<Budget>,
 }
@@ -105,10 +115,12 @@ impl RuntimeHost {
         let call = AgentCall::new(key, prompt, options, phase);
         let active_key = call.key.clone();
         let active_label = call.label.clone();
+        let agent_cwd = call.options.cwd.clone();
         let run_id = self.run_id.clone();
         let cwd = self.cwd.clone();
         let store = Arc::clone(&self.store);
         let transport = Arc::clone(&self.transport);
+        let boundary = self.boundary.clone();
         let budget = self.budget.clone();
         self.scheduler.submit(move || {
             let result = with_active(
@@ -117,7 +129,35 @@ impl RuntimeHost {
                 &active_key,
                 CallKind::Agent,
                 &active_label,
-                || crate::agent::run(&store, transport.as_ref(), &run_id, &cwd, call),
+                || {
+                    if let Some(entry) = store
+                        .journal_index(&run_id)
+                        .map_err(|error| error.to_string())?
+                        .get(&active_key)
+                        && entry.state == CallState::Succeeded
+                    {
+                        return Ok(entry.result.clone().unwrap_or(Value::Null));
+                    }
+                    let resolved_cwd = agent_cwd
+                        .as_deref()
+                        .filter(|path| path.is_absolute())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            agent_cwd
+                                .as_deref()
+                                .map(|path| cwd.join(path))
+                                .unwrap_or_else(|| cwd.clone())
+                        });
+                    audit_agent_boundary(
+                        &store,
+                        &run_id,
+                        &active_key,
+                        boundary.as_ref(),
+                        &resolved_cwd,
+                        true,
+                    )?;
+                    crate::agent::run(&store, transport.as_ref(), &run_id, &cwd, call)
+                },
             );
             settle_budget(budget.as_ref(), &store, &active_key, result)
         })
@@ -137,6 +177,7 @@ impl RuntimeHost {
         let run_id = self.run_id.clone();
         let cwd = self.cwd.clone();
         let store = Arc::clone(&self.store);
+        let boundary = self.boundary.clone();
         let budget = self.budget.clone();
         self.scheduler.submit(move || {
             let result = with_active(
@@ -145,11 +186,266 @@ impl RuntimeHost {
                 &active_key,
                 CallKind::Command,
                 &active_label,
-                || crate::command::run(&store, &run_id, &cwd, call),
+                || {
+                    let resolved_cwd = call
+                        .options
+                        .cwd
+                        .as_deref()
+                        .filter(|path| path.is_absolute())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            call.options
+                                .cwd
+                                .as_deref()
+                                .map(|path| cwd.join(path))
+                                .unwrap_or_else(|| cwd.clone())
+                        });
+                    if let Some(entry) = store
+                        .journal_index(&run_id)
+                        .map_err(|error| error.to_string())?
+                        .get(&active_key)
+                        && entry.state == CallState::Succeeded
+                    {
+                        return Ok(entry.result.clone().unwrap_or(Value::Null));
+                    }
+                    audit_command_boundary(
+                        &store,
+                        &run_id,
+                        &active_key,
+                        boundary.as_ref(),
+                        &call,
+                        &resolved_cwd,
+                    )?;
+                    let redacted_values = boundary
+                        .as_ref()
+                        .map(|_| call.options.env.values().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    if boundary.is_none() {
+                        return crate::command::run(
+                            &store,
+                            &run_id,
+                            &cwd,
+                            call,
+                            false,
+                            &redacted_values,
+                        );
+                    }
+                    let _snapshot_guard = BOUNDARY_SNAPSHOT_LOCK
+                        .lock()
+                        .map_err(|_| "boundary snapshot lock poisoned".to_owned())?;
+                    let before_files = snapshot_observable_files(
+                        boundary.as_ref().expect("checked boundary presence"),
+                    )?;
+                    let before_git = snapshot_git(&resolved_cwd);
+                    let result =
+                        crate::command::run(&store, &run_id, &cwd, call, true, &redacted_values);
+                    audit_command_snapshots(
+                        &store,
+                        &run_id,
+                        &active_key,
+                        boundary.as_ref().expect("checked boundary presence"),
+                        before_files,
+                        before_git,
+                        &store.run_dir(&run_id),
+                    )?;
+                    result
+                },
             );
             settle_budget(budget.as_ref(), &store, &active_key, result)
         })
     }
+}
+
+fn audit_agent_boundary(
+    store: &WorkflowStore,
+    run_id: &str,
+    key: &str,
+    boundary: Option<&BoundaryPolicy>,
+    cwd: &std::path::Path,
+    network: bool,
+) -> JobResult {
+    let Some(boundary) = boundary else {
+        return Ok(Value::Null);
+    };
+    if let Err(error) = ensure_command_policy(boundary, cwd, network) {
+        record_boundary_violation(store, run_id, key, CallKind::Agent, &error, true)?;
+        return Err(error);
+    }
+    store
+        .append_boundary_event(
+            run_id,
+            BoundaryEvent::AgentObserved {
+                key: key.to_owned(),
+                cwd: cwd.to_path_buf(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    store
+        .append_boundary_event(
+            run_id,
+            BoundaryEvent::NetworkObserved {
+                key: key.to_owned(),
+                declared: true,
+                source: NetworkEvidenceSource::AgentTransport,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(Value::Null)
+}
+
+fn audit_command_boundary(
+    store: &WorkflowStore,
+    run_id: &str,
+    key: &str,
+    boundary: Option<&BoundaryPolicy>,
+    call: &CommandCall,
+    cwd: &std::path::Path,
+) -> JobResult {
+    let Some(boundary) = boundary else {
+        return Ok(Value::Null);
+    };
+    let checked = ensure_command_policy(boundary, cwd, call.options.network)
+        .and_then(|_| validate_command_environment(boundary, &call.options.env));
+    let names = match checked {
+        Ok(names) => names,
+        Err(error) => {
+            record_boundary_violation(store, run_id, key, CallKind::Command, &error, true)?;
+            return Err(error);
+        }
+    };
+    store
+        .append_boundary_event(
+            run_id,
+            BoundaryEvent::CommandObserved {
+                key: key.to_owned(),
+                program: call.program.clone(),
+                cwd: cwd.to_path_buf(),
+                environment: names,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    store
+        .append_boundary_event(
+            run_id,
+            BoundaryEvent::NetworkObserved {
+                key: key.to_owned(),
+                declared: call.options.network,
+                source: NetworkEvidenceSource::CommandDeclaration,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(Value::Null)
+}
+
+fn audit_command_snapshots(
+    store: &WorkflowStore,
+    run_id: &str,
+    key: &str,
+    boundary: &BoundaryPolicy,
+    before_files: crate::boundary::FileSnapshot,
+    before_git: crate::boundary::GitSnapshot,
+    run_dir: &std::path::Path,
+) -> JobResult {
+    let mut after_files = snapshot_observable_files(boundary)?;
+    after_files.observed_undeclared_writes =
+        observed_undeclared_writes(&before_files, &after_files, boundary)
+            .into_iter()
+            .filter(|path| !path_is_within(path, run_dir))
+            .collect();
+    let violation = after_files.observed_undeclared_writes.first().map(|path| {
+        format!(
+            "observed write outside declared writePaths: {}",
+            path.display()
+        )
+    });
+    let after_git = snapshot_git(&before_git.cwd);
+    store
+        .append_boundary_event(
+            run_id,
+            BoundaryEvent::FileSnapshot {
+                key: key.to_owned(),
+                before: before_files,
+                after: after_files,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    store
+        .append_boundary_event(
+            run_id,
+            BoundaryEvent::GitSnapshot {
+                key: Some(key.to_owned()),
+                before: before_git,
+                after: after_git,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    if let Some(message) = violation {
+        record_boundary_violation(store, run_id, key, CallKind::Command, &message, false)?;
+        return Err(message);
+    }
+    Ok(Value::Null)
+}
+
+fn path_is_within(path: &std::path::Path, root: &std::path::Path) -> bool {
+    fn normalized(path: &std::path::Path) -> String {
+        path.as_os_str()
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .trim_start_matches(r"\??\")
+            .to_ascii_lowercase()
+    }
+    let path_text = normalized(path);
+    let root_text = normalized(root);
+    if std::path::Path::new(&path_text).starts_with(std::path::Path::new(&root_text)) {
+        return true;
+    }
+    let (Ok(path), Ok(root)) = (path.canonicalize(), root.canonicalize()) else {
+        return false;
+    };
+    let path_text = normalized(&path);
+    let root_text = normalized(&root);
+    std::path::Path::new(&path_text).starts_with(std::path::Path::new(&root_text))
+}
+
+fn record_boundary_violation(
+    store: &WorkflowStore,
+    run_id: &str,
+    key: &str,
+    kind: CallKind,
+    message: &str,
+    journal_failure: bool,
+) -> Result<(), String> {
+    if journal_failure {
+        store
+            .append(
+                run_id,
+                &JournalEntry {
+                    at: Utc::now(),
+                    key: key.to_owned(),
+                    kind,
+                    state: CallState::Failed,
+                    label: key.to_owned(),
+                    result: None,
+                    error: Some(message.to_owned()),
+                    transport_run_id: None,
+                    child_run_id: None,
+                    phase: None,
+                    duration_ms: None,
+                    usage: None,
+                    schema_correction: None,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    store
+        .append_boundary_event(
+            run_id,
+            BoundaryEvent::Violation {
+                key: Some(key.to_owned()),
+                message: message.to_owned(),
+            },
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn settle_budget(
@@ -161,10 +457,44 @@ fn settle_budget(
     let Some(budget) = budget else {
         return result;
     };
+    if let Err(result_error) = result {
+        let succeeded = store
+            .journal_index(budget.run_id())
+            .ok()
+            .and_then(|journal| {
+                journal
+                    .get(key)
+                    .map(|entry| entry.state == CallState::Succeeded)
+            })
+            .unwrap_or(false);
+        if succeeded {
+            let actual_tokens = store
+                .journal_index(budget.run_id())
+                .ok()
+                .and_then(|journal| {
+                    journal
+                        .get(key)
+                        .and_then(|entry| usage_tokens(entry.usage.as_ref()))
+                })
+                .unwrap_or(0);
+            return match budget.settle(key, None, actual_tokens) {
+                Ok(()) => Err(result_error),
+                Err(error) => Err(format!(
+                    "{result_error}; budget settlement failed after completed call: {error}"
+                )),
+            };
+        }
+        if let Err(error) = budget.release(key, "host call failed") {
+            return Err(format!(
+                "{result_error}; budget release failed after failed call: {error}"
+            ));
+        }
+        return Err(result_error);
+    }
     // V2-B does not price calls yet. Agent token totals are already normalized
     // into the durable journal by `agent::run`, so attribute them at settlement.
     let actual_tokens = store
-        .journal_index(&budget.run_id())
+        .journal_index(budget.run_id())
         .ok()
         .and_then(|journal| {
             journal

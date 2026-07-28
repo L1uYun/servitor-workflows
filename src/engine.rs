@@ -1,4 +1,5 @@
 use crate::agent::Transport;
+use crate::boundary::{BoundaryEvent, BoundaryPolicy, ensure_child_narrows, resolve_policy};
 use crate::budget::Budget;
 use crate::error::WorkflowError;
 use crate::model::{CallState, GateDecision, PublicRun, RunState, RunStatus, WorkflowEvent};
@@ -48,6 +49,7 @@ impl Engine {
             source,
         })?;
         let contract = validate_script(&source)?;
+        let child_boundary = parse_meta_boundary(&source)?;
         let cwd = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -56,6 +58,18 @@ impl Engine {
                 path: path.to_path_buf(),
                 source,
             })?;
+        let child_boundary = child_boundary
+            .as_ref()
+            .map(|policy| resolve_policy(policy, &cwd))
+            .transpose()
+            .map_err(WorkflowError::InvalidWorkflow)?;
+        if let (Some(parent_boundary), Some(child_boundary)) =
+            (parent.boundary.as_ref(), child_boundary.as_ref())
+        {
+            ensure_child_narrows(parent_boundary, child_boundary)
+                .map_err(WorkflowError::InvalidWorkflow)?;
+        }
+        let child_boundary = child_boundary.or_else(|| parent.boundary.clone());
         let root_run_id = parent
             .root_run_id
             .clone()
@@ -117,6 +131,7 @@ impl Engine {
             root_run_id: Some(root_run_id),
             parent_call_key: Some(parent_call_key.to_owned()),
             money_cap: parent.money_cap,
+            boundary: child_boundary.clone(),
             status: RunStatus::Running,
             created_at: now,
             updated_at: now,
@@ -136,6 +151,19 @@ impl Engine {
             journal_path: self.store.journal_path(&run_id),
         };
         self.store.create_run(&state, &source)?;
+        if let Some(policy) = state.boundary.clone() {
+            self.store
+                .append_boundary_event(&state.run_id, BoundaryEvent::Declared { policy })?;
+        }
+        if let Some(policy) = state.boundary.clone() {
+            self.store.append_boundary_event(
+                parent_run_id,
+                BoundaryEvent::ChildDeclared {
+                    key: parent_call_key.to_owned(),
+                    policy,
+                },
+            )?;
+        }
         self.store.append_event(
             &state.run_id,
             Some(parent_run_id),
@@ -226,6 +254,7 @@ impl Engine {
         // New runs must opt into the v2 contract explicitly. Legacy v1 runs are
         // resumed from their persisted state and never pass through prepare().
         let contract = validate_script(&script)?;
+        let declared_boundary = parse_meta_boundary(&script)?;
         let version = 2;
         let cwd = path
             .parent()
@@ -238,6 +267,11 @@ impl Engine {
         let money_cap = contract
             .as_ref()
             .and_then(|_| parse_meta_money_cap(&script));
+        let boundary = declared_boundary
+            .as_ref()
+            .map(|policy| resolve_policy(policy, &cwd))
+            .transpose()
+            .map_err(WorkflowError::InvalidWorkflow)?;
         let now = Utc::now();
         let run_id = Uuid::now_v7().to_string();
         let state = RunState {
@@ -260,6 +294,7 @@ impl Engine {
             root_run_id: Some(run_id.clone()),
             parent_call_key: None,
             money_cap,
+            boundary,
             resume_count: 0,
             phase: None,
             active: Default::default(),
@@ -273,6 +308,10 @@ impl Engine {
             journal_path: self.store.journal_path(&run_id),
         };
         self.store.create_run(&state, &script)?;
+        if let Some(policy) = state.boundary.clone() {
+            self.store
+                .append_boundary_event(&state.run_id, BoundaryEvent::Declared { policy })?;
+        }
         if state.contract.as_deref() == Some("workflow.v2") {
             self.store.append_event(
                 &state.run_id,
@@ -498,6 +537,7 @@ impl Engine {
             source,
         })?;
         validate_script(&script)?;
+        parse_meta_boundary(&script)?;
         Ok(serde_json::json!({
             "check": "ok",
             "workflow": path.display().to_string(),
@@ -585,6 +625,14 @@ impl Engine {
         };
         let budget_path = (state.contract.as_deref() == Some("workflow.v2"))
             .then(|| self.store.budget_path(run_id));
+        let boundary_path = state
+            .boundary
+            .is_some()
+            .then(|| self.store.boundary_path(run_id));
+        let boundary_events = boundary_path
+            .as_ref()
+            .map(|_| self.store.read_boundary_events(run_id))
+            .transpose()?;
         Ok(Inspection {
             state,
             script_path: self.store.script_path(run_id),
@@ -592,6 +640,8 @@ impl Engine {
             journal_path: self.store.journal_path(run_id),
             budget_path,
             budget,
+            boundary_path,
+            boundary_events,
             run_summary_path: self.store.run_summary_path(run_id),
         })
     }
@@ -741,6 +791,7 @@ impl Engine {
             scheduler,
             contract: initial.contract.clone(),
             parent_run_id: initial.parent_run_id.clone(),
+            boundary: initial.boundary.clone(),
             budget,
         });
         let result = script::execute(runtime, &source, &initial.args, initial.max_calls);
@@ -836,6 +887,35 @@ impl Engine {
         if !state.status.is_terminal() {
             return Ok(state);
         }
+        if state.status == RunStatus::Succeeded && state.boundary.is_some() {
+            let violations = self
+                .store
+                .read_boundary_events(&state.run_id)?
+                .into_iter()
+                .filter_map(|envelope| match envelope.event {
+                    BoundaryEvent::Violation { message, .. } => Some(message),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if !violations.is_empty() {
+                let error = format!(
+                    "boundary violation blocked success: {}",
+                    violations.join("; ")
+                );
+                return self.transition(
+                    &state.run_id,
+                    WorkflowEvent::RunFailed {
+                        error: error.clone(),
+                    },
+                    |state| {
+                        state.status = RunStatus::Failed;
+                        state.error = Some(error);
+                        state.report = None;
+                        state.active.clear();
+                    },
+                );
+            }
+        }
         let report = if state.status == RunStatus::Succeeded {
             match state.result.as_ref().map(delivery_report).transpose() {
                 Ok(report) => report.flatten(),
@@ -894,6 +974,10 @@ pub struct Inspection {
     pub budget_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget: Option<crate::model::BudgetLedger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary_events: Option<Vec<crate::boundary::BoundaryEnvelope>>,
     pub run_summary_path: PathBuf,
 }
 
@@ -942,6 +1026,20 @@ fn parse_meta_money_cap(script: &str) -> Option<u64> {
         Value::Number(n) if n.is_u64() && n.as_u64()? > 0 => n.as_u64(),
         _ => None,
     }
+}
+
+fn parse_meta_boundary(script: &str) -> Result<Option<BoundaryPolicy>, WorkflowError> {
+    let Some(meta) = script::parse_meta(script)? else {
+        return Ok(None);
+    };
+    let Some(value) = meta.get("boundary") else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| {
+            WorkflowError::InvalidWorkflow(format!("meta.boundary is invalid: {error}"))
+        })
 }
 
 fn validate_script(script: &str) -> Result<Option<String>, WorkflowError> {

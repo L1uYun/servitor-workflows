@@ -57,6 +57,10 @@ pub struct RunState {
     pub parent_call_key: Option<String>,
     #[serde(default)]
     pub money_cap: Option<u64>,
+    /// V2-E audit-mode host boundary. V1 records omit it and preserve frozen
+    /// replay semantics.
+    #[serde(default)]
+    pub boundary: Option<crate::boundary::BoundaryPolicy>,
     pub status: RunStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

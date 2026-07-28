@@ -1,3 +1,4 @@
+use crate::boundary::{BOUNDARY_SCHEMA_VERSION, BoundaryEnvelope, BoundaryEvent};
 use crate::error::WorkflowError;
 use crate::model::{
     BUDGET_SCHEMA_VERSION, BudgetEnvelope, BudgetEvent, BudgetLedger, EVENT_SCHEMA_VERSION,
@@ -55,6 +56,9 @@ impl WorkflowStore {
     }
     pub fn budget_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("budget.jsonl")
+    }
+    pub fn boundary_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("boundary.jsonl")
     }
     pub fn command_result_path(&self, run_id: &str, key: &str) -> PathBuf {
         self.run_dir(run_id)
@@ -203,6 +207,103 @@ impl WorkflowStore {
             index.insert(entry.key.clone(), entry);
         }
         Ok(index)
+    }
+
+    /// Persist one secret-safe V2-E boundary observation. The event carries
+    /// declared paths and variable *names*, never environment values.
+    pub fn append_boundary_event(
+        &self,
+        run_id: &str,
+        event: BoundaryEvent,
+    ) -> Result<(), WorkflowError> {
+        let _process_guard = process_write_lock()
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("boundary write lock poisoned".to_owned()))?;
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("boundary write lock poisoned".to_owned()))?;
+        let path = self.boundary_path(run_id);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        file.lock_exclusive()
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        let sequence = Self::count_event_lines_in(&mut file, &path)? + 1;
+        file.seek(SeekFrom::End(0))
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        let envelope = BoundaryEnvelope {
+            version: BOUNDARY_SCHEMA_VERSION,
+            sequence,
+            at: Utc::now(),
+            run_id: run_id.to_owned(),
+            event,
+        };
+        let mut bytes = serde_json::to_vec(&envelope)?;
+        bytes.push(b'\n');
+        let result = file
+            .write_all(&bytes)
+            .and_then(|_| file.sync_data())
+            .map_err(|source| WorkflowError::Write {
+                path: path.clone(),
+                source,
+            });
+        let unlock = FileExt::unlock(&file).map_err(|source| WorkflowError::Write { path, source });
+        result.and(unlock)
+    }
+
+    pub fn read_boundary_events(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<BoundaryEnvelope>, WorkflowError> {
+        let _process_guard = process_write_lock()
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("boundary read lock poisoned".to_owned()))?;
+        let _guard = self
+            .writes
+            .lock()
+            .map_err(|_| WorkflowError::Invariant("boundary read lock poisoned".to_owned()))?;
+        let path = self.boundary_path(run_id);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(WorkflowError::Read { path, source }),
+        };
+        let mut events = Vec::new();
+        for (index, line) in text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+        {
+            let envelope: BoundaryEnvelope = serde_json::from_str(line)?;
+            let expected_sequence = index as u64 + 1;
+            if envelope.run_id != run_id {
+                return Err(WorkflowError::Invariant(format!(
+                    "boundary event run id mismatch: expected {run_id}, got {}",
+                    envelope.run_id
+                )));
+            }
+            if envelope.sequence != expected_sequence {
+                return Err(WorkflowError::Invariant(format!(
+                    "boundary event sequence gap in run {run_id}: expected {expected_sequence}, got {}",
+                    envelope.sequence
+                )));
+            }
+            events.push(envelope);
+        }
+        Ok(events)
     }
 
     /// Append one lifecycle event to `events.jsonl`. The envelope is stamped
@@ -578,32 +679,34 @@ impl WorkflowStore {
                     actual_money,
                     actual_tokens,
                 } => {
-                    if let Some(res) = ledger.reservations.get_mut(&key) {
-                        if !res.settled && !res.released {
-                            res.settled = true;
-                            res.actual_money = actual_money;
-                            res.actual_tokens = actual_tokens;
-                            ledger.used_calls = ledger.used_calls.saturating_add(1);
-                            ledger.held_calls = ledger.held_calls.saturating_sub(1);
-                            if let Some(held) = res.estimate_money {
-                                ledger.held_money = ledger.held_money.saturating_sub(held);
-                            }
-                            if let Some(money) = actual_money {
-                                ledger.used_money = ledger.used_money.saturating_add(money);
-                            }
-                            ledger.attributed_tokens =
-                                ledger.attributed_tokens.saturating_add(actual_tokens);
+                    if let Some(res) = ledger.reservations.get_mut(&key)
+                        && !res.settled
+                        && !res.released
+                    {
+                        res.settled = true;
+                        res.actual_money = actual_money;
+                        res.actual_tokens = actual_tokens;
+                        ledger.used_calls = ledger.used_calls.saturating_add(1);
+                        ledger.held_calls = ledger.held_calls.saturating_sub(1);
+                        if let Some(held) = res.estimate_money {
+                            ledger.held_money = ledger.held_money.saturating_sub(held);
                         }
+                        if let Some(money) = actual_money {
+                            ledger.used_money = ledger.used_money.saturating_add(money);
+                        }
+                        ledger.attributed_tokens =
+                            ledger.attributed_tokens.saturating_add(actual_tokens);
                     }
                 }
                 BudgetEvent::Released { key, .. } => {
-                    if let Some(res) = ledger.reservations.get_mut(&key) {
-                        if !res.released && !res.settled {
-                            res.released = true;
-                            ledger.held_calls = ledger.held_calls.saturating_sub(1);
-                            if let Some(held) = res.estimate_money {
-                                ledger.held_money = ledger.held_money.saturating_sub(held);
-                            }
+                    if let Some(res) = ledger.reservations.get_mut(&key)
+                        && !res.released
+                        && !res.settled
+                    {
+                        res.released = true;
+                        ledger.held_calls = ledger.held_calls.saturating_sub(1);
+                        if let Some(held) = res.estimate_money {
+                            ledger.held_money = ledger.held_money.saturating_sub(held);
                         }
                     }
                 }
