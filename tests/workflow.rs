@@ -123,6 +123,18 @@ impl Transport for FakeTransport {
         } else if prompt.contains("NEGOTIATE_SYNTH") {
             r#"{"accepted":true,"decision":"use canary A fixed","rationale":"reviewer accepted after revise","open_issues":[]}"#
                 .to_owned()
+        } else if prompt.contains("GOALCHAIN_WORKER") && prompt.contains("BADWORKER") {
+            // Negative control: the worker lands evidence with one token false,
+            // so the mechanical gate (which reads back from disk) must fail.
+            r#"{"summary":"claimed done","evidence":"{\"dual-gate\":true,\"boundary-audit\":false}"}"#
+                .to_owned()
+        } else if prompt.contains("GOALCHAIN_WORKER") {
+            r#"{"summary":"delivered bounded objective","evidence":"{\"dual-gate\":true,\"boundary-audit\":true}"}"#
+                .to_owned()
+        } else if prompt.contains("GOALCHAIN_REVIEW") {
+            r#"{"verdict":"approve","critique":"satisfies contract","must_fix":[]}"#.to_owned()
+        } else if prompt.contains("GOALCHAIN_SEMANTIC") {
+            r#"{"approved":true,"rationale":"meaning holds"}"#.to_owned()
         } else if prompt.contains("WORK ") {
             format!(
                 "{}-ok",
@@ -4125,5 +4137,230 @@ fn watch_rejects_corrupted_parent_child_cycle_instead_of_crashing() {
     assert!(
         matches!(err, servitor_workflows::WorkflowError::Invariant(_)),
         "expected Invariant cycle error, got {err:?}"
+    );
+}
+
+#[test]
+fn goalchain_v2_delivery_completes_dual_gates_child_review_cost_and_boundary() {
+    use servitor_workflows::reconstruct_watch;
+    let temp = TempDir::new().expect("tempdir");
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    // Copy the migrated chain + its independent reviewer child into the temp
+    // cwd so the relative `workflow("goalchain-v2-review.workflow.js")` resolves.
+    fs::copy(
+        examples.join("goalchain-v2.workflow.js"),
+        temp.path().join("goalchain-v2.workflow.js"),
+    )
+    .expect("copy chain");
+    fs::copy(
+        examples.join("goalchain-v2-review.workflow.js"),
+        temp.path().join("goalchain-v2-review.workflow.js"),
+    )
+    .expect("copy reviewer child");
+    // Frozen contract carrying the mechanical acceptance identifiers (G15).
+    fs::write(
+        temp.path().join("contract.md"),
+        "# contract\n\nAcceptance identifiers: dual-gate, boundary-audit.\n",
+    )
+    .expect("write contract");
+
+    let root_dir = temp.path().join("state");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(5)));
+    let eng = engine(&root_dir, Arc::clone(&transport));
+    let waiting = eng
+        .start(
+            &temp.path().join("goalchain-v2.workflow.js"),
+            json!({
+                "contractPath": "contract.md",
+                "evidencePath": "./out/evidence.json",
+                "mechanicalTokens": ["dual-gate", "boundary-audit"],
+                "requireHumanGate": true
+            }),
+            1,
+            20,
+        )
+        .expect("start goalchain v2");
+    // readiness -> dispatch -> child review -> mechanical gate -> human gate.
+    assert_eq!(
+        waiting.status,
+        RunStatus::WaitingHuman,
+        "{:?}",
+        waiting.error
+    );
+    let root_run_id = waiting.run_id.clone();
+
+    // Human acceptance resumes the chain through the semantic gate + writeback.
+    let done = eng
+        .approve(&root_run_id, true, "accept".to_owned(), None)
+        .expect("approve human gate");
+    assert_eq!(done.status, RunStatus::Succeeded, "{:?}", done.error);
+
+    // Dual gates: the mechanical gate (identifier tokens read back from disk)
+    // and the semantic gate (independent meaning review) both passed.
+    let result = done.result.clone().expect("result");
+    assert_eq!(result["protocol"], "goalchain.v2");
+    assert_eq!(result["semantic"]["approved"], true);
+    assert_eq!(result["review"]["verdict"], "approve");
+    assert_eq!(result["human"]["approved"], true);
+    // The mechanical gate (identifier tokens read back from disk) is surfaced
+    // in the result so its pass is observable, not just an unasserted side
+    // effect. The negative-control test below proves it can also fail a chain.
+    assert_eq!(result["mechanical"]["passed"], true);
+    assert_eq!(
+        result["mechanical"]["tokens"],
+        json!(["dual-gate", "boundary-audit"])
+    );
+
+    // Child review (G13): the independent reviewer ran as its own run with its
+    // own journal — never self-review in the parent run.
+    let store = WorkflowStore::new(&root_dir);
+    let children = store.child_run_ids(&root_run_id).expect("children");
+    assert_eq!(
+        children.len(),
+        1,
+        "exactly one child workflow (the reviewer)"
+    );
+    let child = store.load_state(&children[0]).expect("child state");
+    assert_eq!(child.parent_run_id.as_deref(), Some(root_run_id.as_str()));
+    assert_eq!(child.root_run_id.as_deref(), Some(root_run_id.as_str()));
+    assert_eq!(child.status, RunStatus::Succeeded);
+    // The reviewer inherited the parent capability policy and used the
+    // independent `reviewer` role.
+    assert!(
+        store
+            .read_capability_events(&children[0])
+            .expect("child capability events")
+            .iter()
+            .any(|event| matches!(&event.event, CapabilityEvent::Selected { role, .. } if role.as_deref() == Some("reviewer"))),
+        "reviewer child must resolve the independent reviewer role"
+    );
+    // The reviewer boundary is read-only: writePaths narrowed to empty.
+    assert!(
+        child
+            .boundary
+            .as_ref()
+            .expect("child boundary")
+            .write_paths
+            .is_empty(),
+        "reviewer must be read-only"
+    );
+
+    // Cost attribution (V2-B): worker + reviewer + semantic = 3 agent calls,
+    // all attributed to the shared root ledger with tokens settled. The ledger
+    // also counts command/gate/workflow host calls, so assert the agent
+    // Cost attribution (V2-B): the shared root ledger counts EVERY host call,
+    // not just agents — 3 agents (worker + reviewer-child + semantic) + 3
+    // commands (readiness + write-evidence + read-evidence) + 1 gate (human) +
+    // 1 workflow (review child) = 8 settled keys. Pin the exact count so a
+    // regression that stops counting command/gate/workflow calls is caught.
+    let ledger = store.reconstruct_budget(&root_run_id).expect("root ledger");
+    assert_eq!(
+        ledger.used_calls, 8,
+        "ledger counts all 8 host calls (3 agents + 3 commands + gate + workflow)"
+    );
+    assert!(ledger.attributed_tokens > 0, "usage tokens attributed");
+    assert_eq!(transport.count(), 3, "three transport submissions total");
+    // The child reviewer's agent settled against the shared root ledger under a
+    // child-prefixed reservation key — proof the child shares the root budget.
+    let child_reservation = ledger
+        .reservations
+        .keys()
+        .find(|key| key.starts_with(&format!("{}:", children[0])))
+        .expect("child reservation in root ledger");
+    assert!(ledger.reservations[child_reservation].settled);
+
+    // Boundary audit (V2-E): declared policy, child narrowing, and a file
+    // snapshot that observed the evidence land inside ./out — no violations.
+    let boundary = store
+        .read_boundary_events(&root_run_id)
+        .expect("boundary events");
+    assert!(
+        boundary
+            .iter()
+            .any(|event| matches!(event.event, BoundaryEvent::Declared { .. })),
+        "chain declares its boundary"
+    );
+    assert!(
+        boundary
+            .iter()
+            .any(|event| matches!(event.event, BoundaryEvent::ChildDeclared { .. })),
+        "child reviewer boundary is recorded on the parent"
+    );
+    assert!(
+        boundary.iter().any(|event| matches!(
+            &event.event,
+            BoundaryEvent::FileSnapshot { after, .. }
+                if after.files.iter().any(|entry| entry.path.ends_with("evidence.json"))
+        )),
+        "file snapshot observed the evidence written inside ./out"
+    );
+    assert!(
+        !boundary
+            .iter()
+            .any(|event| matches!(event.event, BoundaryEvent::Violation { .. })),
+        "no boundary violations in a clean delivery"
+    );
+
+    // Crash recovery (V2-H): a restarted process rebuilds the identical tree,
+    // status, and budget exclusively from persisted events.
+    let restarted = WorkflowStore::new(&root_dir);
+    let view = reconstruct_watch(&restarted, &root_run_id).expect("watch reconstructs");
+    assert_eq!(view.source, "persisted_events");
+    assert_eq!(view.status, RunStatus::Succeeded);
+    assert_eq!(view.tree.children.len(), 1, "reviewer child in the tree");
+    assert!(view.budget.is_some(), "v2 run reconstructs its budget");
+}
+
+// Negative control for the mechanical gate: a worker that claims success but
+// lands evidence with a token false must FAIL the chain at the verification
+// phase. This is what proves the mechanical half of the dual gate has teeth —
+// the positive test above would stay green even if the gate were a no-op, so
+// this test pins the failure path. The BADWORKER transport branch returns
+// evidence {"dual-gate":true,"boundary-audit":false}.
+#[test]
+fn goalchain_v2_mechanical_gate_fails_when_landed_evidence_token_is_false() {
+    let temp = TempDir::new().expect("tempdir");
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    fs::copy(
+        examples.join("goalchain-v2.workflow.js"),
+        temp.path().join("goalchain-v2.workflow.js"),
+    )
+    .expect("copy chain");
+    fs::copy(
+        examples.join("goalchain-v2-review.workflow.js"),
+        temp.path().join("goalchain-v2-review.workflow.js"),
+    )
+    .expect("copy reviewer child");
+    // Contract carries the BADWORKER identifier so readiness passes and the
+    // worker prompt selects the BADWORKER transport branch.
+    fs::write(
+        temp.path().join("contract.md"),
+        "# contract\n\nAcceptance identifiers: dual-gate, boundary-audit, BADWORKER.\n",
+    )
+    .expect("write contract");
+
+    let root_dir = temp.path().join("state");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(5)));
+    let eng = engine(&root_dir, Arc::clone(&transport));
+    // requireHumanGate=false so the chain reaches the mechanical gate without
+    // parking; the gate must fail the run before any human decision.
+    let failed = eng
+        .start(
+            &temp.path().join("goalchain-v2.workflow.js"),
+            json!({
+                "contractPath": "contract.md",
+                "evidencePath": "./out/evidence.json",
+                "mechanicalTokens": ["dual-gate", "boundary-audit", "BADWORKER"],
+                "requireHumanGate": false
+            }),
+            1,
+            20,
+        )
+        .expect("start goalchain v2 negative control");
+    assert_eq!(failed.status, RunStatus::Failed, "{:?}", failed.result);
+    let err = failed.error.expect("failure error");
+    assert!(
+        err.contains("mechanical gate failed"),
+        "expected mechanical gate failure, got: {err}"
     );
 }
