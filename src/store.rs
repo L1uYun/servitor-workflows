@@ -9,10 +9,19 @@ use crate::model::{
 use chrono::Utc;
 use fs2::FileExt;
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+/// Monotonic per-process counter folded into atomic-write temp file names so two
+/// concurrent writes to the SAME target from the same pid can never collide on
+/// one temp path, even on call sites (`create_run`, `request_pause`,
+/// `request_cancel`) that do not hold the `writes` mutex.
+static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct WorkflowStore {
@@ -140,10 +149,7 @@ impl WorkflowStore {
         update(&mut state);
         state.updated_at = chrono::Utc::now();
         let bytes = serde_json::to_vec_pretty(&state)?;
-        fs::write(self.state_path(run_id), bytes).map_err(|source| WorkflowError::Write {
-            path: self.state_path(run_id),
-            source,
-        })?;
+        self.write(&self.state_path(run_id), &bytes)?;
         Ok(state)
     }
 
@@ -206,9 +212,37 @@ impl WorkflowStore {
             Err(source) => return Err(WorkflowError::Read { path, source }),
         };
         let mut index = BTreeMap::new();
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let entry: JournalEntry = serde_json::from_str(line)?;
-            index.insert(entry.key.clone(), entry);
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        let last = lines.len().saturating_sub(1);
+        for (position, line) in lines.into_iter().enumerate() {
+            match serde_json::from_str::<JournalEntry>(line) {
+                Ok(entry) => {
+                    index.insert(entry.key.clone(), entry);
+                }
+                // Fault tolerance (V2-J): a host kill mid-append leaves only the
+                // FINAL line torn. Drop that one incomplete tail entry and keep
+                // every complete line before it, so reconstruction and resume
+                // survive the crash. A malformed line anywhere but the tail is
+                // genuine corruption, not a torn write, and still errors.
+                //
+                // This reader is shared by v1 and v2 runs. The relaxation is
+                // intentional and safe for the frozen v1 path: `append` is the
+                // only journal writer and always terminates a complete line with
+                // `\n`, so a parse failure on the final line can ONLY be a torn
+                // write — never a complete v1 entry. No journal entry that
+                // previously parsed is ever dropped, so no v1 reconstruction
+                // that previously succeeded changes result; the only behavior
+                // change is that a v1 journal with a torn tail now reconstructs
+                // instead of erroring. This reads tolerantly; it never rewrites
+                // a v1 journal.
+                Err(_source) if position == last => {
+                    break;
+                }
+                Err(source) => return Err(WorkflowError::Json(source)),
+            }
         }
         Ok(index)
     }
@@ -1067,16 +1101,77 @@ impl WorkflowStore {
         }
     }
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), WorkflowError> {
-        if let Some(parent) = path.parent() {
+        let parent = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+        if let Some(parent) = parent {
             fs::create_dir_all(parent).map_err(|source| WorkflowError::Write {
                 path: parent.to_path_buf(),
                 source,
             })?;
         }
-        fs::write(path, bytes).map_err(|source| WorkflowError::Write {
-            path: path.to_path_buf(),
-            source,
-        })
+        // Fault tolerance (V2-J): write to a temp file, `sync_data` it, then
+        // rename over the target. A rename over an existing file is atomic on
+        // POSIX and Windows, so a host kill mid-write leaves either the old
+        // complete file or the new complete file — never a torn state.json that
+        // would fail `load_state` and strand the run.
+        //
+        // The temp file lives in the TARGET'S OWN directory, never in the
+        // process temp dir. Same-directory is the only placement that keeps the
+        // rename same-device: the default Windows state root is on `D:` while
+        // `%TEMP%` is on `C:`, so a `%TEMP%` temp file would make `fs::rename`
+        // fail with ERROR_NOT_SAME_DEVICE on every production write and force a
+        // non-atomic copy fallback — silently voiding the guarantee above. A
+        // temp file here is also invisible to a V2-E boundary audit, which
+        // fingerprints only the workflow's declared read/write paths, not this
+        // crate's state root.
+        //
+        // The name folds a hash of the full target path plus a per-process
+        // monotonic nonce, so concurrent writes to different state files — and
+        // even concurrent writes to the SAME target from lock-free call sites
+        // (`create_run`, `request_pause`, `request_cancel`) — never collide on
+        // one temp path within this pid.
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        let nonce = WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(format!(
+                ".{}.{:016x}.{}.tmp",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("state"),
+                hasher.finish(),
+                nonce
+            ));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .map_err(|source| WorkflowError::Write {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            file.write_all(bytes)
+                .and_then(|_| file.sync_data())
+                .map_err(|source| WorkflowError::Write {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            drop(file);
+            fs::rename(&tmp, path).map_err(|source| WorkflowError::Write {
+                path: path.to_path_buf(),
+                source,
+            })
+        })();
+        if result.is_err() {
+            // Best-effort: never leak a temp file on a failed write. A failure
+            // here must not mask the original error, so ignore the cleanup
+            // result.
+            let _ = fs::remove_file(&tmp);
+        }
+        result
     }
 }
 

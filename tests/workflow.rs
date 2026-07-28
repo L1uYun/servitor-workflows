@@ -30,6 +30,8 @@ struct FakeTransport {
     requests: Mutex<Vec<SubmitRequest>>,
     fail_submissions: bool,
     fail_after: Option<usize>,
+    loop_rounds: AtomicUsize,
+    emit_usage: bool,
 }
 
 impl FakeTransport {
@@ -43,6 +45,16 @@ impl FakeTransport {
             requests: Mutex::new(Vec::new()),
             fail_submissions: false,
             fail_after: None,
+            loop_rounds: AtomicUsize::new(0),
+            emit_usage: true,
+        }
+    }
+    /// Fault injection (V2-J): a provider that reports no usage diagnostics,
+    /// so settlement must still succeed with zero attributed tokens.
+    fn without_usage(delay: Duration) -> Self {
+        Self {
+            emit_usage: false,
+            ..Self::new(delay)
         }
     }
     fn failing(delay: Duration) -> Self {
@@ -62,6 +74,16 @@ impl FakeTransport {
     }
     fn peak_inspections(&self) -> usize {
         self.peak_inspections.load(Ordering::SeqCst)
+    }
+    /// The transport run ids currently held by the provider, in sorted order.
+    /// Used by the V2-J fault tests to assert which submissions persisted.
+    fn record_ids(&self) -> Vec<String> {
+        self.records
+            .lock()
+            .expect("record lock")
+            .keys()
+            .cloned()
+            .collect()
     }
 }
 
@@ -135,6 +157,25 @@ impl Transport for FakeTransport {
             r#"{"verdict":"approve","critique":"satisfies contract","must_fix":[]}"#.to_owned()
         } else if prompt.contains("GOALCHAIN_SEMANTIC") {
             r#"{"approved":true,"rationale":"meaning holds"}"#.to_owned()
+        } else if prompt.contains("JUDGE_CASE") {
+            // V2-J judge panel: each independent candidate returns a score.
+            r#"{"score":8,"rationale":"candidate approach"}"#.to_owned()
+        } else if prompt.contains("JUDGE_SYNTH") {
+            r#"{"winner":"beta","rationale":"highest judged score"}"#.to_owned()
+        } else if prompt.contains("FIND_NEW") {
+            // V2-J loop-until-dry: first discovery finds items, every later
+            // round finds nothing new so the loop converges.
+            let round = self.loop_rounds.fetch_add(1, Ordering::SeqCst);
+            if round == 0 {
+                r#"{"items":["x","y"]}"#.to_owned()
+            } else {
+                r#"{"items":[]}"#.to_owned()
+            }
+        } else if prompt.contains("VANISH") {
+            // V2-J fault: the provider accepts the submission but loses the
+            // record before the result is persisted. Handled below by removing
+            // the just-inserted record so the first `inspect` fails "missing".
+            "ok".to_owned()
         } else if prompt.contains("WORK ") {
             format!(
                 "{}-ok",
@@ -171,6 +212,15 @@ impl Transport for FakeTransport {
                     diagnostics: Diagnostics::default(),
                 },
             );
+        if prompt.contains("VANISH") {
+            // Fault injection (V2-J): submitted transport without persisted
+            // result — the provider accepted the run but lost the record, so
+            // the first `inspect` fails with "missing".
+            self.records
+                .lock()
+                .map_err(|_| ErrorInfo::new("lock", "record lock poisoned"))?
+                .remove(&run_id);
+        }
         Ok(SubmitResponse {
             run_id,
             state: ServitorState::Accepted,
@@ -192,10 +242,12 @@ impl Transport for FakeTransport {
         if record.state == ServitorState::Running {
             record.state = ServitorState::Succeeded;
             record.finished_at = Some(Utc::now());
-            record
-                .diagnostics
-                .provider
-                .insert("usage".to_owned(), json!({"input": 100, "output": 20}));
+            if self.emit_usage {
+                record
+                    .diagnostics
+                    .provider
+                    .insert("usage".to_owned(), json!({"input": 100, "output": 20}));
+            }
         }
         Ok(record.clone())
     }
@@ -4362,5 +4414,475 @@ fn goalchain_v2_mechanical_gate_fails_when_landed_evidence_token_is_false() {
     assert!(
         err.contains("mechanical gate failed"),
         "expected mechanical gate failure, got: {err}"
+    );
+}
+
+// ===========================================================================
+// V2-J — Superiority benchmark and fault-injection release gate
+//
+// Fixed behavioral cases (Claude-native-expressible) and fault-injection cases
+// (local-only). Every input is fixed and every assertion is a machine verdict,
+// so the whole block is replayable. Cases already proven elsewhere in this
+// suite (dynamic fan-out, no-barrier pipeline, schema correction, child
+// workflows, budget persistence, human waiting, child degradation, cancellation
+// propagation, boundary violation, restart-while-waiting-human, orphan-process
+// termination) are not duplicated here; the tests below cover the remaining
+// named cases.
+// ===========================================================================
+
+#[test]
+fn benchmark_judge_panel_scores_independent_candidates_and_synthesizes() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-bench-judge");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(20)));
+    let path = script(
+        &temp,
+        "judge-panel.js",
+        r#"
+        const schema = { type: "object", required: ["score", "rationale"], properties: { score: { type: "number" }, rationale: { type: "string" } } };
+        const candidates = ["alpha", "beta", "gamma"];
+        const scored = await parallel(candidates.map(name => () =>
+          agent(`JUDGE_CASE ${name}`, { schema }).then(r => ({ name, score: r.score }))));
+        const synth = await agent("JUDGE_SYNTH", {
+          schema: { type: "object", required: ["winner", "rationale"], properties: { winner: { type: "string" }, rationale: { type: "string" } } }
+        });
+        return { scored, winner: synth.winner };
+    "#,
+    );
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 4, 100)
+        .expect("judge panel workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(
+        state.result,
+        Some(json!({
+            "scored": [
+                {"name": "alpha", "score": 8},
+                {"name": "beta", "score": 8},
+                {"name": "gamma", "score": 8}
+            ],
+            "winner": "beta"
+        }))
+    );
+    // 3 independent candidate submissions + 1 synthesis = 4 transport calls.
+    assert_eq!(transport.count(), 4);
+}
+
+#[test]
+fn benchmark_loop_until_dry_converges_when_no_new_items() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-bench-loop");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(5)));
+    let path = script(
+        &temp,
+        "loop-until-dry.js",
+        r#"
+        const schema = { type: "object", required: ["items"], properties: { items: { type: "array", items: { type: "string" } } } };
+        const seen = [];
+        let rounds = 0;
+        while (true) {
+          const found = await agent("FIND_NEW", { schema });
+          rounds += 1;
+          const fresh = found.items.filter(item => !seen.includes(item));
+          if (fresh.length === 0) { break; }
+          seen.push(...fresh);
+        }
+        const processed = await pipeline(seen, item => agent(`WORK ${item}`));
+        return { seen, rounds, processed };
+    "#,
+    );
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 4, 100)
+        .expect("loop-until-dry workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    // Round 0 discovers x,y; round 1 discovers nothing new, so the loop dries
+    // after exactly 2 discovery rounds, then the pipeline processes x and y.
+    assert_eq!(
+        state.result,
+        Some(json!({"seen": ["x", "y"], "rounds": 2, "processed": ["x-ok", "y-ok"]}))
+    );
+    // 2 discovery + 2 pipeline work calls.
+    assert_eq!(transport.count(), 4);
+}
+
+#[test]
+fn fault_torn_journal_tail_is_tolerated_on_reconstruction_and_resume() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-fault-torn-journal");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(5)));
+    let path = script(
+        &temp,
+        "torn-journal.js",
+        r#"const a = await agent("FIRST"); return { a };"#,
+    );
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("run");
+    assert_eq!(state.status, RunStatus::Succeeded);
+
+    let store = WorkflowStore::new(&root);
+    let journal_path = store.journal_path(&state.run_id);
+    let before = store.journal_index(&state.run_id).expect("index before");
+    assert!(!before.is_empty(), "agent call journaled");
+
+    // Simulate a host kill mid-append: only the FINAL line is torn.
+    let mut text = fs::read_to_string(&journal_path).expect("read journal");
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("{\"at\":\"2026-01-01T00:00:00Z\",\"key\":\"agent:0\",\"state\":\"subm");
+    fs::write(&journal_path, text).expect("write torn journal");
+
+    // Reconstruction drops the torn tail and keeps every complete line.
+    let after = store
+        .journal_index(&state.run_id)
+        .expect("index after torn tail");
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "torn tail must be dropped, not counted"
+    );
+    assert_eq!(after, before, "complete entries survive the torn tail");
+
+    // Roll the run back to a non-terminal status so `resume` actually
+    // reconstructs from the journal instead of short-circuiting on a terminal
+    // state (a Succeeded run resumes via `ensure_terminal_artifacts` without
+    // ever reading the journal). This models a host killed after the agent call
+    // settled but before the run wrote its own terminal status.
+    store
+        .update_state(&state.run_id, |st| {
+            st.status = RunStatus::Running;
+            st.result = None;
+        })
+        .expect("roll back to running");
+
+    // Resume over the torn journal succeeds and does not resubmit the call:
+    // replay reads the surviving Succeeded agent entry and returns it cached.
+    let resumed = engine(&root, Arc::clone(&transport))
+        .resume(&state.run_id)
+        .expect("resume over torn journal");
+    assert_eq!(resumed.status, RunStatus::Succeeded, "{:?}", resumed.error);
+    assert_eq!(
+        transport.count(),
+        1,
+        "torn-tail resume resubmitted the call"
+    );
+}
+
+#[test]
+fn fault_mid_journal_corruption_still_errors() {
+    // The torn-tail tolerance is specific to the FINAL line. A malformed line
+    // anywhere else is genuine corruption and must still fail loudly rather
+    // than be silently dropped.
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-fault-mid-corrupt");
+    let path = script(&temp, "mid-corrupt.js", r#"return { done: true };"#);
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 10)
+        .expect("run");
+    let store = WorkflowStore::new(&root);
+    let journal_path = store.journal_path(&state.run_id);
+    // One corrupt line followed by a valid line: the corrupt line is not the
+    // tail, so reconstruction must error.
+    fs::write(
+        &journal_path,
+        "not-json\n{\"at\":\"2026-01-01T00:00:00Z\",\"key\":\"x\",\"kind\":\"agent\",\"state\":\"succeeded\",\"label\":\"x\"}\n",
+    )
+    .expect("write corrupt journal");
+    assert!(
+        store.journal_index(&state.run_id).is_err(),
+        "mid-journal corruption must not be silently tolerated"
+    );
+}
+
+#[test]
+fn fault_interrupted_state_write_never_leaves_torn_or_temp_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-fault-atomic-write");
+    let path = script(&temp, "atomic-write.js", r#"return { done: true };"#);
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 10)
+        .expect("run");
+    let store = WorkflowStore::new(&root);
+    let run_dir = store.run_dir(&state.run_id);
+
+    // Many in-place updates: because each write is temp-file + sync + rename
+    // (temp created in the target's OWN directory so the rename is same-device
+    // and therefore atomic), the on-disk state.json is always one complete
+    // document — a kill at any point leaves either the old or the new file,
+    // never a torn one. Every intermediate state must read back parseable.
+    for i in 0..10 {
+        store
+            .update_state(&state.run_id, |st| st.phase = Some(format!("phase-{i}")))
+            .expect("atomic update");
+        let loaded = store.load_state(&state.run_id).expect("load after update");
+        assert_eq!(loaded.phase.as_deref(), Some(format!("phase-{i}").as_str()));
+    }
+
+    // No temp file survives a successful write. The temp now lives in the run
+    // dir itself (the same directory as state.json), so this scan exercises the
+    // real temp location — a leaked temp here would be caught, unlike a temp
+    // parked in the shared process temp dir.
+    let leftovers: Vec<_> = fs::read_dir(&run_dir)
+        .expect("read run dir")
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "atomic write leaked a temp file into the run dir: {leftovers:?}"
+    );
+
+    // Crash-safety property: an orphaned temp sibling (what a kill between
+    // temp-create and rename would leave behind) must never affect the
+    // observable target. Plant one, then confirm load_state still returns the
+    // complete, current document.
+    let orphan = run_dir.join(".state.json.deadbeef.999.tmp");
+    fs::write(&orphan, b"{\"truncated\": tr").expect("plant orphan temp");
+    let still_complete = store.load_state(&state.run_id).expect("load with orphan");
+    assert_eq!(still_complete.phase.as_deref(), Some("phase-9"));
+    fs::remove_file(&orphan).expect("clean orphan");
+}
+
+#[test]
+fn fault_absent_provider_usage_settles_with_zero_tokens() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-fault-no-usage");
+    let transport = Arc::new(FakeTransport::without_usage(Duration::from_millis(5)));
+    let path = script(
+        &temp,
+        "no-usage.js",
+        r#"const a = await agent("hello"); return { a };"#,
+    );
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("run without usage");
+    // A provider that reports no usage diagnostics must not break settlement.
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+
+    let store = WorkflowStore::new(&root);
+    let journal = fs::read_to_string(store.journal_path(&state.run_id)).expect("journal");
+    let succeeded = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("journal value"))
+        .find(|entry| entry["state"] == "succeeded")
+        .expect("succeeded entry");
+    assert!(
+        succeeded.get("usage").is_none(),
+        "no usage diagnostics means no usage field"
+    );
+    let ledger = store.reconstruct_budget(&state.run_id).expect("ledger");
+    assert_eq!(ledger.used_calls, 1, "call still settles");
+    assert_eq!(
+        ledger.attributed_tokens, 0,
+        "absent usage attributes zero tokens"
+    );
+}
+
+#[test]
+fn fault_submitted_transport_without_persisted_result_fails_the_call() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-fault-vanish");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(5)));
+    let path = script(&temp, "vanish.js", r#"return await agent("VANISH");"#);
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 10)
+        .expect("run with vanished record");
+    // The provider accepted the submission but lost the record before the
+    // result was persisted; the first inspect fails "missing" and the call
+    // fails fast rather than hanging or silently succeeding.
+    assert_eq!(state.status, RunStatus::Failed);
+    let err = state.error.expect("failure error");
+    assert!(
+        err.contains("missing"),
+        "expected a missing-record inspect failure, got: {err}"
+    );
+    assert_eq!(transport.count(), 1, "exactly one submission was made");
+    assert!(
+        transport.record_ids().is_empty(),
+        "the provider holds no persisted record for the run"
+    );
+}
+
+#[test]
+fn fault_unsettled_reservation_never_counts_as_used() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-fault-unsettled");
+    let path = script(&temp, "unsettled.js", r#"return { done: true };"#);
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .prepare(&path, Value::Null, 1, 5)
+        .expect("prepare");
+    let store = WorkflowStore::new(&root);
+    // A reservation with no settlement and no release — the ledger state a
+    // crash leaves behind for an in-flight call.
+    store
+        .append_budget_event(
+            &state.run_id,
+            &state.run_id,
+            BudgetEvent::Reserved {
+                key: "orphan".to_owned(),
+                kind: CallKind::Agent,
+                estimate_money: None,
+            },
+        )
+        .expect("reserve");
+    let ledger = store.reconstruct_budget(&state.run_id).expect("ledger");
+    assert_eq!(ledger.held_calls, 1, "reservation is held");
+    assert_eq!(ledger.used_calls, 0, "unsettled reservation is never used");
+    assert!(!ledger.reservations["orphan"].settled);
+    assert!(!ledger.reservations["orphan"].released);
+}
+
+#[test]
+fn fault_child_success_before_parent_acknowledgment_is_replayed_on_resume() {
+    let temp = TempDir::new().expect("tempdir");
+    let root_dir = temp.path().join("state-fault-child-ack");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(5)));
+    let _child = script(
+        &temp,
+        "ack-child.js",
+        r#"return await agent("CHILD_WORK");"#,
+    );
+    let root = script(
+        &temp,
+        "ack-root.js",
+        r#"const result = await workflow("ack-child.js"); return { result };"#,
+    );
+    let state = engine(&root_dir, Arc::clone(&transport))
+        .start(&root, Value::Null, 1, 10)
+        .expect("run parent");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let root_run_id = state.run_id.clone();
+    assert_eq!(transport.count(), 1);
+
+    let store = WorkflowStore::new(&root_dir);
+    let child_id = store
+        .child_run_ids(&root_run_id)
+        .expect("child ids")
+        .remove(0);
+    assert_eq!(
+        store.load_state(&child_id).expect("child state").status,
+        RunStatus::Succeeded
+    );
+
+    // Simulate a host kill in the window between the child reaching Succeeded
+    // and the parent acknowledging it: truncate the parent journal so the
+    // workflow call is recorded only as `submitted` (its acknowledgment entry
+    // never landed). The child stays Succeeded on disk.
+    let journal_path = store.journal_path(&root_run_id);
+    let submitted_line = fs::read_to_string(&journal_path)
+        .expect("read parent journal")
+        .lines()
+        .find(|line| {
+            serde_json::from_str::<Value>(line)
+                .map(|entry| entry["state"] == "submitted" && entry["kind"] == "workflow")
+                .unwrap_or(false)
+        })
+        .expect("parent journaled the child submission")
+        .to_owned();
+    fs::write(&journal_path, format!("{submitted_line}\n")).expect("truncate to submitted");
+    // Roll the parent's persisted status back to the state it held inside that
+    // window: still Running (it never reached its own terminal write), with the
+    // child call recorded only as `submitted`. A real host kill leaves exactly
+    // this — a non-terminal parent, a succeeded child on disk, an unacknowledged
+    // journal entry.
+    store
+        .update_state(&root_run_id, |state| {
+            state.status = RunStatus::Running;
+            state.result = None;
+            state.error = None;
+        })
+        .expect("roll parent back to running");
+    let truncated = store.journal_index(&root_run_id).expect("truncated index");
+    let child_call = truncated
+        .values()
+        .find(|entry| entry.kind == CallKind::Workflow)
+        .expect("workflow call in truncated journal");
+    assert_eq!(child_call.state, CallState::Submitted);
+
+    // A killed-and-restarted controller resumes the parent. It sees the child
+    // call as submitted, loads the child's persisted Succeeded state (never
+    // resubmitting it), acknowledges the result, and completes.
+    let resumed = engine(&root_dir, Arc::clone(&transport))
+        .resume(&root_run_id)
+        .expect("resume parent");
+    assert_eq!(resumed.status, RunStatus::Succeeded, "{:?}", resumed.error);
+    assert_eq!(resumed.result, Some(json!({"result": "ok"})));
+    assert_eq!(
+        transport.count(),
+        1,
+        "the succeeded child call was submitted again on parent resume"
+    );
+    let acked = store
+        .journal_index(&root_run_id)
+        .expect("journal after ack");
+    let child_call_after = acked
+        .values()
+        .find(|entry| entry.kind == CallKind::Workflow)
+        .expect("child call after ack");
+    assert_eq!(child_call_after.state, CallState::Succeeded);
+    assert_eq!(child_call_after.result, Some(json!("ok")));
+}
+
+#[test]
+fn fault_host_kill_mid_run_recovers_via_replay_without_resubmission() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-fault-host-kill");
+    let transport = Arc::new(FakeTransport::new(Duration::from_millis(300)));
+    let path = script(
+        &temp,
+        "host-kill.js",
+        r#"const a = await agent("FIRST"); const b = await agent("SECOND"); return { a, b };"#,
+    );
+    let runner_root = root.clone();
+    let runner_transport = Arc::clone(&transport);
+    let path_copy = path.clone();
+    let runner = thread::spawn(move || {
+        engine(&runner_root, runner_transport).start(&path_copy, Value::Null, 1, 10)
+    });
+    // Let both submissions land, then stop the in-memory runtime. `pause` is a
+    // COOPERATIVE stand-in for a host death, not a true crash: it persists a
+    // clean Paused status rather than losing in-memory state mid-flight. What
+    // this test still proves — and what a naive controller cannot — is that a
+    // FRESH engine with no shared memory can reconstruct the run purely from
+    // persisted journal/state and drive it to completion WITHOUT resubmitting
+    // any already-settled call. The torn journal tail appended below exercises
+    // the V2-J torn-tail tolerance on top of that reconstruction. The
+    // no-resubmission assertion is robust regardless of the pause/inspect race
+    // because `transport.count()` counts submissions only, not inspections.
+    wait_for_call_count(&transport, 2);
+    let run_id = wait_for_active_run(&root);
+    engine(&root, Arc::clone(&transport))
+        .pause(&run_id)
+        .expect("pause (stop the in-memory runtime)");
+    let killed = runner.join().expect("join").expect("paused run");
+    assert_eq!(killed.status, RunStatus::Paused);
+    assert_eq!(transport.count(), 2);
+
+    // Append a torn journal tail on top of the kill, then restart fresh: a new
+    // engine (no shared memory) must reconstruct from disk and complete.
+    let store = WorkflowStore::new(&root);
+    let journal_path = store.journal_path(&run_id);
+    let mut text = fs::read_to_string(&journal_path).expect("read journal");
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("{\"at\":\"2026-01-01T00:00:00Z\",\"key\":\"agent:1\",\"sta");
+    fs::write(&journal_path, text).expect("write torn tail");
+
+    let restarted = engine(&root, Arc::clone(&transport))
+        .resume(&run_id)
+        .expect("resume after kill");
+    assert_eq!(
+        restarted.status,
+        RunStatus::Succeeded,
+        "{:?}",
+        restarted.error
+    );
+    assert_eq!(restarted.result, Some(json!({"a": "ok", "b": "ok"})));
+    assert_eq!(
+        transport.count(),
+        2,
+        "host-kill recovery resubmitted completed calls"
     );
 }
