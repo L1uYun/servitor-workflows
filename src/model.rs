@@ -153,6 +153,11 @@ pub enum CallKind {
     Command,
     Gate,
     Workflow,
+    /// A child workflow run materialized by the runtime `spawn(specs[])`
+    /// builtin. Behaves like `Workflow` for budget/cost purposes but is
+    /// distinguished in the journal so fan-out is auditable separately from
+    /// single `workflow()` dispatches.
+    Spawn,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

@@ -185,6 +185,7 @@ fn call_kind(entry: &JournalEntry) -> &'static str {
         crate::model::CallKind::Command => "command",
         crate::model::CallKind::Gate => "gate",
         crate::model::CallKind::Workflow => "workflow",
+        crate::model::CallKind::Spawn => "spawn",
     }
 }
 

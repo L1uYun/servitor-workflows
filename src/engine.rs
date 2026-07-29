@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct Engine {
     store: Arc<WorkflowStore>,
     transport: Arc<dyn Transport>,

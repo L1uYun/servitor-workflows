@@ -11,6 +11,7 @@ use boa_gc::{Finalize, Trace};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::Digest;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -28,6 +29,13 @@ globalThis.gate = async (question, options = {}) =>
   JSON.parse(await __gate(String(question), JSON.stringify(options)));
 globalThis.workflow = async (path, args = {}, options = {}) =>
   JSON.parse(await __workflow(String(path), JSON.stringify(args), JSON.stringify(options)));
+// spawn(specs[]) materializes each spec into an independent child workflow run
+// (own journal, boundary, budget attribution) and returns an array of
+// {runId, result} objects in spec order. Each spec is {path?, inline?, args?}.
+// Exactly one of path/inline is required. Child runs reuse engine.prepare_child
+// and therefore inherit MAX_WORKFLOW_DEPTH (16) and the shared max_calls ledger.
+globalThis.spawn = async specs =>
+  JSON.parse(await __spawn(JSON.stringify(Array.from(specs))));
 globalThis.supersede = async options =>
   JSON.parse(await __supersede(JSON.stringify(options || {})));
 globalThis.phase = name => __phase(String(name));
@@ -207,6 +215,7 @@ impl HostState {
                 "command" => CallKind::Command,
                 "gate" => CallKind::Gate,
                 "workflow" => CallKind::Workflow,
+                "spawn" => CallKind::Spawn,
                 _ => {
                     return Err("unknown call kind".to_owned());
                 }
@@ -673,6 +682,13 @@ fn execute_vm(
         .map_err(js_error)?;
     context
         .register_global_builtin_callable(
+            js_string!("__spawn"),
+            1,
+            NativeFunction::from_async_fn(host_spawn),
+        )
+        .map_err(js_error)?;
+    context
+        .register_global_builtin_callable(
             js_string!("__supersede"),
             1,
             NativeFunction::from_async_fn(host_supersede),
@@ -1012,6 +1028,265 @@ async fn host_workflow(
             serde_json::to_string(&result).map_err(native_error)?
         ))),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SpawnSpec {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    inline: Option<String>,
+    #[serde(default)]
+    args: Value,
+}
+
+/// `spawn(specs[])` materializes each spec into an independent child workflow
+/// run, reusing `engine.prepare_child` so depth (MAX_WORKFLOW_DEPTH = 16),
+/// boundary narrowing, and the shared max_calls ledger all apply. Each spec
+/// must carry exactly one of `path` (resolved against the parent cwd) or
+/// `inline` (materialized to a deterministic file under the parent run dir so
+/// `prepare_child` can read + canonicalize it). Returns an array of
+/// `{runId, result}` objects in spec order. Children execute sequentially in
+/// spec order; parallelism is the caller's responsibility via `parallel()`.
+/// A child that fails, waits for a human gate, or pauses aborts the whole
+/// spawn (matching `workflow()` semantics): partial results are not returned.
+async fn host_spawn(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &RefCell<&mut Context>,
+) -> JsResult<JsValue> {
+    let (specs_json, host) = {
+        let context = &mut context.borrow_mut();
+        let host = context
+            .get_data::<HostState>()
+            .cloned()
+            .ok_or_else(|| JsNativeError::error().with_message("workflow host is missing"))?;
+        (js_string_arg(args, 0, context)?, host)
+    };
+    let specs: Vec<SpawnSpec> = serde_json::from_str(&specs_json).map_err(native_error)?;
+    if specs.is_empty() {
+        return Err(native_error("spawn requires at least one spec"));
+    }
+    let engine = crate::engine::Engine::from_shared(
+        Arc::clone(&host.runtime.store),
+        Arc::clone(&host.runtime.transport),
+    );
+    let phase = host
+        .phase
+        .lock()
+        .map_err(|_| native_error("phase lock poisoned"))?
+        .clone();
+    let mut results: Vec<Value> = Vec::with_capacity(specs.len());
+    for (index, spec) in specs.into_iter().enumerate() {
+        let (path, label) = match (spec.path.as_deref(), spec.inline.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err(native_error(format!(
+                    "spawn spec {index} provides both path and inline"
+                )));
+            }
+            (None, None) => {
+                return Err(native_error(format!(
+                    "spawn spec {index} requires exactly one of path or inline"
+                )));
+            }
+            (Some(path), None) => {
+                let path_buf = std::path::PathBuf::from(path);
+                let resolved = if path_buf.is_absolute() {
+                    path_buf
+                } else {
+                    host.runtime.cwd.join(path_buf)
+                };
+                (resolved, path.to_owned())
+            }
+            (None, Some(source)) => {
+                // Materialize inline source to a deterministic path under the
+                // parent run dir so prepare_child can read + canonicalize it.
+                // Naming by content hash makes resume idempotent: the same
+                // inline source re-materializes the same path and therefore
+                // the same child run identity.
+                let dir = host
+                    .runtime
+                    .store
+                    .run_dir(&host.runtime.run_id)
+                    .join("spawn");
+                std::fs::create_dir_all(&dir)
+                    .map_err(|source| native_error(format!("spawn inline dir: {source}")))?;
+                let digest = {
+                    let mut hasher = sha2::Sha256::new();
+                    sha2::Digest::update(&mut hasher, source.as_bytes());
+                    format!("{:x}", sha2::Digest::finalize(hasher))
+                };
+                let path = dir.join(format!("inline-{digest}.js"));
+                if !path.exists() {
+                    std::fs::write(&path, source)
+                        .map_err(|source| native_error(format!("spawn inline write: {source}")))?;
+                }
+                let label = format!("inline:{}", &digest[..digest.len().min(8)]);
+                (path, label)
+            }
+        };
+        let child_args = spec.args;
+        let input = json!({ "path": path, "args": child_args });
+        let key = host.key("spawn", &input).map_err(native_error)?;
+        let existing = host
+            .runtime
+            .store
+            .journal_index(&host.runtime.run_id)
+            .map_err(native_error)?
+            .remove(&key);
+        if let Some(entry) = existing.as_ref() {
+            match entry.state {
+                CallState::Succeeded => {
+                    results.push(json!({
+                        "runId": entry.child_run_id.clone().unwrap_or_default(),
+                        "result": entry.result.clone().unwrap_or(Value::Null),
+                    }));
+                    continue;
+                }
+                CallState::Failed | CallState::Cancelled => {
+                    return Err(native_error(
+                        entry
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "spawn child failed".to_owned()),
+                    ));
+                }
+                CallState::Submitted => {}
+            }
+        }
+        let child = engine
+            .prepare_child(&host.runtime.run_id, &key, &path, child_args)
+            .map_err(native_error)?;
+        if existing.is_none() {
+            host.runtime
+                .store
+                .append(
+                    &host.runtime.run_id,
+                    &JournalEntry {
+                        at: Utc::now(),
+                        key: key.clone(),
+                        kind: CallKind::Spawn,
+                        state: CallState::Submitted,
+                        label: label.clone(),
+                        result: None,
+                        error: None,
+                        transport_run_id: None,
+                        child_run_id: Some(child.run_id.clone()),
+                        phase: phase.clone(),
+                        duration_ms: None,
+                        usage: None,
+                        schema_correction: None,
+                    },
+                )
+                .map_err(native_error)?;
+        }
+        let child_run_id = child.run_id.clone();
+        let child_state = host
+            .runtime
+            .store
+            .load_state(&child_run_id)
+            .map_err(native_error)?;
+        let final_state = if child_state.status.is_terminal() {
+            child_state
+        } else {
+            let scheduler = Arc::clone(&host.runtime.scheduler);
+            let worker_engine = engine.clone();
+            let (sender, receiver) = futures_channel::oneshot::channel();
+            let owned_id = child_run_id.clone();
+            thread::spawn(move || {
+                let result = worker_engine.execute_child(&owned_id, scheduler);
+                let _ = sender.send(result);
+            });
+            receiver
+                .await
+                .map_err(|_| native_error("spawn child worker dropped"))?
+                .map_err(native_error)?
+        };
+        let (call_state, result, error) = match final_state.status {
+            RunStatus::Succeeded => (
+                CallState::Succeeded,
+                final_state.result.unwrap_or(Value::Null),
+                None,
+            ),
+            RunStatus::WaitingHuman => {
+                let gate = final_state
+                    .waiting_gate
+                    .clone()
+                    .ok_or_else(|| native_error("waiting spawn child has no gate"))?;
+                let origin_run_id = gate
+                    .origin_run_id
+                    .clone()
+                    .unwrap_or_else(|| child.run_id.clone());
+                let bubbled = GateRequest {
+                    origin_run_id: Some(origin_run_id.clone()),
+                    ..gate
+                };
+                host.runtime
+                    .transition(
+                        WorkflowEvent::GateOpened {
+                            key: bubbled.key.clone(),
+                            origin_run_id: Some(origin_run_id),
+                            label: bubbled.label.clone(),
+                            question: bubbled.question.clone(),
+                            expect: bubbled.expect.clone(),
+                            current: bubbled.current.clone(),
+                            hint: bubbled.hint.clone(),
+                        },
+                        |state| {
+                            state.status = RunStatus::WaitingHuman;
+                            state.waiting_gate = Some(bubbled);
+                        },
+                    )
+                    .map_err(native_error)?;
+                return Err(native_error("spawn child is waiting for human input"));
+            }
+            RunStatus::Paused | RunStatus::Pausing => {
+                return Err(native_error("spawn child is paused"));
+            }
+            _ => (
+                CallState::Failed,
+                Value::Null,
+                Some(
+                    final_state
+                        .error
+                        .unwrap_or_else(|| "spawn child failed".to_owned()),
+                ),
+            ),
+        };
+        host.runtime
+            .store
+            .append(
+                &host.runtime.run_id,
+                &JournalEntry {
+                    at: Utc::now(),
+                    key: key.clone(),
+                    kind: CallKind::Spawn,
+                    state: call_state.clone(),
+                    label: label.clone(),
+                    result: (call_state == CallState::Succeeded).then_some(result.clone()),
+                    error: error.clone(),
+                    transport_run_id: None,
+                    child_run_id: Some(child.run_id.clone()),
+                    phase: phase.clone(),
+                    duration_ms: None,
+                    usage: None,
+                    schema_correction: None,
+                },
+            )
+            .map_err(native_error)?;
+        if let Some(budget) = host.budget.as_ref() {
+            budget.settle(&key, None, 0).map_err(native_error)?;
+        }
+        host.remember_journal_key(&key).map_err(native_error)?;
+        if let Some(error) = error {
+            return Err(native_error(error));
+        }
+        results.push(json!({ "runId": child.run_id, "result": result }));
+    }
+    Ok(JsValue::from(js_string!(
+        serde_json::to_string(&results).map_err(native_error)?
+    )))
 }
 
 async fn host_gate(

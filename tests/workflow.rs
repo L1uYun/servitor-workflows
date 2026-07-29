@@ -4886,3 +4886,171 @@ fn fault_host_kill_mid_run_recovers_via_replay_without_resubmission() {
         "host-kill recovery resubmitted completed calls"
     );
 }
+
+// ---------------------------------------------------------------------------
+// spawn(specs[]) builtin — runtime fan-out into independent child runs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spawn_builtin() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-spawn-builtin");
+    let path = script(
+        &temp,
+        "spawn-builtin.js",
+        r#"const child = 'export const meta = { name: "c", contract: "workflow" }; return { i: args.i };';
+const specs = [
+  { inline: child, args: { i: 1 } },
+  { inline: child, args: { i: 2 } },
+];
+const r = await spawn(specs);
+return { count: r.length, ids: r.map(x => x.runId), vals: r.map(x => x.result.i) };"#,
+    );
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 20)
+        .expect("spawn workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let result = state.result.expect("result");
+    assert_eq!(result["count"], 2);
+    let ids = result["ids"].as_array().expect("ids array");
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(result["vals"], json!([1, 2]));
+
+    // Two spawn child runs are linked from the parent journal with distinct
+    // child_run_id values and a "spawn" call kind.
+    let store = WorkflowStore::new(&root);
+    let journal = fs::read_to_string(store.journal_path(&state.run_id)).expect("journal");
+    let child_ids: Vec<String> = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("journal entry"))
+        .filter(|entry| entry["kind"] == "spawn" && entry["state"] == "succeeded")
+        .filter_map(|entry| entry["child_run_id"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(child_ids.len(), 2, "two spawn children in parent journal");
+    assert_ne!(child_ids[0], child_ids[1]);
+}
+
+#[test]
+fn spawn_depth_guard() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-spawn-depth");
+    // A linear chain of 17 DISTINCT scripts. Each spawns the next by filename;
+    // distinct sources keep the cycle detector quiet so MAX_WORKFLOW_DEPTH=16
+    // is the only thing that can stop the chain. Preparing the depth-16 child
+    // from depth-15 sees 16 ancestors and must reject.
+    for n in 0..=16u32 {
+        let body = if n == 16 {
+            format!("return {{ level: {n} }};")
+        } else {
+            format!(
+                "const r = await spawn([{{ path: \"depth-{}.js\", args: {{}} }}]);\nreturn {{ level: {n}, child: r[0].result }};",
+                n + 1
+            )
+        };
+        fs::write(
+            temp.path().join(format!("depth-{n}.js")),
+            format!(
+                "export const meta = {{ name: \"depth-{n}\", contract: \"workflow\" }};\n{body}",
+            ),
+        )
+        .expect("write depth script");
+    }
+    let path = temp.path().join("depth-0.js");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, Value::Null, 1, 1000)
+        .expect("terminal depth workflow");
+    assert_eq!(state.status, RunStatus::Failed, "{:?}", state.status);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("maximum depth"),
+        "depth guard error: {:?}",
+        state.error
+    );
+}
+
+#[test]
+fn spawn_budget_attribution() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-spawn-budget");
+    let path = temp.path().join("spawn-budget.js");
+    fs::write(
+        &path,
+        r#"export const meta = { name: "spawn-budget", contract: "workflow" };
+const child = 'export const meta = { name: "c", contract: "workflow" }; const a = await agent("hello " + args.label); return { label: args.label, ok: a };';
+const specs = [
+  { inline: child, args: { label: "x" } },
+  { inline: child, args: { label: "y" } },
+  { inline: child, args: { label: "z" } },
+];
+const r = await spawn(specs);
+return { count: r.length };"#,
+    )
+    .expect("write budget workflow");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 1, 100)
+        .expect("budget workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+
+    // Each of the 3 children made one agent call. Those calls must land in the
+    // shared root budget ledger (keys prefixed with the child run id), proving
+    // child runs count toward the shared max_calls ledger — not just the
+    // parent's spawn reservations.
+    let store = WorkflowStore::new(&root);
+    let ledger = store
+        .reconstruct_budget(&state.run_id)
+        .expect("reconstruct root ledger");
+    let child_call_keys = ledger
+        .reservations
+        .keys()
+        .filter(|key| key.starts_with("child-"))
+        .count();
+    assert!(
+        child_call_keys >= 3,
+        "expected >=3 child-attributed reservations in root ledger, got {child_call_keys}: {:?}",
+        ledger.reservations.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        ledger.used_calls >= 3,
+        "expected >=3 settled calls in root ledger, got {}",
+        ledger.used_calls
+    );
+    assert_eq!(transport.count(), 3, "one provider call per spawned child");
+}
+
+#[test]
+fn spawn_probe_fanout() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("state-spawn-probe");
+    let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("spawn-fanout.workflow.js");
+    let path = temp.path().join("spawn-fanout.workflow.js");
+    fs::copy(&example, &path).expect("copy example workflow");
+    let state = engine(&root, Arc::new(FakeTransport::new(Duration::ZERO)))
+        .start(&path, json!({ "count": 3 }), 1, 20)
+        .expect("probe workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(state.result.expect("result")["count"], 3);
+
+    // The probe must produce N>1 child run ids in the parent journal from a
+    // single spawn() call (runtime-determined fan-out).
+    let store = WorkflowStore::new(&root);
+    let journal = fs::read_to_string(store.journal_path(&state.run_id)).expect("journal");
+    let child_ids: Vec<String> = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("journal entry"))
+        .filter(|entry| entry["kind"] == "spawn")
+        .filter_map(|entry| entry["child_run_id"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        child_ids.len() > 1,
+        "expected N>1 child run ids in parent journal, got {}: {:?}",
+        child_ids.len(),
+        child_ids
+    );
+}
