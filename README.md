@@ -94,7 +94,11 @@ workflow scripts: `Date.now()`, `Math.random()`, argless `new Date()`, and
 }
 ```
 
-The default agent is `pi`.
+The default agent is `pi`. When specifying a model for pi, use the
+`provider/model-id` format (e.g. `"newapi/glm-5.2"`). The provider prefix must
+match a key in `~/.pi/agent/models.json` → `providers`. A bare model id (e.g.
+`"glm-5.2"`) makes pi guess the upstream provider by name and fails with
+"No API key found for \<guessed-provider\>".
 
 When an agent call requests structured output, the runtime extracts JSON from free-form model text by:
 strip reasoning wrappers → collect candidates (whole text, fenced ```json, balanced `{...}`/`[...]` spans) → trailing-comma repair → shape filter from schema `type` → **schema-valid selection** (required/properties/items): if several candidates validate, take the **last** (final-answer convention). Schema is a selection criterion among candidates, not only a post-check on the first shape match. Pure whole-text JSON still works.
@@ -266,7 +270,9 @@ requirements:
 ```javascript
 capabilities: {
   providers: [
-    { agent: "pi", model: "local", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 },
+    // pi model format: "provider/model-id" (see ~/.pi/agent/models.json).
+    // Bare model ids make pi guess the upstream provider and fail.
+    { agent: "pi", model: "newapi/glm-5.2", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 400000 },
   ],
   roles: {
     maker: { requires: ["reasoning"], effort: "high", contextTokens: 100000 },

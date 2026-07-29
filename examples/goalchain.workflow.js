@@ -28,7 +28,10 @@ export const meta = {
   // fire, and declaring dead policy would overstate the guarantee.
   capabilities: {
     providers: [
-      { agent: "pi", model: "local", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 },
+      // pi model format: "provider/model-id" (see ~/.pi/agent/models.json).
+      // Bare model ids (e.g. "glm-5.2") make pi guess the upstream provider
+      // and fail with "No API key found for <guessed-provider>".
+      { agent: "pi", model: "newapi/glm-5.2", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 400000 },
     ],
     roles: {
       maker: { requires: ["reasoning"], effort: "high", contextTokens: 100000 },
