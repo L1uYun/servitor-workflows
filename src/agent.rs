@@ -7,13 +7,74 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use servitor::{Input, Output, RunState as ServitorState, SubmitRequest};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const INVALID_OUTPUT_EXCERPT_MAX_CHARS: usize = 2_000;
 type RecoveredStructuredOutput = (Value, Option<u64>, Option<Value>);
+
+/// In-memory continuation session cache shared across agent calls within one
+/// engine execution. Keyed by resolved agent identity (`agent\0model`) so
+/// stages that select the same provider/model reuse the session the daemon
+/// returned from the previous stage instead of starting cold. The cache is
+/// populated only by successful submits in the current execution; it is not
+/// persisted (succeeded calls short-circuit on resume, so a resumed run does
+/// not re-submit and therefore does not need the prior session id).
+pub(crate) type ContinuationCache = Arc<Mutex<BTreeMap<String, String>>>;
+
+pub(crate) fn continuation_cache_new() -> ContinuationCache {
+    Arc::new(Mutex::new(BTreeMap::new()))
+}
+
+fn continuation_cache_key(agent: &str, model: Option<&str>) -> String {
+    format!("{agent}\0{}", model.unwrap_or(""))
+}
+
+/// Resolve the continuation to seed the first submit of a call. Returns the
+/// explicitly-seeded continuation if the script supplied one (and records it
+/// so a same-session correction or later stage can reuse it when the daemon
+/// echoes none), the cached value for the resolved agent when default-ON
+/// threading applies, or `None` when the stage opted out or no session is
+/// known yet.
+fn seed_continuation(cache: &ContinuationCache, options: &AgentOptions) -> Option<String> {
+    if options.no_continuation {
+        return None;
+    }
+    let agent = options.agent.clone().unwrap_or_else(|| "pi".to_owned());
+    if let Some(explicit) = options.continuation.as_ref() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(continuation_cache_key(&agent, options.model.as_deref()), explicit.clone());
+        }
+        return Some(explicit.clone());
+    }
+    match cache.lock() {
+        Ok(guard) => guard.get(&continuation_cache_key(&agent, options.model.as_deref())).cloned(),
+        Err(_) => None,
+    }
+}
+
+/// Record the continuation a successful transport run returned so later
+/// stages selecting the same resolved agent/model can reuse the session. A
+/// stage that opted out via `no_continuation` does not pollute the cache.
+fn record_continuation(
+    cache: &ContinuationCache,
+    options: &AgentOptions,
+    record: &servitor::RunRecord,
+) {
+    if options.no_continuation {
+        return;
+    }
+    if let Some(continuation) = record.continuation.as_ref() {
+        let agent = options.agent.clone().unwrap_or_else(|| "pi".to_owned());
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(continuation_cache_key(&agent, options.model.as_deref()), continuation.clone());
+        }
+    }
+}
 
 pub trait Transport: Send + Sync {
     fn submit(
@@ -73,6 +134,19 @@ pub struct AgentOptions {
     pub effort: Option<crate::capabilities::Effort>,
     #[serde(default)]
     pub context_tokens: Option<u64>,
+    /// Explicit continuation session id seed. When set, the first submit of
+    /// this call uses this continuation (opt-in seeding). When unset and
+    /// `no_continuation` is false, the call reuses the last continuation
+    /// recorded for the same resolved agent in this run (default-ON memory).
+    #[serde(default)]
+    pub continuation: Option<String>,
+    /// Per-stage opt-out of cross-call continuation threading. When true, the
+    /// first submit of this call carries no continuation regardless of the
+    /// cache. The schema-correction retry still threads the failed attempt's
+    /// own continuation (the "makeup exam" fix) because that is same-session,
+    /// not cross-call memory.
+    #[serde(default)]
+    pub no_continuation: bool,
 }
 
 pub(crate) struct AgentCall {
@@ -102,6 +176,7 @@ pub(crate) fn run(
     run_id: &str,
     default_cwd: &Path,
     call: AgentCall,
+    continuation_cache: &ContinuationCache,
 ) -> JobResult {
     let AgentCall {
         key,
@@ -147,6 +222,13 @@ pub(crate) fn run(
                     && let Ok(Some((result, duration_ms, usage))) =
                         try_recover_structured(transport, transport_run_id, options.schema.as_ref())
                 {
+                    // The transport run is already terminal on disk; refresh
+                    // the continuation cache from it so a later stage selecting
+                    // the same resolved agent/model still threads the session
+                    // forward after a resume.
+                    if let Ok(record) = transport.inspect(transport_run_id) {
+                        record_continuation(continuation_cache, &options, &record);
+                    }
                     append(
                         CallState::Succeeded,
                         Some(result.clone()),
@@ -163,7 +245,7 @@ pub(crate) fn run(
                     .clone()
                     .unwrap_or_else(|| "schema correction was already exhausted".to_owned()));
             }
-            CallState::Failed | CallState::Submitted | CallState::Cancelled => {}
+            CallState::Failed | CallState::Submitted | CallState::Cancelled | CallState::Rejected => {}
         }
     }
 
@@ -189,11 +271,13 @@ pub(crate) fn run(
             (transport_run_id, record)
         }
         _ => {
+            let seed = seed_continuation(continuation_cache, &options);
             let response = submit(
                 transport,
                 &options,
                 default_cwd,
                 structured_prompt(&prompt, options.schema.as_ref()),
+                seed.as_deref(),
             )?;
             append(
                 CallState::Submitted,
@@ -229,6 +313,13 @@ pub(crate) fn run(
     if first_record.state != ServitorState::Succeeded {
         return finish_transport_failure(&append, first_run_id, first_record, resumed_correction);
     }
+
+    // Thread the session forward: a succeeded submit's returned continuation
+    // becomes the cache entry the next stage selecting the same resolved
+    // agent/model will reuse. Done before the resumed-correction and
+    // schema-correction branches so the correction retry below can also see
+    // the just-recorded session id of the failed first attempt.
+    record_continuation(continuation_cache, &options, &first_record);
 
     let (first_duration_ms, first_usage) = record_metrics(&first_record);
     if let Some(mut metadata) = resumed_correction {
@@ -290,7 +381,28 @@ pub(crate) fn run(
                 &first_error,
                 &invalid_output,
             );
-            let correction = match submit(transport, &options, default_cwd, correction_prompt) {
+            // Makeup-exam fix: the correction retry carries the continuation of
+            // the FAILED first attempt (returned by the daemon and just
+            // recorded) so the model sees its own prior reasoning instead of a
+            // cold re-read with only a 2000-char output excerpt. Falls back to
+            // the seeded/cache continuation only when the daemon returned none;
+            // `no_continuation` keeps the retry cold as well because the whole
+            // stage opted out.
+            let retry_continuation = if options.no_continuation {
+                None
+            } else {
+                first_record
+                    .continuation
+                    .clone()
+                    .or_else(|| seed_continuation(continuation_cache, &options))
+            };
+            let correction = match submit(
+                transport,
+                &options,
+                default_cwd,
+                correction_prompt,
+                retry_continuation.as_deref(),
+            ) {
                 Ok(response) => response,
                 Err(error) => {
                     let metadata = SchemaCorrectionMetadata {
@@ -351,6 +463,10 @@ pub(crate) fn run(
                     Some(metadata),
                 );
             }
+            // A successful correction submit may itself return a continuation
+            // (continuation of the resumed session). Thread it forward the
+            // same way as the primary submit so a following stage reuses it.
+            record_continuation(continuation_cache, &options, &correction_record);
             let (duration_ms, usage) = record_metrics(&correction_record);
             match materialize_output(correction_record.output.as_ref(), options.schema.as_ref()) {
                 Ok(result) => {
@@ -468,6 +584,7 @@ fn submit(
     options: &AgentOptions,
     default_cwd: &Path,
     text: String,
+    continuation: Option<&str>,
 ) -> Result<servitor::SubmitResponse, String> {
     transport
         .submit(SubmitRequest {
@@ -476,7 +593,7 @@ fn submit(
             input: Input::Text { text },
             cwd: resolve_cwd(default_cwd, options.cwd.as_deref()),
             system_prompt: options.system_prompt.clone(),
-            continuation: None,
+            continuation: continuation.map(str::to_owned),
             timeout_seconds: options.timeout_seconds,
             native_args: options.native_args.clone(),
         })

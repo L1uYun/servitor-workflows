@@ -158,6 +158,13 @@ pub enum CallKind {
     /// distinguished in the journal so fan-out is auditable separately from
     /// single `workflow()` dispatches.
     Spawn,
+    /// A stage-boundary verify outcome (reject marker) written by the
+    /// `pipeline()` verify gate. The verify LLM call itself is a normal
+    /// `Agent` call (it reuses `agent()` and therefore capability resolution,
+    /// continuation threading, and budget gating); this kind tags only the
+    /// visible reject marker so verify outcomes are auditable separately from
+    /// regular agent calls and distinguishable from null/empty output.
+    Verify,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -207,6 +214,15 @@ pub enum CallState {
     Succeeded,
     Failed,
     Cancelled,
+    /// A stage-boundary verify gate rejected the upstream stage output. The
+    /// item is NOT null: this state plus the `error` field on the same
+    /// `JournalEntry` (with `kind: Verify`) records the reject reason so the
+    /// downstream stage can be audited to have skipped the item without
+    /// silently swallowing it. Distinguished from `Failed` because verify
+    /// rejection is a handoff decision, not a call execution failure: the
+    /// upstream call already succeeded, the pipeline simply refused to pass
+    /// its output forward.
+    Rejected,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]

@@ -212,7 +212,13 @@ const semantic = await agent(
     "tokens. Return approved=true only if scope, numbers, and prohibited",
     "actions all hold.",
   ].join("\n"),
-  { label: "semantic-gate", role: "semantic", timeoutSeconds: 900, schema: semanticSchema },
+  // noContinuation: the semantic gate is an independent semantic review, not a
+  // continuation of the worker's session. Default-ON continuation threading
+  // would otherwise let the maker and semantic roles share a session when they
+  // resolve to the same agent/model (see B1). Forcing a cold review preserves
+  // the semantic gate's independence in the same run, so the worker's prior
+  // reasoning cannot prime the verdict on its own work.
+  { label: "semantic-gate", role: "semantic", timeoutSeconds: 900, schema: semanticSchema, noContinuation: true },
 );
 if (semantic.approved !== true) {
   throw new Error("semantic gate rejected: " + JSON.stringify(semantic));

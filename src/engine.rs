@@ -859,6 +859,7 @@ impl Engine {
             boundary: initial.boundary.clone(),
             capabilities: initial.capabilities.clone(),
             budget,
+            continuation_cache: crate::agent::continuation_cache_new(),
         });
         let result = script::execute(runtime, &source, &initial.args, initial.max_calls);
         let current = self.store.load_state(run_id)?;

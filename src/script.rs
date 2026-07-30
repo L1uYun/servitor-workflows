@@ -23,6 +23,24 @@ const BOOTSTRAP: &str = r#"
 globalThis.args = JSON.parse(__argsJson);
 globalThis.agent = async (prompt, options = {}) =>
   JSON.parse(await __agent(String(prompt), JSON.stringify(options)));
+// agentLastContinuation() returns the last continuation session id the
+// runtime cached for the most recent successful agent submit in this run
+// (default-ON cross-stage memory). Returns null when no session has been
+// recorded yet. It is a read-only escape hatch for scripts that need to
+// inspect or log the threaded session; it does NOT mutate the cache.
+// Intentionally NOT keyed by agent/model so a script can observe the last
+// session regardless of which provider/model produced it.
+globalThis.agentLastContinuation = () => __agentLastContinuation();
+// agentDropContinuation() clears the cached continuation session for a
+// resolved agent/model (or all when called with no args). Per-stage opt-out
+// is preferred (agent options.noContinuation = true) because it is
+// declarative and self-scoping; this imperative escape hatch covers the
+// rare case where a script must reset cross-call memory mid-run without
+// touching the next call's options (e.g. a privacy/rotation boundary).
+// Returns undefined and never throws.
+globalThis.agentDropContinuation = (agent, model) => {
+  try { __agentDropContinuation(String(agent == null ? '' : agent), String(model == null ? '' : model)); } catch (e) {}
+};
 globalThis.command = async (program, argv = [], options = {}) =>
   JSON.parse(await __command(String(program), JSON.stringify(argv), JSON.stringify(options)));
 globalThis.gate = async (question, options = {}) =>
@@ -60,22 +78,113 @@ globalThis.parallel = entries => {
 // independently per item — no cross-item barrier between stages. Each stage
 // callback receives (prevResult, originalItem, index). A stage that throws
 // (or rejects) drops only its own item to null and skips that item's remaining
-// stages. pipeline never rejects. The degenerate pipeline(items, worker) call
-// is the N=1 case and produces the same results as before (minus reject).
+// stages. pipeline never rejects.
+//
+// B2 stage-boundary verify gate: between stages, a verify gate fires by
+// default (default-ON). An independent reviewer agent reviews the upstream
+// stage output before the downstream stage accepts it. A stage may opt out via
+// `noVerify: true` or declare a declarative assertion `{command, args?,
+// exitCode?}` that runs FIRST as a cheap machine check; only if it passes (or
+// is absent) does the LLM review run. On verify fail, the item is marked
+// rejected (NOT null): the reject reason is written to the journal via
+// __verify_reject, and a Rejected marker is returned so the caller can
+// distinguish verify rejection from null/empty output. The LAST stage has no
+// downstream boundary, so no verify fires for it — the degenerate
+// pipeline(items, worker) N=1 case is unchanged.
+//
+// Stages may be plain functions (backward-compatible) or stage objects:
+//   { run: (prev, item, idx) => ...,
+//     verify: { prompt?, role?, agent?, model?, schema?, ...agentOptions } | null,
+//     noVerify: false,
+//     declarative: { command, args?, exitCode? } | null }
+const __REJECTED_KEY = "__servitor_rejected__";
+function __rejected(reason) {
+  return { [__REJECTED_KEY]: true, reason: String(reason == null ? "" : reason) };
+}
+function __isRejected(v) {
+  return v != null && typeof v === "object" && v[__REJECTED_KEY] === true;
+}
+async function __pipeline_verify(output, stage, item, idx, stageIdx) {
+  if (stage.noVerify === true) return null;
+  // Declarative fast-path: run a cheap machine check FIRST. If it fails,
+  // short-circuit to reject WITHOUT invoking the LLM reviewer.
+  if (stage.declarative) {
+    const d = stage.declarative;
+    const expected = d.exitCode == null ? 0 : d.exitCode;
+    let cmdResult;
+    try {
+      cmdResult = await command(d.command, d.args || [], {
+        label: `verify-stage-${stageIdx}-declarative`,
+      });
+    } catch (e) {
+      return __rejected(
+        `declarative assertion failed: ${String(e && e.message ? e.message : e)}`
+      );
+    }
+    if (cmdResult.exitCode !== expected) {
+      return __rejected(
+        `declarative assertion failed: exit code ${cmdResult.exitCode}`
+      );
+    }
+  }
+  // LLM review: an independent agent reviews the upstream stage output.
+  // noContinuation is forced true so the reviewer never inherits the maker's
+  // session — verify is a cold review, not a continuation of the work. The
+  // reviewer role (with independent_from) is resolved through the normal
+  // capability path, which rejects same-model independent roles before
+  // transport submission.
+  const v = stage.verify || {};
+  const prompt =
+    v.prompt ||
+    `Review the following stage output for acceptability. Return JSON with "pass" (boolean) and "reason" (string explaining any rejection).\n\nOutput:\n${JSON.stringify(output)}`;
+  const schema =
+    v.schema || {
+      type: "object",
+      required: ["pass", "reason"],
+      properties: {
+        pass: { type: "boolean" },
+        reason: { type: "string" },
+      },
+    };
+  const opts = Object.assign({}, v, { schema, noContinuation: true });
+  delete opts.prompt;
+  let review;
+  try {
+    review = await agent(prompt, opts);
+  } catch (e) {
+    return __rejected(
+      `verify agent failed: ${String(e && e.message ? e.message : e)}`
+    );
+  }
+  if (review && review.pass === false) {
+    return __rejected(review.reason || "verify rejected");
+  }
+  return null;
+}
 globalThis.pipeline = (items, ...stages) => {
   const arr = Array.from(items);
-  const fns = stages.filter(s => typeof s === 'function');
-  return Promise.all(arr.map((item, idx) => (async () => {
-    let cur = item;
-    for (let s = 0; s < fns.length; s++) {
-      try {
-        cur = await fns[s](cur, item, idx);
-      } catch (e) {
-        return null;
+  const normalized = stages.map((s) => (typeof s === "function" ? { run: s } : s));
+  return Promise.all(
+    arr.map((item, idx) => (async () => {
+      let cur = item;
+      for (let s = 0; s < normalized.length; s++) {
+        const stage = normalized[s];
+        try {
+          cur = await stage.run(cur, item, idx);
+        } catch (e) {
+          return null;
+        }
+        if (s < normalized.length - 1) {
+          const verdict = await __pipeline_verify(cur, stage, item, idx, s);
+          if (__isRejected(verdict)) {
+            await __verify_reject(verdict.reason, JSON.stringify(item), s);
+            return verdict;
+          }
+        }
       }
-    }
-    return cur;
-  })()));
+      return cur;
+    })())
+  );
 };
 // log(message) streams narration to workflow.log in the run record dir via the
 // __log host function. It never becomes a journal entry. Resume idempotency is
@@ -176,6 +285,12 @@ struct HostState {
     #[unsafe_ignore_trace]
     budget: Option<crate::budget::Budget>,
     max_calls: usize,
+    /// Mirror of the runtime's continuation cache for the JS escape hatches
+    /// `agentLastContinuation()` / `agentDropContinuation()`. Sharing the same
+    /// `Arc` the agent dispatcher writes keeps the script-side read consistent
+    /// with what the next `agent()` call will actually seed from.
+    #[unsafe_ignore_trace]
+    continuation_cache: crate::agent::ContinuationCache,
 }
 
 impl JsData for HostState {}
@@ -216,6 +331,7 @@ impl HostState {
                 "gate" => CallKind::Gate,
                 "workflow" => CallKind::Workflow,
                 "spawn" => CallKind::Spawn,
+                "verify" => CallKind::Verify,
                 _ => {
                     return Err("unknown call kind".to_owned());
                 }
@@ -631,6 +747,7 @@ fn execute_vm(
 ) -> Result<Value, WorkflowError> {
     let mut context = Context::default();
     let budget = runtime.budget.clone();
+    let continuation_cache = Arc::clone(&runtime.continuation_cache);
     let journal_index = runtime
         .store
         .journal_index(&runtime.run_id)
@@ -651,12 +768,27 @@ fn execute_vm(
         phase: Arc::new(Mutex::new(initial_phase)),
         budget,
         max_calls,
+        continuation_cache,
     });
     context
         .register_global_builtin_callable(
             js_string!("__agent"),
             2,
             NativeFunction::from_async_fn(host_agent),
+        )
+        .map_err(js_error)?;
+    context
+        .register_global_builtin_callable(
+            js_string!("__agentLastContinuation"),
+            0,
+            NativeFunction::from_fn_ptr(host_agent_last_continuation),
+        )
+        .map_err(js_error)?;
+    context
+        .register_global_builtin_callable(
+            js_string!("__agentDropContinuation"),
+            2,
+            NativeFunction::from_fn_ptr(host_agent_drop_continuation),
         )
         .map_err(js_error)?;
     context
@@ -713,6 +845,13 @@ fn execute_vm(
             js_string!("__log"),
             1,
             NativeFunction::from_fn_ptr(host_log),
+        )
+        .map_err(js_error)?;
+    context
+        .register_global_builtin_callable(
+            js_string!("__verify_reject"),
+            3,
+            NativeFunction::from_async_fn(host_verify_reject),
         )
         .map_err(js_error)?;
     context
@@ -789,6 +928,61 @@ async fn host_agent(
     Ok(JsValue::from(js_string!(
         serde_json::to_string(&result).map_err(native_error)?
     )))
+}
+
+// agentLastContinuation() — JS escape hatch. Returns the most recently
+// recorded continuation session id for this run as a string, or null when
+// none is cached. The cache is keyed by resolved agent/model; this surface
+// returns the last one inserted regardless of key, which is what a script
+// almost always wants when inspecting "where did the session get to".
+fn host_agent_last_continuation(
+    _this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let host = context
+        .get_data::<HostState>()
+        .cloned()
+        .ok_or_else(|| JsNativeError::error().with_message("workflow host is missing"))?;
+    let last = host
+        .continuation_cache
+        .lock()
+        .map_err(|_| native_error("continuation lock poisoned"))?
+        .values()
+        .last()
+        .cloned();
+    match last {
+        Some(value) => Ok(JsValue::from(js_string!(value))),
+        None => Ok(JsValue::null()),
+    }
+}
+
+// agentDropContinuation(agent, model) — imperative escape hatch. When both
+// args are non-empty strings, drops only the entry for that resolved
+// agent/model. When agent is empty (the call-site passes no args), drops
+// every cached entry. Never throws.
+fn host_agent_drop_continuation(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let host = context
+        .get_data::<HostState>()
+        .cloned()
+        .ok_or_else(|| JsNativeError::error().with_message("workflow host is missing"))?;
+    let agent = js_string_arg(args, 0, context).unwrap_or_default();
+    let model = js_string_arg(args, 1, context).unwrap_or_default();
+    let mut guard = host
+        .continuation_cache
+        .lock()
+        .map_err(|_| native_error("continuation lock poisoned"))?;
+    if agent.is_empty() {
+        guard.clear();
+    } else {
+        let key = format!("{agent}\0{model}");
+        guard.remove(&key);
+    }
+    Ok(JsValue::undefined())
 }
 
 async fn host_command(
@@ -877,7 +1071,7 @@ async fn host_workflow(
                         .map_err(native_error)?
                 )));
             }
-            CallState::Failed | CallState::Cancelled => {
+            CallState::Failed | CallState::Cancelled | CallState::Rejected => {
                 return Err(native_error(
                     entry
                         .error
@@ -1144,7 +1338,7 @@ async fn host_spawn(
                     }));
                     continue;
                 }
-                CallState::Failed | CallState::Cancelled => {
+                CallState::Failed | CallState::Cancelled | CallState::Rejected => {
                     return Err(native_error(
                         entry
                             .error
@@ -1492,6 +1686,88 @@ fn host_log(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResul
             let _ = file.sync_data();
         }
     }
+    Ok(JsValue::undefined())
+}
+
+// __verify_reject appends a visible reject marker to the journal so a
+// pipeline() verify-gate rejection is distinguishable from a null/empty
+// output. The item is NOT null: the journal records CallKind::Verify with
+// CallState::Rejected and the reject reason in the `error` field, so the
+// downstream stage can be audited to have skipped the item. It returns
+// undefined and never throws; a journal write failure is swallowed because
+// the JS-side pipeline already holds the Rejected marker in-band. `item_json`
+// is the original item's JSON serialization (so the journal records which
+// item was rejected at which stage index). `stage_index` is the 0-based
+// upstream stage number whose output was rejected.
+async fn host_verify_reject(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &RefCell<&mut Context>,
+) -> JsResult<JsValue> {
+    let (reason, item_json, stage_index, host) = {
+        let context = &mut context.borrow_mut();
+        let host = context
+            .get_data::<HostState>()
+            .cloned()
+            .ok_or_else(|| JsNativeError::error().with_message("workflow host is missing"))?;
+        (
+            js_string_arg(args, 0, context)?,
+            js_string_arg(args, 1, context)?,
+            args.get_or_undefined(2)
+                .to_number(context)
+                .map_err(native_error)?,
+            host,
+        )
+    };
+    let input = json!({
+        "reason": reason,
+        "item": item_json,
+        "stage_index": stage_index,
+    });
+    let key = host.key("verify", &input).map_err(native_error)?;
+    let phase = host
+        .phase
+        .lock()
+        .map_err(|_| native_error("phase lock poisoned"))?
+        .clone();
+    // Resume idempotency: if this reject was already journaled in a prior
+    // execution, don't append a duplicate entry — the key is already in the
+    // journal and replay made it free.
+    let already_rejected = host
+        .runtime
+        .store
+        .journal_index(&host.runtime.run_id)
+        .map_err(native_error)?
+        .get(&key)
+        .is_some();
+    if !already_rejected {
+        let label = format!("verify-stage-{}", stage_index as i64);
+        host.runtime
+            .store
+            .append(
+                &host.runtime.run_id,
+                &JournalEntry {
+                    at: Utc::now(),
+                    key: key.clone(),
+                    kind: CallKind::Verify,
+                    state: CallState::Rejected,
+                    label,
+                    result: None,
+                    error: Some(reason.clone()),
+                    transport_run_id: None,
+                    child_run_id: None,
+                    phase,
+                    duration_ms: None,
+                    usage: None,
+                    schema_correction: None,
+                },
+            )
+            .map_err(native_error)?;
+    }
+    if let Some(budget) = host.budget.as_ref() {
+        let _ = budget.settle(&key, None, 0);
+    }
+    host.remember_journal_key(&key).map_err(native_error)?;
     Ok(JsValue::undefined())
 }
 

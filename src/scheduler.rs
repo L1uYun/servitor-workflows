@@ -1,4 +1,4 @@
-use crate::agent::{AgentCall, AgentOptions, Transport};
+use crate::agent::{AgentCall, AgentOptions, ContinuationCache, Transport};
 use crate::boundary::{
     BoundaryEvent, BoundaryPolicy, NetworkEvidenceSource, ensure_command_policy,
     observed_undeclared_writes, snapshot_git, snapshot_observable_files,
@@ -100,6 +100,12 @@ pub struct RuntimeHost {
     pub capabilities: Option<CapabilityPolicy>,
     /// Shared budget handle. `None` for legacy runs.
     pub budget: Option<Budget>,
+    /// In-memory continuation session cache shared by all agent calls in this
+    /// run. Populated by successful submits; read by later stages selecting
+    /// the same resolved agent/model to thread the session forward (the
+    /// default-ON cross-call memory for stages/retries). Owned here so every
+    /// `RuntimeHost::agent` dispatch in the run shares one cache.
+    pub continuation_cache: ContinuationCache,
 }
 
 impl RuntimeHost {
@@ -137,6 +143,7 @@ impl RuntimeHost {
         let boundary = self.boundary.clone();
         let capabilities = self.capabilities.clone();
         let budget = self.budget.clone();
+        let continuation_cache = Arc::clone(&self.continuation_cache);
         self.scheduler.submit(move || {
             let result = with_active(
                 &store,
@@ -182,7 +189,14 @@ impl RuntimeHost {
                         &resolved_cwd,
                         true,
                     )?;
-                    crate::agent::run(&store, transport.as_ref(), &run_id, &cwd, call)
+                    crate::agent::run(
+                        &store,
+                        transport.as_ref(),
+                        &run_id,
+                        &cwd,
+                        call,
+                        &continuation_cache,
+                    )
                 },
             );
             settle_budget(budget.as_ref(), &store, &active_key, result)

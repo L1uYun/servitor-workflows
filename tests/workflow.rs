@@ -176,6 +176,15 @@ impl Transport for FakeTransport {
             // record before the result is persisted. Handled below by removing
             // the just-inserted record so the first `inspect` fails "missing".
             "ok".to_owned()
+        } else if prompt.contains("Review the following stage output") {
+            // B2 verify gate: the default-ON LLM review prompt. The FakeTransport
+            // returns a pass verdict unless the upstream output contains the
+            // "FAIL_ME" marker, in which case it returns a fail verdict.
+            if prompt.contains("FAIL_ME") {
+                r#"{"pass":false,"reason":"verify rejected"}"#.to_owned()
+            } else {
+                r#"{"pass":true,"reason":"ok"}"#.to_owned()
+            }
         } else if prompt.contains("WORK ") {
             format!(
                 "{}-ok",
@@ -191,6 +200,16 @@ impl Transport for FakeTransport {
             "ok".to_owned()
         };
         let now = Utc::now();
+        // Model realistic daemon continuation behavior so the default-ON
+        // cross-call memory and the "makeup exam" correction retry are
+        // observable in tests: when the request carries a continuation, echo
+        // it back (same session extended); when it does not, mint a new
+        // session id derived from the transport run id. This is what lets
+        // `requests[N].continuation` assertions verify threading.
+        let continuation = request
+            .continuation
+            .clone()
+            .or_else(|| Some(format!("sess-{run_id}")));
         self.records
             .lock()
             .map_err(|_| ErrorInfo::new("lock", "record lock poisoned"))?
@@ -207,7 +226,7 @@ impl Transport for FakeTransport {
                     finished_at: None,
                     output: Some(Output::Text { text: output }),
                     error: None,
-                    continuation: None,
+                    continuation,
                     activity: None::<Activity>,
                     diagnostics: Diagnostics::default(),
                 },
@@ -1654,7 +1673,7 @@ fn gate_replay_uses_cached_calls() {
 }
 
 #[test]
-fn invalid_structured_agent_is_corrected_without_resume() {
+fn invalid_structured_agent_correction_threads_prior_continuation() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("state-retry-agent");
     let transport = Arc::new(FakeTransport::new(Duration::ZERO));
@@ -1678,6 +1697,12 @@ fn invalid_structured_agent_is_corrected_without_resume() {
     assert_eq!(state.status, RunStatus::Succeeded);
     assert_eq!(state.result, Some(json!({"ok": true})));
     assert_eq!(transport.count(), 2);
+    // B1 default-ON threading: first submit is cold; the correction retry
+    // threads the failed first attempt's continuation (`sess-fake-1`).
+    let requests = transport.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].continuation, None);
+    assert_eq!(requests[1].continuation.as_deref(), Some("sess-fake-1"));
 }
 
 #[test]
@@ -1708,6 +1733,22 @@ fn structured_agent_corrects_invalid_output_once_and_preserves_options() {
     assert_eq!(requests[0].system_prompt, requests[1].system_prompt);
     assert_eq!(requests[0].timeout_seconds, requests[1].timeout_seconds);
     assert_eq!(requests[0].native_args, requests[1].native_args);
+    // B1 default-ON continuation threading + "makeup exam" fix: the first
+    // submit is a cold call (no prior session for this resolved agent), so
+    // `requests[0].continuation` is None. The correction retry must carry the
+    // FAILED first attempt's continuation so the model sees its own prior
+    // reasoning instead of a cold re-read. FakeTransport echoes the first
+    // attempt's continuation as `sess-fake-1`, and the retry submit must thread
+    // that exact value forward.
+    assert_eq!(
+        requests[0].continuation, None,
+        "first submit is cold; no prior session cached for this agent"
+    );
+    assert_eq!(
+        requests[1].continuation.as_deref(),
+        Some("sess-fake-1"),
+        "correction retry must thread the failed attempt's continuation"
+    );
     let prompt = match &requests[1].input {
         Input::Text { text } => text,
         Input::Image(_) => panic!("text correction prompt"),
@@ -1758,6 +1799,10 @@ fn structured_agent_corrects_provider_success_that_fails_local_strict_schema() {
         "local validation must force one correction"
     );
     let requests = transport.requests.lock().expect("requests");
+    // B1 default-ON threading + "makeup exam" fix: first submit cold, retry
+    // threads the failed attempt's continuation (`sess-fake-1`).
+    assert_eq!(requests[0].continuation, None);
+    assert_eq!(requests[1].continuation.as_deref(), Some("sess-fake-1"));
     let correction = match &requests[1].input {
         Input::Text { text } => text,
         Input::Image(_) => panic!("text correction prompt"),
@@ -1799,6 +1844,15 @@ fn exhausted_schema_correction_fails_and_resume_does_not_submit_third_time() {
         .expect("terminal workflow");
     assert_eq!(failed.status, RunStatus::Failed);
     assert_eq!(transport.count(), 2);
+    // B1 default-ON + makeup-exam: first submit cold, correction retry threads
+    // the failed attempt's continuation (`sess-fake-1`). Both attempts return
+    // invalid JSON, so the run still fails after one correction.
+    {
+        let requests = transport.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].continuation, None);
+        assert_eq!(requests[1].continuation.as_deref(), Some("sess-fake-1"));
+    }
     let journal = fs::read_to_string(WorkflowStore::new(&root).journal_path(&failed.run_id))
         .expect("journal");
     let terminal: Value = serde_json::from_str(journal.lines().last().expect("terminal entry"))
@@ -4884,6 +4938,249 @@ fn fault_host_kill_mid_run_recovers_via_replay_without_resubmission() {
         transport.count(),
         2,
         "host-kill recovery resubmitted completed calls"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B2: stage-boundary verify gate for pipeline().
+//
+// pipeline() now ships default-ON verify between stages: an independent LLM
+// reviewer checks the upstream stage output before the downstream stage sees
+// it. A stage may opt out via `noVerify: true` or declare a declarative
+// assertion that runs FIRST as a cheap machine check; on declarative fail the
+// LLM reviewer is NOT invoked. On verify fail the item is marked Rejected
+// (NOT null): the reject reason is written to the journal with
+// CallKind::Verify + CallState::Rejected so it is auditable and
+// distinguishable from a real null/empty output, and the downstream stage
+// never receives that item. Other items in the same pipeline still complete.
+//
+// The degenerate `pipeline(items, worker)` N=1 case has no stage boundary, so
+// no verify fires — the existing dynamic_pipeline_fans_out_and_runs_concurrently
+// and benchmark_loop_until_dry_converges_when_no_new_items tests pin that
+// backward-compat.
+//
+// FakeTransport review prompt: any prompt containing "Review the following
+// stage output" returns a pass verdict unless the upstream output contains
+// the "FAIL_ME" marker, in which case it returns a fail verdict. This lets
+// tests drive both outcomes from the same transport branch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pipeline_verify_pass_lets_downstream_receive_item() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    // Two stages: stage 0 uppercases, stage 1 appends a suffix. Default-ON
+    // verify fires between them. The reviewer returns pass, so stage 1
+    // receives the uppercased value and the result is the suffixed form.
+    let path = script(
+        &temp,
+        "verify-pass.js",
+        r#"
+        const items = ["alpha"];
+        const out = await pipeline(items,
+          { run: (item) => item.toUpperCase() },
+          { run: (prev) => prev + "-ok" }
+        );
+        return { out };
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), Arc::clone(&transport))
+        .start(&path, Value::Null, 4, 100)
+        .expect("workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    assert_eq!(
+        state.result,
+        Some(json!({ "out": ["ALPHA-ok"] }))
+    );
+    // One verify LLM call between the two stages (the last stage has no
+    // downstream boundary, so no verify fires for it).
+    let requests = transport.requests.lock().expect("requests");
+    let verify_count = requests
+        .iter()
+        .filter(|r| match &r.input {
+            Input::Text { text } => text.contains("Review the following stage output"),
+            _ => false,
+        })
+        .count();
+    assert_eq!(verify_count, 1, "exactly one verify LLM call between stages");
+}
+
+#[test]
+fn pipeline_verify_fail_marks_item_rejected_and_skips_downstream() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    // Two items, two stages. Stage 0 returns "FAIL_ME" for item "bad" so the
+    // verify gate rejects it; item "good" passes verify and flows through to
+    // stage 1. The bad item MUST come back as a Rejected marker (not null),
+    // the journal MUST record a CallKind::Verify/CallState::Rejected entry
+    // with the reject reason, and the good item MUST still complete stage 1.
+    let path = script(
+        &temp,
+        "verify-fail.js",
+        r#"
+        const items = ["good", "bad"];
+        const out = await pipeline(items,
+          { run: (item) => item === "bad" ? "FAIL_ME" : item },
+          { run: (prev) => prev + "-ok" }
+        );
+        return {
+          good: out[0],
+          bad: out[1],
+          badIsObject: out[1] != null && typeof out[1] === "object",
+          badMarker: out[1] && out[1]["__servitor_rejected__"],
+          badReason: out[1] && out[1]["reason"],
+        };
+    "#,
+    );
+    let root = temp.path().join("state");
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 8, 100)
+        .expect("workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let result = state.result.expect("result");
+    assert_eq!(result["good"], "good-ok", "good item flows through both stages");
+    assert_eq!(result["badIsObject"], true, "rejected item is a Rejected object, not null");
+    assert_eq!(result["badMarker"], true, "Rejected marker present");
+    assert!(
+        result["badReason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("verify rejected"),
+        "reject reason carries the LLM verdict: {:?}",
+        result["badReason"]
+    );
+
+    // The journal records the reject as CallKind::Verify + CallState::Rejected
+    // with the reject reason in the error field — distinguishable from null.
+    let store = WorkflowStore::new(&root);
+    let journal = fs::read_to_string(store.journal_path(&state.run_id)).expect("journal");
+    let rejects: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("journal entry"))
+        .filter(|entry| entry["kind"] == "verify" && entry["state"] == "rejected")
+        .collect();
+    assert_eq!(rejects.len(), 1, "exactly one verify-reject entry in the journal");
+    assert!(
+        rejects[0]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("verify rejected"),
+        "journal reject entry carries the reason: {:?}",
+        rejects[0]
+    );
+}
+
+#[test]
+fn pipeline_declarative_fast_path_short_circuits_without_llm_reviewer() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    // Two stages; stage 0 carries a declarative assertion that exits 1. The
+    // declarative fast-path must short-circuit to reject WITHOUT invoking the
+    // LLM reviewer, so transport.count() must be 0 agent calls.
+    let path = script(
+        &temp,
+        "verify-declarative.js",
+        r#"
+        const items = ["x"];
+        const out = await pipeline(items,
+          {
+            run: (item) => item,
+            declarative: { command: "cmd", args: ["/C", "exit 1"] }
+          },
+          { run: (prev) => prev + "-ok" }
+        );
+        return {
+          marker: out[0] && out[0]["__servitor_rejected__"],
+          reason: out[0] && out[0]["reason"],
+        };
+    "#,
+    );
+    let state = engine(&temp.path().join("state"), Arc::clone(&transport))
+        .start(&path, Value::Null, 8, 100)
+        .expect("workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let result = state.result.expect("result");
+    assert_eq!(result["marker"], true, "declarative fail produces a Rejected marker");
+    assert!(
+        result["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("declarative assertion failed"),
+        "reject reason points at the declarative assertion: {:?}",
+        result["reason"]
+    );
+    // CRITICAL: the LLM reviewer must NOT be invoked when the declarative
+    // assertion already failed. No agent prompts at all in this workflow.
+    assert_eq!(
+        transport.count(),
+        0,
+        "declarative fast-path must short-circuit before the LLM reviewer"
+    );
+}
+
+#[test]
+fn pipeline_independent_from_violation_in_verify_is_rejected() {
+    let temp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(FakeTransport::new(Duration::ZERO));
+    // A single provider policy where the `reviewer` role declares
+    // `independentFrom: ["maker"]`. Stage 0 (the maker) selects the only
+    // available provider/model; when the verify gate fires for stage 1 with
+    // `role: "reviewer"`, capability resolution MUST reject the same-model
+    // independent role before transport submission — the verify call errors
+    // out and the item is marked rejected with a verify-agent-failed reason.
+    let path = temp.path().join("verify-independence.js");
+    fs::write(
+        &path,
+        r#"export const meta = {
+          name: "verify-independence",
+          contract: "workflow",
+          capabilities: {
+            providers: [{ agent: "claude", model: "claude-opus-5", capabilities: ["reasoning"], maxEffort: "high", contextTokens: 200000 }],
+            roles: {
+              maker: { requires: ["reasoning"] },
+              reviewer: { requires: ["reasoning"], independentFrom: ["maker"] }
+            }
+          }
+        };
+        const out = await pipeline(["item"],
+          { run: (item) => agent(`WORK ${item}`, { role: "maker" }), verify: { role: "reviewer" } },
+          { run: (prev) => prev + "-ok" }
+        );
+        return {
+          marker: out[0] && out[0]["__servitor_rejected__"],
+          reason: out[0] && out[0]["reason"],
+        };"#,
+    )
+    .expect("write script");
+    let root = temp.path().join("state");
+    let state = engine(&root, Arc::clone(&transport))
+        .start(&path, Value::Null, 8, 100)
+        .expect("workflow");
+    assert_eq!(state.status, RunStatus::Succeeded, "{:?}", state.error);
+    let result = state.result.expect("result");
+    assert_eq!(result["marker"], true, "independence violation rejects the item");
+    assert!(
+        result["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("must be independent"),
+        "reject reason surfaces the independence violation: {:?}",
+        result["reason"]
+    );
+    // Capability resolution rejects the reviewer before any transport submit
+    // for the verify call, so only the maker agent call lands.
+    assert_eq!(
+        transport.count(),
+        1,
+        "reviewer must be rejected before transport submission"
+    );
+    let events = WorkflowStore::new(&root)
+        .read_capability_events(&state.run_id)
+        .expect("capability events");
+    assert!(
+        matches!(events.last().map(|event| &event.event), Some(CapabilityEvent::IndependenceViolation { role, conflict_role, .. }) if role == "reviewer" && conflict_role == "maker"),
+        "independence violation recorded for reviewer vs maker: {:?}",
+        events.last()
     );
 }
 

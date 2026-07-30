@@ -107,7 +107,7 @@ pub(crate) fn run(
     {
         match entry.state {
             CallState::Succeeded => return Ok(entry.result.unwrap_or(Value::Null)),
-            CallState::Failed | CallState::Submitted | CallState::Cancelled => {}
+            CallState::Failed | CallState::Submitted | CallState::Cancelled | CallState::Rejected => {}
         }
     }
     let journal = CommandJournal {

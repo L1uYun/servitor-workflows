@@ -186,6 +186,7 @@ fn call_kind(entry: &JournalEntry) -> &'static str {
         crate::model::CallKind::Gate => "gate",
         crate::model::CallKind::Workflow => "workflow",
         crate::model::CallKind::Spawn => "spawn",
+        crate::model::CallKind::Verify => "verify",
     }
 }
 
@@ -195,6 +196,7 @@ fn call_state(entry: &JournalEntry) -> &'static str {
         CallState::Succeeded => "succeeded",
         CallState::Failed => "failed",
         CallState::Cancelled => "cancelled",
+        CallState::Rejected => "rejected",
     }
 }
 
