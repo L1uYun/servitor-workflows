@@ -21,14 +21,29 @@ use std::thread;
 
 const BOOTSTRAP: &str = r#"
 globalThis.args = JSON.parse(__argsJson);
-globalThis.agent = async (prompt, options = {}) =>
-  JSON.parse(await __agent(String(prompt), JSON.stringify(options)));
+// B'/HIGH: pipeline() runs its items concurrently, so agent() calls made
+// inside a stage share one cross-call continuation cache cell per resolved
+// agent/model. Without a guard, item B's stage-0 session overwrites item A's
+// and item A's stage-1 then seeds item B's session — unverified handoff
+// between independent items. The depth counter marks "we are inside at least
+// one pipeline": while > 0, the agent() wrapper injects noCrossCallContinuation
+// so each stage submit is cold w.r.t. the shared cache. Within-call continuity
+// (schema-correction "makeup exam") and explicit opt-in continuation are
+// preserved (see AgentOptions.no_cross_call_continuation).
+let __pipelineDepth = 0;
+globalThis.agent = async (prompt, options = {}) => {
+  const opts = __pipelineDepth > 0
+    ? Object.assign({ noCrossCallContinuation: true }, options)
+    : options;
+  return JSON.parse(await __agent(String(prompt), JSON.stringify(opts)));
+};
 // agentLastContinuation() returns the last continuation session id the
 // runtime cached for the most recent successful agent submit in this run
 // (default-ON cross-stage memory). Returns null when no session has been
 // recorded yet. It is a read-only escape hatch for scripts that need to
 // inspect or log the threaded session; it does NOT mutate the cache.
-// Intentionally NOT keyed by agent/model so a script can observe the last
+// Returns the last-INSERTED value (insertion order), not the lexicographic
+// max of cache keys or values, so a script observes the actual most-recent
 // session regardless of which provider/model produced it.
 globalThis.agentLastContinuation = () => __agentLastContinuation();
 // agentDropContinuation() clears the cached continuation session for a
@@ -79,6 +94,19 @@ globalThis.parallel = entries => {
 // callback receives (prevResult, originalItem, index). A stage that throws
 // (or rejects) drops only its own item to null and skips that item's remaining
 // stages. pipeline never rejects.
+//
+// B'/HIGH session isolation: concurrent items selecting the same resolved
+// agent/model share one cross-call continuation cache cell, so without a
+// guard item B's stage-0 session overwrites item A's and item A's stage-1
+// then seeds item B's session — unverified handoff between independent items.
+// The agent() calls made inside a stage therefore opt out of cross-call
+// memory via noCrossCallContinuation, so every stage submit is cold w.r.t.
+// the shared cache. Within-call continuity is preserved: the schema-
+// correction retry still threads the failed attempt's own returned
+// continuation (the "makeup exam"), and an explicit continuation option on
+// the agent() call still threads forward. This isolation is strictly
+// additive to B2 verify (which already forces noContinuation on the
+// reviewer) and to explicit per-call noContinuation.
 //
 // B2 stage-boundary verify gate: between stages, a verify gate fires by
 // default (default-ON). An independent reviewer agent reviews the upstream
@@ -164,6 +192,7 @@ async function __pipeline_verify(output, stage, item, idx, stageIdx) {
 globalThis.pipeline = (items, ...stages) => {
   const arr = Array.from(items);
   const normalized = stages.map((s) => (typeof s === "function" ? { run: s } : s));
+  __pipelineDepth++;
   return Promise.all(
     arr.map((item, idx) => (async () => {
       let cur = item;
@@ -184,7 +213,7 @@ globalThis.pipeline = (items, ...stages) => {
       }
       return cur;
     })())
-  );
+  ).finally(() => { __pipelineDepth--; });
 };
 // log(message) streams narration to workflow.log in the run record dir via the
 // __log host function. It never becomes a journal entry. Resume idempotency is
@@ -290,7 +319,7 @@ struct HostState {
     /// `Arc` the agent dispatcher writes keeps the script-side read consistent
     /// with what the next `agent()` call will actually seed from.
     #[unsafe_ignore_trace]
-    continuation_cache: crate::agent::ContinuationCache,
+    continuation_cache: crate::agent::ContinuationCacheArc,
 }
 
 impl JsData for HostState {}
@@ -933,7 +962,8 @@ async fn host_agent(
 // agentLastContinuation() — JS escape hatch. Returns the most recently
 // recorded continuation session id for this run as a string, or null when
 // none is cached. The cache is keyed by resolved agent/model; this surface
-// returns the last one inserted regardless of key, which is what a script
+// returns the last-inserted value (insertion order, not BTreeMap's
+// lexicographic iteration order) regardless of key, which is what a script
 // almost always wants when inspecting "where did the session get to".
 fn host_agent_last_continuation(
     _this: &JsValue,
@@ -948,8 +978,7 @@ fn host_agent_last_continuation(
         .continuation_cache
         .lock()
         .map_err(|_| native_error("continuation lock poisoned"))?
-        .values()
-        .last()
+        .last_inserted()
         .cloned();
     match last {
         Some(value) => Ok(JsValue::from(js_string!(value))),

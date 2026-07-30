@@ -1000,6 +1000,40 @@ impl Engine {
                 );
             }
         }
+        // B2/MEDIUM-1: pipeline() never rejects and a verify-gate rejection
+        // only writes a CallKind::Verify/CallState::Rejected journal entry —
+        // it does not throw. Without this check a pipeline where every item
+        // was rejected ends RunSucceeded: a swallowed failure (anti-pattern 5).
+        // A run that succeeded but whose journal holds any Rejected verify
+        // entry is downgraded to Failed so the terminal status reflects the
+        // refusal. This is orthogonal to the write boundary above.
+        if state.status == RunStatus::Succeeded {
+            let has_verify_reject = self
+                .store
+                .journal_index(&state.run_id)?
+                .values()
+                .any(|entry| {
+                    entry.kind == crate::model::CallKind::Verify
+                        && entry.state == CallState::Rejected
+                });
+            if has_verify_reject {
+                let error =
+                    "pipeline verify gate rejected one or more items; run downgraded from succeeded"
+                        .to_owned();
+                return self.transition(
+                    &state.run_id,
+                    WorkflowEvent::RunFailed {
+                        error: error.clone(),
+                    },
+                    |state| {
+                        state.status = RunStatus::Failed;
+                        state.error = Some(error);
+                        state.report = None;
+                        state.active.clear();
+                    },
+                );
+            }
+        }
         let report = if state.status == RunStatus::Succeeded {
             match state.result.as_ref().map(delivery_report).transpose() {
                 Ok(report) => report.flatten(),

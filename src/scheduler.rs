@@ -1,4 +1,4 @@
-use crate::agent::{AgentCall, AgentOptions, ContinuationCache, Transport};
+use crate::agent::{AgentCall, AgentOptions, ContinuationCacheArc, Transport};
 use crate::boundary::{
     BoundaryEvent, BoundaryPolicy, NetworkEvidenceSource, ensure_command_policy,
     observed_undeclared_writes, snapshot_git, snapshot_observable_files,
@@ -105,7 +105,7 @@ pub struct RuntimeHost {
     /// the same resolved agent/model to thread the session forward (the
     /// default-ON cross-call memory for stages/retries). Owned here so every
     /// `RuntimeHost::agent` dispatch in the run shares one cache.
-    pub continuation_cache: ContinuationCache,
+    pub continuation_cache: ContinuationCacheArc,
 }
 
 impl RuntimeHost {

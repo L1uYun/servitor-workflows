@@ -24,10 +24,57 @@ type RecoveredStructuredOutput = (Value, Option<u64>, Option<Value>);
 /// populated only by successful submits in the current execution; it is not
 /// persisted (succeeded calls short-circuit on resume, so a resumed run does
 /// not re-submit and therefore does not need the prior session id).
-pub(crate) type ContinuationCache = Arc<Mutex<BTreeMap<String, String>>>;
+///
+/// The `last_inserted` field tracks the most recently *recorded* session id
+/// (value, not key) so the JS escape hatch `agentLastContinuation()` can return
+/// insertion order rather than `BTreeMap`'s lexicographic iteration order —
+/// the latter returns the max key, which is not "the last session".
+pub(crate) struct ContinuationCache {
+    by_agent: BTreeMap<String, String>,
+    last_inserted: Option<String>,
+}
 
-pub(crate) fn continuation_cache_new() -> ContinuationCache {
-    Arc::new(Mutex::new(BTreeMap::new()))
+impl ContinuationCache {
+    pub(crate) fn insert(&mut self, key: String, value: String) {
+        self.last_inserted = Some(value.clone());
+        self.by_agent.insert(key, value);
+    }
+    pub(crate) fn get(&self, key: &str) -> Option<&String> {
+        self.by_agent.get(key)
+    }
+    pub(crate) fn remove(&mut self, key: &str) {
+        let removed = self.by_agent.remove(key);
+        // If the dropped entry was the tracked last-inserted value, fall back
+        // to the most recent remaining entry by insertion order. BTreeMap does
+        // not preserve insertion order, so there is no exact "most recent
+        // remaining"; clearing last_inserted when the live value is gone is the
+        // honest behavior (the tracked value is no longer authoritative).
+        if let Some(removed_value) = removed
+            && self.last_inserted.as_deref() == Some(removed_value.as_str())
+        {
+            self.last_inserted = None;
+        }
+    }
+    pub(crate) fn clear(&mut self) {
+        self.by_agent.clear();
+        self.last_inserted = None;
+    }
+    pub(crate) fn last_inserted(&self) -> Option<&String> {
+        self.last_inserted.as_ref()
+    }
+    #[allow(dead_code)]
+    pub(crate) fn values(&self) -> impl Iterator<Item = &String> {
+        self.by_agent.values()
+    }
+}
+
+pub(crate) type ContinuationCacheArc = Arc<Mutex<ContinuationCache>>;
+
+pub(crate) fn continuation_cache_new() -> ContinuationCacheArc {
+    Arc::new(Mutex::new(ContinuationCache {
+        by_agent: BTreeMap::new(),
+        last_inserted: None,
+    }))
 }
 
 fn continuation_cache_key(agent: &str, model: Option<&str>) -> String {
@@ -40,16 +87,27 @@ fn continuation_cache_key(agent: &str, model: Option<&str>) -> String {
 /// echoes none), the cached value for the resolved agent when default-ON
 /// threading applies, or `None` when the stage opted out or no session is
 /// known yet.
-fn seed_continuation(cache: &ContinuationCache, options: &AgentOptions) -> Option<String> {
+///
+/// `no_cross_call_continuation` disables only the cross-call memory (cache
+/// lookup and explicit-seed recording); an explicit `continuation` is still
+/// returned so an opt-in seed threads forward. This is what `pipeline()` sets
+/// so concurrent items selecting the same resolved agent/model do not
+/// cross-pollinate sessions through the shared cache cell.
+fn seed_continuation(cache: &ContinuationCacheArc, options: &AgentOptions) -> Option<String> {
     if options.no_continuation {
         return None;
     }
     let agent = options.agent.clone().unwrap_or_else(|| "pi".to_owned());
     if let Some(explicit) = options.continuation.as_ref() {
-        if let Ok(mut guard) = cache.lock() {
-            guard.insert(continuation_cache_key(&agent, options.model.as_deref()), explicit.clone());
+        if !options.no_cross_call_continuation {
+            if let Ok(mut guard) = cache.lock() {
+                guard.insert(continuation_cache_key(&agent, options.model.as_deref()), explicit.clone());
+            }
         }
         return Some(explicit.clone());
+    }
+    if options.no_cross_call_continuation {
+        return None;
     }
     match cache.lock() {
         Ok(guard) => guard.get(&continuation_cache_key(&agent, options.model.as_deref())).cloned(),
@@ -60,12 +118,17 @@ fn seed_continuation(cache: &ContinuationCache, options: &AgentOptions) -> Optio
 /// Record the continuation a successful transport run returned so later
 /// stages selecting the same resolved agent/model can reuse the session. A
 /// stage that opted out via `no_continuation` does not pollute the cache.
+/// `no_cross_call_continuation` skips recording too: it marks a call whose
+/// session must not become cross-call memory (the pipeline case), while still
+/// letting the schema-correction retry thread the call's own returned
+/// continuation (the "makeup exam" reads `first_record.continuation`
+/// directly, not the cache).
 fn record_continuation(
-    cache: &ContinuationCache,
+    cache: &ContinuationCacheArc,
     options: &AgentOptions,
     record: &servitor::RunRecord,
 ) {
-    if options.no_continuation {
+    if options.no_continuation || options.no_cross_call_continuation {
         return;
     }
     if let Some(continuation) = record.continuation.as_ref() {
@@ -147,6 +210,18 @@ pub struct AgentOptions {
     /// not cross-call memory.
     #[serde(default)]
     pub no_continuation: bool,
+    /// Opt-out of cross-call continuation memory only. When true, the call
+    /// neither seeds from nor records into the shared agent/model cache cell,
+    /// so concurrent siblings selecting the same agent/model cannot
+    /// cross-pollinate sessions through that cell. The schema-correction
+    /// retry still threads the call's own returned continuation (the
+    /// "makeup exam" reads `first_record.continuation` directly), and an
+    /// explicit `continuation` seed still threads forward, so within-call
+    /// session continuity is preserved. `pipeline()` sets this so its
+    /// concurrent items stay session-isolated without disabling the
+    /// default-ON cache for non-pipeline calls.
+    #[serde(default)]
+    pub no_cross_call_continuation: bool,
 }
 
 pub(crate) struct AgentCall {
@@ -176,7 +251,7 @@ pub(crate) fn run(
     run_id: &str,
     default_cwd: &Path,
     call: AgentCall,
-    continuation_cache: &ContinuationCache,
+    continuation_cache: &ContinuationCacheArc,
 ) -> JobResult {
     let AgentCall {
         key,
