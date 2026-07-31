@@ -476,6 +476,12 @@ servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\goalchain.
 # Newcomer intro: parallel() section assembly builds a self-contained HTML that
 # introduces servitor + servitor-workflows from these two READMEs (see docs/servitor-intro.html).
 servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\intro-html.workflow.js
+
+# Parallel web research: fan out one searching agent per dimension, adversarially
+# verify top claims, synthesize a decision brief. Needs a web-capable agent — pi
+# runs --offline, so it routes to codex by default (override via args.researchAgent).
+servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\batch-research.workflow.js `
+  --args '{"question":"local STT stack for a CLI","dimensions":[{"key":"whisper-cpp","prompt":"CPU/VRAM, RTF, model sizes"},{"key":"faster-whisper","prompt":"GPU vs CPU, RTF, deps"}]}'
 ```
 
 Pause/resume evidence uses the original run id:
