@@ -3,174 +3,104 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Servitor 与 servitor-workflows 介绍</title>
+<title>servitor 与 servitor-workflows 介绍</title>
 <style>
   :root{
-    --bg:#f7f8fa; --panel:#ffffff; --ink:#1f2937; --muted:#6b7280;
-    --line:#e5e7eb; --accent:#2563eb; --code-bg:#1e293b; --code-ink:#e2e8f0;
+    --bg:#f7f8fa; --card:#ffffff; --ink:#1f2328; --muted:#57606a;
+    --line:#d8dee4; --accent:#0969da; --code-bg:#f0f2f5; --code-ink:#24292f;
   }
   *{box-sizing:border-box;}
   html{scroll-behavior:smooth;}
   body{
     margin:0; background:var(--bg); color:var(--ink);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
     line-height:1.7; font-size:16px;
   }
   .wrap{max-width:880px; margin:0 auto; padding:0 20px;}
   header.hero{
-    background:linear-gradient(135deg,#1e3a8a,#2563eb);
+    background:linear-gradient(135deg,#0a2540,#0d4a8a);
     color:#fff; padding:48px 0 40px;
   }
-  header.hero h1{margin:0 0 8px; font-size:30px; font-weight:700;}
-  header.hero p{margin:0; opacity:.92; font-size:16px;}
-  .lead{background:var(--panel); border:1px solid var(--line); border-radius:10px;
-    padding:20px 22px; margin:24px 0;}
-  .lead p{margin:0 0 8px;} .lead p:last-child{margin:0;}
-  nav.toc{margin:0 0 32px;}
-  nav.toc h2{font-size:14px; text-transform:uppercase; letter-spacing:.08em;
-    color:var(--muted); margin:0 0 12px;}
-  nav.toc ol{margin:0; padding-left:0; list-style:none; columns:2; gap:12px;}
-  nav.toc a{display:block; padding:8px 12px; border:1px solid var(--line);
-    border-radius:8px; text-decoration:none; color:var(--ink); background:var(--panel);
-    transition:border-color .15s, color .15s;}
-  nav.toc a:hover{border-color:var(--accent); color:var(--accent);}
-  section{background:var(--panel); border:1px solid var(--line); border-radius:10px;
-    padding:24px 26px; margin:0 0 22px; scroll-margin-top:20px;}
-  h2{margin:0 0 14px; font-size:22px; border-bottom:2px solid var(--line); padding-bottom:8px;}
-  h3{margin:22px 0 10px; font-size:17px; color:#111827;}
-  p{margin:0 0 12px;}
-  code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
-    background:#eef2f7; color:#be185d; padding:1px 6px; border-radius:4px; font-size:14px;}
-  pre{background:var(--code-bg); color:var(--code-ink); padding:16px 18px;
-    border-radius:8px; overflow:auto; font-size:13.5px; line-height:1.55;}
-  pre code{background:none; color:inherit; padding:0;}
-  ul,ol{padding-left:22px;} li{margin:4px 0;}
-  .tag{display:inline-block; font-size:12px; color:var(--muted);
-    border:1px solid var(--line); border-radius:999px; padding:1px 10px; margin-left:6px;}
+  header.hero h1{margin:0 0 12px; font-size:2rem; letter-spacing:.5px;}
+  header.hero p{margin:0; opacity:.9; font-size:1.05rem;}
+  nav.toc{
+    background:var(--card); border:1px solid var(--line); border-radius:10px;
+    margin:28px 0; padding:18px 22px;
+  }
+  nav.toc h2{margin:0 0 10px; font-size:1rem; color:var(--muted); font-weight:600;}
+  nav.toc ol{margin:0; padding-left:22px; columns:2; column-gap:32px;}
+  nav.toc a{color:var(--accent); text-decoration:none;}
+  nav.toc a:hover{text-decoration:underline;}
+  main{padding:0 0 64px;}
+  section{margin:40px 0;}
+  h2{font-size:1.5rem; border-bottom:2px solid var(--line); padding-bottom:8px;}
+  h3{font-size:1.15rem; margin-top:28px;}
+  p,li{color:var(--ink);}
+  code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace; font-size:.9em;}
+  p code, li code{background:var(--code-bg); color:var(--code-ink); padding:2px 6px; border-radius:4px;}
+  pre{
+    background:var(--code-bg); color:var(--code-ink);
+    border:1px solid var(--line); border-radius:8px;
+    padding:16px; overflow:auto; line-height:1.5;
+  }
+  pre code{background:none; padding:0;}
+  .intro{background:var(--card); border:1px solid var(--line); border-radius:10px; padding:22px 26px; margin-top:28px;}
+  .intro p{margin:.6em 0;}
 </style>
 </head>
 <body>
 <header class="hero">
   <div class="wrap">
-    <h1>Servitor 与 servitor-workflows</h1>
-    <p>本地 agent 进程的 Rust 传输层 与 其之上的 工作流编排层</p>
+    <h1>servitor &amp; servitor-workflows</h1>
+    <p>两个用 Rust 编写的本地 agent 进程传输层与编排层</p>
   </div>
 </header>
 <div class="wrap">
-  <div class="lead">
-    <p><strong>Servitor</strong> 是一个 Rust 传输层：接收一个请求，启动一个 provider 进程，留存可追溯的证据，返回一个小的、有类型的结果。它有意止步于「一次持久的 provider 调用」。</p>
-    <p><strong>servitor-workflows</strong> 是 Servitor 之上的 Rust 编排层，负责动态工作流执行、并发、命令、人工 gate、持久化状态、replay/resume 与机器运行证据。</p>
-    <p>二者分工清晰：传输只管一次可靠的调用，编排只管多步与策略。</p>
+  <div class="intro">
+    <p><code>servitor</code> 是一个 Rust 传输层：它接受一次请求，启动一个 provider 进程，固化证据，再返回一个小型类型化结果。工作流策略、扇出、角色、advisor 提示、schema 校验、Git 交付与任务验收都不属于它。</p>
+    <p><code>servitor-workflows</code> 是构建在 <code>servitor</code> 之上的 Rust 编排层：它负责动态工作流执行、并发、命令、人工 gate、持久化状态、重放、暂停、取消以及机器运行证据。读者面交付报告是工作流输出，而非 Rust 渲染的运行时页面。</p>
   </div>
   <nav class="toc">
     <h2>目录</h2>
     <ol>
-      <li><a href="#what-is">1. 这是什么</a></li>
-      <li><a href="#relationship">2. 二者关系</a></li>
-      <li><a href="#primitives">3. 执行契约三原语</a></li>
-      <li><a href="#control-flow">4. 控制流原语</a></li>
-      <li><a href="#example">5. 工作流示例</a></li>
-      <li><a href="#persistence">6. 状态与恢复</a></li>
-      <li><a href="#budget-boundary">7. 预算与边界</a></li>
-      <li><a href="#cli">8. CLI</a></li>
-      <li><a href="#design">9. 设计边界</a></li>
+      <li><a href="#what-is">它们是什么</a></li>
+      <li><a href="#relationship">分工关系</a></li>
+      <li><a href="#primitives">执行契约三原语</a></li>
+      <li><a href="#control-flow">控制流原语</a></li>
+      <li><a href="#example">工作流示例</a></li>
+      <li><a href="#persistence">状态与恢复</a></li>
+      <li><a href="#budget-boundary">预算与边界</a></li>
+      <li><a href="#cli">命令行接口</a></li>
+      <li><a href="#design">设计契约</a></li>
     </ol>
   </nav>
+  <main>
 
 <section id="what-is">
-  <h2>这两个工具是什么</h2>
+<h2>这两个工具是什么</h2>
+<p>它们是一对分工明确的 Rust 工具，一个负责「把一次任务可靠地交给某个 agent 进程」，另一个负责「把这些任务编排成有状态、可恢复的多步工作流」。</p>
 
-  <p>
-    <code>servitor</code> 是一个用 Rust 写的本地 agent 进程<strong>传输层</strong>。它的边界非常窄，只负责一件事：接受一个请求，启动一个 provider 进程，捕获持久的证据，然后返回一个小型的 typed 结果。工作流策略、任务分发（fan-out）、角色划分、advisor 提示、schema 校验、Git 交付、任务验收——这些都不属于 servitor，而是属于它之上的层级。
-  </p>
+<h3>servitor：传输层</h3>
+<p>servitor 是一个本地 agent 进程的 <em>传输层</em>（transport layer）。它的职责被刻意收得很窄：接收一个请求，启动一个 provider 进程，把过程证据持久化下来，最后返回一个体积很小、带类型的（typed）结果。它只管「一次请求 → 一次 provider 调用」这一层。</p>
+<p>它明确地不管工作流策略、任务扇出（fan-out）、角色分工、advisor 提示、schema 检查、Git 交付以及任务验收——这些都属于它之上的工具。换句话说，servitor 是地基，不是整栋楼。它解决的核心问题是：让「调用一个本地 agent」这件事变得可观测、可重放、可追溯，而不是一次性的黑盒命令。</p>
+<p>日常用法很直接：用 <code>servitor submit</code> 提交一个 prompt（来自文件或直接字符串），立刻拿到一个持久的 <code>RUN_ID</code> 句柄；之后用 <code>servitor get</code> 读取（可等待），用 <code>servitor list</code> 盘点，用 <code>servitor gc</code> 清理卡住的运行，用 <code>servitor cancel</code> 请求终止。每一次运行都会在状态目录里留下 <code>request.json</code>、<code>record.json</code>、<code>stdout.txt</code>、<code>stderr.txt</code> 等证据文件。</p>
 
-  <p>
-    它解决的问题很具体：把“调用一个本地 agent/provider”这件事变成一次<strong>可观测、可取证、可重读</strong>的持久操作。每次 run 都会在 <code>D:\AgentWork\state\servitor\runs/&lt;RUN_ID&gt;/</code> 下留下 <code>request.json</code>、<code>record.json</code>、<code>stdout.txt</code>、<code>stderr.txt</code>；JSON 是默认输出，统一走 <code>{ok,data,meta,error}</code> 信封，错误也留在 stdout，agent 只需解析一条流。它故意停在“一次 durable provider 调用”这里就不再往下走了——多步执行、重放/恢复、人工 gate、验收这些留给兄弟工具 <code>servitor-workflows</code>。
-  </p>
+<h3>servitor-workflows：编排层</h3>
+<p>servitor-workflows 是构建在 servitor 之上的 Rust 动态工作流运行时。servitor 在「一次 provider 调用」处刻意停下，而多步执行、并发、命令执行、人工审批（gate）、持久化状态、重放/恢复、验收以及机器运行证据，全部交给 servitor-workflows。</p>
+<p>它解决的核心问题是：当一个真实任务需要「发现 → 并行审计 → 汇总」「需求 → 派发 → 独立评审 → 多重 gate → 回写」这类多步、带分支、带人工决策、并且中途崩溃后还能接着跑的流程时，靠单次 servitor 调用是不够的——需要一个有状态的编排器来管理调用身份、预算、边界审计和恢复。</p>
+<p>它的执行契约由三个原语组成：<code>agent + command + gate</code>，分别对应「调用 agent」「执行命令」「等待人类决策」。工作流用沙箱化的 JavaScript 编写（Rust 二进制内嵌 Boa 引擎，不依赖 Node/Deno/V8/Python），因为普通的循环、分支和动态扇出在脚本里比静态 DAG 更清晰。脚本本身没有直接访问文件系统或进程的 API，所有外部工作都必须穿过 <code>agent</code>、<code>command</code> 或 <code>gate</code> 这些有类型的边界。</p>
 
-  <p>
-    <code>servitor-workflows</code> 是构建在 <code>servitor</code> 之上的 Rust <strong>动态工作流运行时</strong>。servitor 只管“一次 provider 调用”，而 servitor-workflows 负责“把多次调用组织成一条可恢复的链”：动态工作流执行、并发、命令、人工 gate、持久状态、重放（replay）、暂停、取消，以及机器运行证据。面向读者的交付报告则是工作流产物，不由 Rust 运行时直接渲染。
-  </p>
-
-  <p>
-    它的执行契约只有三个原语：<code>agent + command + gate</code>。工作流用沙箱化的 JavaScript 编写（Boa 解释器内嵌在 Rust 二进制里，不依赖 Node/Deno/V8/Python），因为普通的循环、分支、动态 fan-out 在 JS 里比静态 DAG 更清晰。JS 脚本本身没有直接的文件系统或进程 API，所有外部动作都必须穿过有类型的 <code>agent</code>、<code>command</code> 或 <code>gate</code> 边界。
-  </p>
-
-  <p>
-    一句话概括分工：<code>servitor</code> 是“一次可靠的单次调用”，<code>servitor-workflows</code> 是“把多次调用编排成可恢复、可审计、带预算与边界的工作流”。前者是传输，后者是编排，两者用同一套协议类型和 Rust 实现衔接。
-  </p>
+<p>一句话概括：servitor 是「一次可靠的 agent 调用 + 持久证据」，servitor-workflows 是「把这一个个调用编排成可恢复、有预算、有边界的完整工作流」。</p>
 </section>
-<section id="relationship">
-  <h2>职责边界：谁拥有什么</h2>
-  <p>两个工具是分层关系：<code>servitor</code> 是 Rust 传输层，只负责一次 provider 调用的提交、捕获与返回；<code>servitor-workflows</code> 是其上方的 Rust 编排层。README 明确把多步执行、fan-out、命令、人工 gate、replay/resume、接受与机器运行证据交给 workflows，而把 agent 进程的提交、检查、取消、输出去留给 servitor。下表按“拥有 / 刻意不拥有”两侧对照。</p>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">维度</th>
-        <th scope="col">servitor（传输层）</th>
-        <th scope="col">servitor-workflows（编排层）</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <th scope="row">拥有的能力</th>
-        <td>
-          <ul>
-            <li>agent 进程提交：<code>servitor submit</code>，接受一个请求、跑一个 provider 进程。</li>
-            <li>检查：<code>get</code>、<code>list</code>、<code>inspect</code>、<code>inspect capabilities</code>、<code>doctor</code>、<code>schema</code>。</li>
-            <li>取消：<code>cancel</code> 是唯一请求进程终止的控制器操作。</li>
-            <li>持久化证据：每个 run 存 <code>request.json</code> / <code>record.json</code> / <code>stdout.txt</code> / <code>stderr.txt</code>。</li>
-            <li>provider 适配：<code>pi</code>（默认与设计中心）、<code>codex</code>、<code>codebuddy</code>、<code>claude</code>；通过 NewAPI 的 Rust 图片生成/编辑 <code>servitor image</code>。</li>
-            <li>SDK 操作：<code>submit</code>、<code>get</code>、<code>cancel</code>、<code>inspect</code>、<code>list_runs</code>、<code>gc_runs</code>。</li>
-          </ul>
-        </td>
-        <td>
-          <ul>
-            <li>动态工作流执行（沙箱化 JavaScript，内嵌 Boa）。</li>
-            <li>并发、<code>command()</code>、人工 <code>gate()</code>、<code>retry()</code>、<code>supersede()</code>、子 <code>workflow()</code>。</li>
-            <li>持久化状态、replay/resume、pause、cancel、机器运行证据。</li>
-            <li>预算账本 <code>budget.jsonl</code>（调用数 / 可选 money / token 归因）。</li>
-            <li>边界审计 <code>boundary.jsonl</code>、能力注册与路由。</li>
-            <li>事件流 <code>events.jsonl</code> 与 <code>watch</code> 重建实时树视图。</li>
-          </ul>
-        </td>
-      </tr>
-      <tr>
-        <th scope="row">刻意不拥有</th>
-        <td>
-          <ul>
-            <li>多步执行、fan-out、角色、advisor 提示、schema 检查、Git 交付、任务接受——“属于 Servitor 之上”。</li>
-            <li>无 <code>advisor</code> 子命令：专家咨询只是一个 <em>角色</em>，通过既有传输表达，且建议只是控制器证据、绝不驱动命令/gate/部署。</li>
-            <li>无生成的 launcher 源码、<code>_DONE.txt</code>、session 缓存、daemon、队列或隐藏兜底数据库。</li>
-            <li>不感知 workflow 阶段与报告策略；不渲染面向读者的报告。</li>
-          </ul>
-        </td>
-        <td>
-          <ul>
-            <li>不含 provider 适配器：agent 进程提交/检查/取消/输出由 servitor 拥有。</li>
-            <li>不静默重试 provider、不回退到别的 provider、不设 token 预算停跑（token 仅用于归因、永不停跑）、无 provider 专用文本剥离器。</li>
-            <li>显式 provider/model 选择不会被静默替换；不可接受的选择在传输提交前即失败，不探测 provider、不制造兜底。</li>
-            <li>不渲染面向读者的交付报告：<code>run-summary.html</code> 是机器运行证据，交付 HTML 由 workflow 报告阶段用 <code>reader-centered-reporting</code> + <code>l1uyun-surface</code> 产出。</li>
-          </ul>
-        </td>
-      </tr>
-      <tr>
-        <th scope="row">状态与恢复</th>
-        <td>默认 <code>D:\AgentWork\state\servitor\</code>，可用 <code>SERVITOR_STATE_ROOT</code> 覆盖；<code>running</code> 时上报 2 秒 worker 心跳与进程存活 <code>activity.status=working|stale</code>。</td>
-        <td>默认 <code>D:\AgentWork\state\servitor-workflows</code>，可用 <code>SERVITOR_WORKFLOWS_STATE_ROOT</code> 覆盖；resume 复用 journal 中已完成调用、重连 Servitor run id、重跑失败调用，<code>succeeded|cancelled|superseded</code> 阻止重跑。</td>
-      </tr>
-    </tbody>
-  </table>
-  <p>一句话记忆：servitor 负责“一次耐用 provider 调用”，servitor-workflows 负责“在这之上把多次调用组织成可恢复、有预算、有边界、有人工 gate 的工作流”。两者各自清楚边界，绝不互相越界。</p>
-</section>
+<section id="relationship"><h2>职责边界：谁拥有什么</h2><p>servitor 与 servitor-workflows 是上下层关系：servitor 是 Rust 传输层，接受一次请求、运行一个 provider 进程、固化证据、返回一个小型类型化结果；servitor-workflows 是建在 servitor 之上的 Rust 编排层。两者各自拥有清晰的职责，也各自刻意不拥有一些东西。下表基于两份 README 列出对比。</p><table><thead><tr><th scope="col">维度</th><th scope="col">servitor（传输层）</th><th scope="col">servitor-workflows（编排层）</th></tr></thead><tbody><tr><th scope="row">拥有</th><td>agent 进程提交（<code>submit</code>）、检查（<code>get</code>/<code>inspect</code>）、取消（<code>cancel</code>）、输出固化（<code>runs/RUN_ID/</code> 下的 <code>request.json</code>、<code>record.json</code>、<code>stdout.txt</code>、<code>stderr.txt</code>）；provider 适配器（<code>pi</code>、<code>codex</code>、<code>codebuddy</code>、<code>claude</code>）；image 生成/编辑传输；worker 心跳与进程存活上报（<code>activity.status</code>）；SDK 的 <code>submit/get/cancel/inspect/list_runs/gc_runs</code>。</td><td>动态工作流执行、并发、命令（<code>command()</code>）、人机 gate（<code>gate()</code>）、持久化状态、replay/resume、暂停/取消、子工作流树、预算账本（<code>budget.jsonl</code>）、边界审计（<code>boundary.jsonl</code>）、能力注册与路由、事件流（<code>events.jsonl</code>）与 <code>watch</code> 树视图、机器运行证据 <code>run-summary.html</code>。</td></tr><tr><th scope="row">刻意不拥有</th><td>多步执行、fan-out、命令、角色、advisor prompt、schema 检查、Git 交付、任务接受、replay/resume、人机 gate、报告渲染——这些属于 workflows。servitor 刻意停在“一次可持久的 provider 调用”。没有 <code>advisor</code> 子命令，专家咨询只是经现有传输表达的角色。</td><td>不含 provider 适配器本身（仍经 servitor 提交）；不做模型兜底——显式 provider/model 选择不会被静默替换，不可接受的选择在提交前失败；不做静默重试 provider 或切换 provider；不设 token 预算停跑（token 仅用于归因，从不停止 run）；不渲染读者面向的交付报告（<code>run-summary.html</code> 仅是机器运行证据，读者报告由工作流报告阶段用 <code>reader-centered-reporting</code> + <code>l1uyun-surface</code> 产出）；不做内核级沙箱（边界审计只观察记录，不在内核层隔离）。</td></tr><tr><th scope="row">执行原语</th><td>一次 <code>SubmitRequest</code> → 一个 provider 进程 → 一个类型化结果。</td><td>三个原语：<code>agent + command + gate</code>；用沙箱化 JavaScript 表达循环、分支、动态 fan-out（内嵌 Boa，无 Node/Deno/V8/Python 运行时依赖）。</td></tr><tr><th scope="row">对协议的无知</th><td>servitor 自身不感知工作流阶段与报告策略。</td><td>workflows 不感知 provider 进程内部行为，只通过 servitor 的运行 id 复用已完成的调用。</td></tr></tbody></table><p>一句话总结：servitor 负责“把一次 agent 调用可靠地跑完并留下证据”，servitor-workflows 负责“把多次调用、命令与人机决策编排成可恢复、可审计、有预算约束的完整工作流”。两者的边界由 README 明确写出，不可越界。</p></section>
 <section id="primitives">
 <h2>三个执行原语</h2>
 <p><code>servitor-workflows</code> 的执行契约只有三个原语：</p>
 <pre><code>agent + command + gate</code></pre>
-<p>工作流用沙箱化的 JavaScript 编写，因为普通的循环、分支和动态扇出在那里比在静态 DAG 中更清晰。Rust 二进制内嵌了 Boa 引擎；Node、Deno、V8 和 Python 都不是运行时依赖。关键约束是：<strong>JavaScript 没有直接的文件系统或进程 API</strong>——所有外部工作都必须穿过下面这三类有类型的边界。</p>
+<p>工作流用沙箱化的 JavaScript 编写，因为普通的循环、分支和动态 fan-out 在脚本里比静态 DAG 更清晰。Rust 二进制内嵌了 Boa 引擎；<code>Node</code>、<code>Deno</code>、<code>V8</code>、<code>Python</code> 都不是运行时依赖。</p>
 
-<h3><code>agent(prompt, options?)</code></h3>
-<p>提交一次模型调用并返回经过 schema 校验后的 JSON。默认 agent 是 <code>pi</code>；为 pi 指定模型时使用 <code>provider/model-id</code> 格式（例如 <code>"newapi/glm-5.2"</code>），provider 前缀必须匹配 <code>~/.pi/agent/models.json</code> 中 <code>providers</code> 的某个键，否则裸 model id 会让 pi 猜测上游 provider 并失败。典型用法：</p>
+<h3>agent — 一次模型调用</h3>
+<p><code>agent(prompt, options?)</code> 向 transport 提交一次模型调用。当请求结构化输出时，运行时会从模型自由文本里提取 JSON（剥离推理包装 → 收集候选片段 → 尾逗号修复 → 按 schema 形状过滤 → schema 合法性筛选，多个合法候选取最后一个），再做 schema 校验；若仍失败，会在同一个逻辑 journal 调用下补发一次修正请求，要求返回裸 JSON。默认 agent 是 <code>pi</code>。</p>
 <pre><code>const found = await agent("Find files to audit.", {
   schema: {
     type: "object",
@@ -180,118 +110,72 @@
     },
   },
 });</code></pre>
-<p>当 agent 调用请求结构化输出时，运行时从自由文本中抽取 JSON：剥除 reasoning 包装 → 收集候选（整段文本、fenced <code>```json</code>、平衡的 <code>{...}</code>/<code>[...]</code> 区间）→ 修复尾逗号 → 按 schema 的 <code>type</code> 做形状过滤 → schema-valid 选择（required/properties/items）。若多个候选都校验通过，取<strong>最后一个</strong>（final-answer 约定）。schema 是候选之间的选择标准，而不只是对首个形状匹配项的事后检查。</p>
-<p>若成功的 transport 输出仍通不过 schema 校验，引擎会在同一个逻辑 journal call 下提交恰好一次 correction request，带上原始任务、schema、校验错误和有界无效输出摘录，要求返回裸的修正 JSON；backend、model、cwd、system prompt、timeout、native args 保持不变。provider/timeout/worker/submission/inspection/cancellation 等传输层失败不会被该机制重试。结构化输出支持刻意收窄的 JSON Schema 子集：<code>type</code>、<code>required</code>、<code>properties</code>、<code>items</code>。Agent options 的真实字段包括 <code>label</code>、<code>agent</code>、<code>model</code>、<code>cwd</code>、<code>systemPrompt</code>、<code>timeoutSeconds</code>、<code>nativeArgs</code>、<code>schema</code>。</p>
+<p>可用的 agent 选项包括 <code>label</code>、<code>agent</code>、<code>model</code>、<code>cwd</code>、<code>systemPrompt</code>、<code>timeoutSeconds</code>（默认 120）、<code>nativeArgs</code>、<code>schema</code>。给 pi 指定 model 时用 <code>provider/model-id</code> 格式（如 <code>"newapi/glm-5.2"</code>），provider 前缀必须匹配 <code>~/.pi/agent/models.json</code> 的 <code>providers</code> 键；裸 model id（如 <code>"glm-5.2"</code>）会让 pi 猜测上游 provider 并以 <code>No API key found</code> 失败。</p>
 
-<h3><code>command(program, args?, options?)</code></h3>
-<p>运行一个本地命令并返回结构化的 <code>CommandResult</code>。Command options 的真实字段是 <code>label</code>、<code>cwd</code>、<code>timeoutSeconds</code>、<code>env</code>。在 Windows 上，command 子进程创建时不带控制台窗口；stdout 和 stderr 各保留有界的 1 MiB 尾部。</p>
-<pre><code>await retry(() => command("pwsh", ["-File", "flaky.ps1"]), {
-  maxAttempts: 3,
-  delayMs: 2000,
-  backoff: 2,
-  wallTimeSeconds: 60,
-  nonRetryable: ["validation"],
-});</code></pre>
-<p><code>command()</code> 解析为结构化的 <code>CommandResult</code>：</p>
-<pre><code>{
-  "argv": ["pwsh", "-NoProfile", "..."],
-  "cwd": "D:\\AgentWork",
-  "exitCode": 0,
-  "stdout": "...",
-  "stderr": "...",
-  "stdoutTruncated": false,
-  "stderrTruncated": false,
-  "timedOut": false,
-  "durationMs": 751
-}</code></pre>
-<p>同一个对象在成功、非零退出和超时情况下都会被原子地持久化到 <code>state/servitor-workflows/runs/&lt;run_id&gt;/commands/&lt;key&gt;/result.json</code>。直接消费这些有类型字段；不要重新读控制台输出或加一个 "read-results" 阶段。<code>stdout</code>/<code>stderr</code> 是有界尾部，不是业务结论——如果一个 worker 必须回传机器裁决，它应该在约定路径写一个显式的 evidence JSON。</p>
+<h3>command — 一个本地命令</h3>
+<p><code>command(program, args?, options?)</code> 运行一个本地命令，返回结构化的 <code>CommandResult</code>。在 Windows 上子进程不创建控制台窗口；stdout 与 stderr 各保留有界 1 MiB 尾部。</p>
+<pre><code>const r = await command("pwsh", ["-File", "flaky.ps1"], {
+  label: "test",
+  cwd: null,
+  timeoutSeconds: 300,
+  env: {},
+});
+// r: { argv, cwd, exitCode, stdout, stderr,
+//      stdoutTruncated, stderrTruncated, timedOut, durationMs }</code></pre>
+<p>同一个结果对象会原子地持久化到 <code>state/servitor-workflows/runs/&lt;run_id&gt;/commands/&lt;key&gt;/result.json</code>，成功、非零退出和超时都同样落盘。直接消费这些类型化字段即可，不要重新读控制台输出或加一个 "read-results" 阶段。<code>stdout</code>/<code>stderr</code> 是有界尾部，不是业务结论——要回传机器判定，worker 应在约定路径写一份显式 evidence JSON。</p>
 
-<h3><code>gate(question, options?)</code></h3>
-<p>暂停运行，等待一个人类决策。除了 yes/no，gate 还能为"人类修正输入"的情形携带一个注入值：</p>
+<h3>gate — 暂停等人决策</h3>
+<p><code>gate(question, options?)</code> 为一个人工决策暂停。除了 yes/no，gate 还可以带一个注入值用于"人工修正输入"的情形：</p>
 <pre><code>const fixed = await gate("give the correct contractPath", {
-  expect: "value",
+  expect: "value",                 // 请求一个 JSON 值而非 yes/no
   current: { contractPath: "old.md" },
   hint: "should be under surveys/",
 });
 await command("pwsh", ["-File", "check.ps1", fixed.value.contractPath]);</code></pre>
-<p>运行停在 <code>waiting_human</code>，<code>expect</code>/<code>current</code>/<code>hint</code> 记录在 <code>waiting_gate</code> 中。收集这个值（一个聊天回答、一个本地决策页）是 controller 的工作；用 <code>approve RUN_ID --reason TEXT --value '{"contractPath":"surveys/new.md"}'</code> 注入，<code>get</code> 会返回已存储的值。</p>
+<p>运行会停在 <code>waiting_human</code> 状态，<code>expect</code>/<code>current</code>/<code>hint</code> 写入 <code>waiting_gate</code>。收集这个值（聊天回答、本地决策页）是 controller 的工作；用 <code>approve RUN_ID --reason TEXT --value '{"contractPath":"surveys/new.md"}'</code> 注入，<code>get</code> 会返回已存储的值。</p>
 
-<h3>三者之外的边界</h3>
-<p>这三个原语是工作流脚本与外界交互的唯一通道。因为 JavaScript 没有直接的文件系统或进程 API，任何读文件、跑命令、问人的动作都必须分别穿过 <code>agent</code>、<code>command</code> 或 <code>gate</code> 的有类型边界——这样每一次外部调用都会被 journal 记录、可被 replay 复现、并受 budget 与 boundary 审计约束。<code>parallel</code>、<code>pipeline</code>、<code>retry</code>、<code>workflow</code> 等控制流原语都是围绕这三类边界调用的编排，本身不引入新的外部能力。</p>
+<h3>边界：JS 没有直接文件系统/进程 API</h3>
+<p>JavaScript 没有直接的文件系统或进程 API。任何外部工作都必须穿过类型化的 <code>agent</code>、<code>command</code> 或 <code>gate</code> 边界。这条约束与 journal 的确定性回放假设一致：脚本每次执行必须产生相同的调用输入，因此 <code>Date.now()</code>、<code>Math.random()</code>、无参 <code>new Date()</code>、以及把 <code>Date()</code> 当函数调用都会在脚本里抛 <code>TypeError</code>；时间戳和随机量应通过 <code>args</code> 传入（如 <code>args.startedAt</code>），并在工作流返回后再打墙钟时间。<code>new Date(explicitValue)</code>、<code>Date.parse(...)</code>、<code>Date.UTC(...)</code> 仍然合法。</p>
 </section>
 <section id="control-flow">
 <h2>控制流原语</h2>
-<p><code>servitor-workflows</code> 用沙箱化的 JavaScript 表达控制流，因为普通循环、分支和动态 fan-out 在脚本里比静态 DAG 更清晰。执行契约只有三个原语：<code>agent</code> + <code>command</code> + <code>gate</code>。除直接调用外，运行时还提供以下组合原语。</p>
+
+<p>README 把 servitor-workflows 的执行契约收敛为三个原语：<code>agent + command + gate</code>。围绕这三个原语，脚本里可用的控制流由一组全局函数提供。下面逐个给出作用与 README 中明文列出的选项。</p>
 
 <h3><code>pipeline(items, ...stages)</code></h3>
-<p>对一组条目按一个或多个 stage 顺序串联处理，常用于动态 fan-out 场景，例如把 <code>agent</code> 发现的文件列表逐个送入审计调用。</p>
-<pre><code>phase("audit");
-const results = await pipeline(
-  found.files,
-  file =&gt; agent(`Audit ${file}.`, { label: file }),
-);</code></pre>
+<p>把一组条目按阶段串联推进，每个阶段对前一个阶段的产出再加工，常用于动态扇出的逐项处理（如对每个文件依次审计）。README 示例为 <code>pipeline(found.files, file =&gt; agent(`Audit ${file}.`, { label: file }))</code>。</p>
 
 <h3><code>parallel(promises)</code></h3>
-<p>并发执行一组 promise，与 <code>pipeline</code> 一起覆盖「并行同构任务」与「流水线分阶段」两种结构，共同受运行树共享的并发调度器与预算账本约束。</p>
+<p>并发执行一组 agent/command 调用并等待全部完成，是独立扇出与 section 组装的基础。README 的 intro-html 示例即用 <code>parallel()</code> 并行拼装各段 HTML。</p>
 
 <h3><code>retry(fn, options?)</code></h3>
-<p>对任意 <code>agent</code>/<code>command</code> thunk 做有界重试。每次尝试都是一条独立的 journaled call（尝试序号是 journal key 的一部分），因此确定性重放仍然成立：成功的尝试在 resume 时被跳过，失败的尝试重新运行。<code>retry()</code> 的墙钟计时使用一个被豁免于确定性禁令的隐藏宿主时钟，因为它从不进入 call key。</p>
-<p>选项（均来自 README）：</p>
-<ul>
-<li><code>maxAttempts</code>：固定的尝试次数上限。</li>
-<li><code>delayMs</code>：首次回退延迟。</li>
-<li><code>backoff</code>：倍数（<code>1</code> 为固定间隔）。</li>
-<li><code>wallTimeSeconds</code>：总耗时上限（SLA），即使剩余尝试次数也会停止。</li>
-<li><code>nonRetryable</code>：当错误文本匹配时立即失败、不再重试。</li>
-</ul>
-<pre><code>await retry(() =&gt; command("pwsh", ["-File", "flaky.ps1"]), {
-  maxAttempts: 3,
-  delayMs: 2000,
-  backoff: 2,
-  wallTimeSeconds: 60,
-  nonRetryable: ["validation"],
-});</code></pre>
+<p>对任意 <code>agent</code>/<code>command</code> thunk 做有界重试。每次尝试都是一次独立的 journaled call，尝试编号写入 journal key，因此重试不破坏确定性 replay：成功的尝试在 resume 时跳过，失败的尝试重跑。<code>retry()</code> 的墙上时间记账用隐藏 host clock，不喂入 call key，故不受确定性禁令影响。选项（README 原文）：</p>
+<pre><code>{
+  maxAttempts: 3,          // fixed attempt cap
+  delayMs: 2000,           // first backoff delay
+  backoff: 2,              // multiplier (1 = fixed interval)
+  wallTimeSeconds: 60,     // total elapsed cap (SLA), stops even if attempts remain
+  nonRetryable: ["validation"], // fail fast when error text matches; no retry
+}</code></pre>
 
 <h3><code>gate(question, options?)</code></h3>
-<p>暂停运行以等待人工决策。除 yes/no 外，gate 还可以为「人工修正输入」的场景携带一个注入值：把 <code>expect</code> 设为 <code>"value"</code> 以请求一个 JSON 值而非布尔，并用 <code>current</code> 给出当前值、<code>hint</code> 给出提示。运行停靠在 <code>waiting_human</code> 状态，<code>expect</code>/<code>current</code>/<code>hint</code> 记录在 <code>waiting_gate</code> 中；收集该值是 controller 的工作，通过 <code>approve RUN_ID --reason TEXT --value '{...}'</code> 注入，<code>get</code> 返回已存储的值。</p>
-<pre><code>const fixed = await gate("give the correct contractPath", {
-  expect: "value",
-  current: { contractPath: "old.md" },
-  hint: "should be under surveys/",
-});</code></pre>
+<p>暂停运行以等待一个人类决策。除 yes/no 外，gate 还能为“人类修正输入”这一情形注入一个值：运行停在 <code>waiting_human</code>，把 <code>expect</code>/<code>current</code>/<code>hint</code> 写入 <code>waiting_gate</code>；控制器收集到值后用 <code>approve RUN_ID --reason TEXT --value '{...}'</code> 注入，<code>get</code> 会返回已存储的值。</p>
 
 <h3><code>supersede(options)</code></h3>
-<p>当方向本身错误时，把整个 run 标记为终态 <code>superseded</code>（区别于 <code>failed</code>/<code>cancelled</code>），并记录 <code>{reason, evidence?, newContract?}</code> 到 state。controller 读取 <code>get</code> 得到 <code>status=superseded</code>，写下 supersede-chain 说明，然后启动一个新 run——其 readiness gate 会跳过已产出的产物。这是 continue-as-new，而不是就地修改脚本。CLI 等价物：<code>supersede RUN_ID --reason TEXT [--evidence PATH] [--new-contract TEXT]</code>。</p>
+<p>当方向本身错误时，把整个 run 标记为终态 <code>superseded</code>（区别于 <code>failed</code>/<code>cancelled</code>），并把 <code>{reason, evidence?, newContract?}</code> 记录进 state。控制器读 <code>get</code> 看到 <code>status=superseded</code>，写 supersede-chain 说明，再启动一个新 run——这是 continue-as-new，绝不就地改脚本。CLI 等价：<code>supersede RUN_ID --reason TEXT [--evidence PATH] [--new-contract TEXT]</code>。</p>
 
-<h3><code>workflow(path, args?, options?)</code> — 子工作流</h3>
-<p>把另一个工作流脚本作为当前 run 的子 run 运行。子 run 形成一棵持久化的结构化并发树：每个子 run 拥有自己的 run id、journal 与边界，同时共享根的并发调度器与预算账本；子 run 的结果持久化在树中并计入共享预算。</p>
-<p>来自 README 的关键规则：</p>
+<h3><code>workflow(path, args?, options?)</code>（子工作流）</h3>
+<p>把另一个 workflow 脚本作为当前 run 的子运行执行。子工作流构成持久化的结构化并发树：每个 child 有自己的 run id、journal 与边界，同时共享 root 的并发调度器与预算账本。README 明文规则：</p>
 <ul>
-<li>子 run 继承父 run 的预算、边界、能力与隔离，且只能收紧、不能放宽。</li>
-<li>子 run 失败只会 reject 那一次 <code>workflow()</code> 调用；策略（catch、retry 或 fail the chain）由父脚本决定。</li>
-<li>人工等待会沿树可见地上冒：批准根 run 即可恢复等待中的后代。</li>
-<li>循环与无界递归在任何 dispatch 之前被拒绝。</li>
-<li>取消从父 run 传播到所有存活后代。</li>
+<li>child 继承 parent 的 budget、boundary、capabilities 与 isolation，且只能收紧、不能放宽；</li>
+<li>child 失败只 reject 那一次 <code>workflow()</code> 调用，由 parent 脚本决定策略（catch / retry / fail the chain）；</li>
+<li>人类等待沿树可见地上浮：批准 root 即恢复等待中的后代；</li>
+<li>循环与无界递归在任何 dispatch 之前被拒绝；</li>
+<li>cancellation 从 parent 传播到所有存活后代。</li>
 </ul>
-<p>这正是表达「独立审查」的方式：审查者作为子工作流运行、带有自己收窄（只读）的边界，因此制作者的产物不会在同一个 run 中被自评。</p>
-<pre><code>const review = await workflow("review.workflow.js", {
-  contractPath,
-  evidencePath,
-});</code></pre>
+<p>这正是“独立审查”的表达方式：reviewer 作为带自身收窄（read-only）边界的 child workflow 运行，maker 的产出不会在同一个 run 里被自我打分。</p>
 </section>
-<section id="example">
-  <h2>一个真实可运行的示例</h2>
-
-  <p>
-    上一节讲了三原语 <code>agent + command + gate</code> 和沙箱化 JavaScript 的执行模型。这一节直接看一段来自 README 的真实工作流脚本 <code>audit-routes</code>，再把它跑起来。它把上面三原语里最常用的 <code>agent</code>（带 schema 结构化输出）与 <code>pipeline</code>（动态扇出）串成一条线：先发现要审计的文件，再对每个文件做一次审计，最后返回结果数组。
-  </p>
-
-  <h3>脚本：audit-routes</h3>
-  <p>
-    每个工作流都必须声明 <code>meta.contract: "workflow"</code>。一个 run 如果省略 contract 或给出任何其他值，会在创建 run 目录之前就被拒绝。<code>phase(name)</code> 标记当前阶段；<code>agent(prompt, options?)</code> 发起一次经由 servitor transport 的 provider 调用；<code>pipeline(items, ...stages)</code> 对每个 item 依次跑给定的 stage，是比静态 DAG 更清晰的动态扇出方式。
-  </p>
-
-  <pre><code>export const meta = {
+<section id="example"><h2>一个真实可运行的示例</h2><p>下面这段 <code>workflow</code> 脚本直接取自 README 里的 audit-routes 示例，展示了两个核心习惯：用 <code>phase(name)</code> 划分阶段，用 <code>agent(prompt, options?)</code> 让模型返回结构化结果，再用 <code>pipeline(items, ...stages)</code> 对上一步的结果做动态 fan-out。</p><p>每个 workflow 必须声明 <code>meta.contract: "workflow"</code>，否则在创建 run 目录之前就会被拒绝。<code>agent</code> 调用里给出的 <code>schema</code> 是 prompt 层契约，运行时会从模型文本里抽取 JSON 并按 schema 做有效性筛选；若抽取后仍不满足 schema，引擎会在同一逻辑 journal 调用下补发一次 correction 请求。</p><pre><code>export const meta = {
   name: "audit-routes",
   contract: "workflow",
 };
@@ -313,82 +197,51 @@ const results = await pipeline(
   file => agent(`Audit ${file}.`, { label: file }),
 );
 
-return results;</code></pre>
-
-  <p>
-    这里 <code>schema</code> 用的是工作流契约支持的精简 JSON Schema 子集：<code>type</code>、<code>required</code>、<code>properties</code>、<code>items</code>。runtime 会从模型自由文本里提取 JSON（剥掉 reasoning 包装 → 收集候选 → 尾逗号修复 → 按形状过滤 → schema 合法性选择），多个候选都合法时取最后一个（final-answer 约定）。<code>label</code> 给这次 agent 调用一个可读标签，方便在 journal 和 watch 视图里辨认。
-  </p>
-
-  <h3>跑起来</h3>
-  <p>
-    README 给出的真实运行命令是对仓库自带的示例脚本直接执行：<code>servitor-workflows run</code> 会在创建 run 目录之前先做一次和 <code>check</code> 相同的校验（meta 声明 + 在真实引擎封装下解析脚本），脚本解析失败会以 exit <code>2</code> 拒绝。校验通过后创建一个 run 记录并开始执行，<code>get RUN_ID --wait</code> 可以每 500ms 轮询直到成功、终态失败、取消、被取代，或停在 <code>waiting_human</code>。
-  </p>
-
-  <pre><code>servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\dynamic.workflow.js</code></pre>
-
-  <p>
-    想给脚本传参，用 <code>--args</code> 传一段 JSON；它会在脚本里以全局 <code>args</code> 出现。下面是 README 里的两体协商 canary，同样是对真实示例脚本 <code>negotiate-2body.workflow.js</code> 的脚本组合调用：
-  </p>
-
-  <pre><code>servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\negotiate-2body.workflow.js `
-  --args '{"topic":"pick a 30s local canary","maxRounds":2}'</code></pre>
-
-  <p>
-    默认 <code>max_parallel = min(16, available_parallelism)</code>、<code>max_calls = 1000</code>（共享硬上限，覆盖整棵工作流树，可用 <code>--max-calls</code> 覆盖）。每个 run 自带 <code>run-summary.html</code> 这份机器运行证据（由 Rust 从持久化的 state 和 journal 生成，不打开浏览器），它不是面向读者的交付报告。
-  </p>
-</section>
+return results;</code></pre><p>README 给出的真实运行命令是直接指向 examples 目录下的 <code>dynamic.workflow.js</code>。这是一个可复制即用的命令：</p><pre><code>servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\dynamic.workflow.js</code></pre><p>运行前可以用 <code>servitor-workflows check WORKFLOW.js</code> 只做校验而不执行；<code>run</code> 自身也会做同样的校验，脚本无法解析时以 exit <code>2</code> 拒绝，且不会创建 run 目录。提交后立即拿到 <code>run_id</code>，用 <code>servitor-workflows get RUN_ID --wait</code> 轮询直到成功、终态失败、取消、superseded 或 <code>waiting_human</code>。每个终态 run 都会生成机器运行证据 <code>run-summary.html</code>，注意它不是面向读者的交付报告。</p></section>
 <section id="persistence">
-<h2>持久化与恢复</h2>
+  <h2>持久化与恢复</h2>
 
-<p>servitor-workflows 把每个 run 的全部可观察状态落在磁盘上，使得“杀掉控制器进程再重启”等价于一次续跑，而不是丢失工作。默认状态根是 <code>D:\AgentWork\state\servitor-workflows</code>，可用 <code>SERVITOR_WORKFLOWS_STATE_ROOT</code> 覆盖。</p>
+  <p><code>servitor-workflows</code> 把每个 run 的全部可恢复事实落到磁盘，进程崩溃或被杀后无需内存状态即可重建。默认状态根是 <code>D:\AgentWork\state\servitor-workflows</code>，可用 <code>SERVITOR_WORKFLOWS_STATE_ROOT</code> 覆盖。每个 run 独占一个目录 <code>runs/&lt;RUN_ID&gt;/</code>，内含下列文件：</p>
 
-<h3>每个 run 的文件结构</h3>
-<p>每个 run 拥有目录 <code>runs/&lt;RUN_ID&gt;/</code>，其下固定落盘这些文件：</p>
-<ul>
-  <li><code>workflow.js</code> — 本次运行的工作流脚本本体，原样留存以便 resume 时重放同一段 JavaScript。</li>
-  <li><code>state.json</code> — 运行状态机当前值。例如 <code>cancel</code> 要求 <code>--reason</code>，该文本以 <code>error: "cancelled: &lt;reason&gt;"</code> 形式记入 <code>state.json</code> 供审计。</li>
-  <li><code>journal.jsonl</code> — 稳定调用身份与调用结果日志。一次调用由“身份 + 出现序号”定位；已结算的调用在 resume 时直接取回，不必重新提交。</li>
-  <li><code>events.jsonl</code> — 版本化、append-only 的事件流，记录每一次生命周期迁移、调用、gate、预算变动与 boundary 事件。<code>watch</code> 完全从该文件重建整棵运行树的实时视图，不依赖任何内存状态。</li>
-  <li><code>budget.jsonl</code> — 多维预算账本，按 reservation → settlement → release 记账；崩溃在 reservation 与 settlement 之间既不重复计费也不丢失预留。</li>
-  <li><code>boundary.jsonl</code> — boundary 审计证据：每条命令对照声明的读/写/网络/环境面被核对，未声明的写、过量环境继承、子任务越权都会被记为 violation 并阻止成功。凭据值从不进 journal，secret 经 allowlisted 环境变量传递并在 journal 中脱敏。</li>
-  <li><code>run-summary.html</code> — 每个 terminal run 自带的机器运行证据页，由 Rust 从持久化状态与 journal 生成，从不打开浏览器。它是 machine run-evidence，不是面向读者的交付报告。</li>
-  <li><code>pause.request</code> / <code>cancel.request</code> — pause 与 cancel 的请求落盘文件，支撑控制信号在进程边界之外传递。</li>
-</ul>
+  <ul>
+    <li><code>workflow.js</code> — 该 run 执行的工作流脚本本体，resume 时原样重放。</li>
+    <li><code>state.json</code> — 运行状态机当前值与终态审计信息；<code>cancel</code> 的 <code>--reason</code> 文本以 <code>error: "cancelled: &lt;reason&gt;"</code> 形式记录于此。</li>
+    <li><code>journal.jsonl</code> — 稳定调用身份与对应的 Servitor run id。已结算的调用在 resume 时从 journal 取回，不再向 transport 重提交；失败的调用在同一稳定身份下重跑。<code>schema_correction</code> 元数据会保留两个 transport run id 与校验错误，一次 correction 耗尽即终态，resume 不会提交第三次 transport run。</li>
+    <li><code>events.jsonl</code> — 版本化、只追加的事件流：每次生命周期迁移、调用、gate、budget 变动、boundary 事件都追加一行。<code>watch</code> 完全从该流重建整棵树的实时视图（状态、活跃 phase、预算用量、等待类别、关键路径、恢复命令），不持有任何内存状态。重建时拒绝畸形或撕裂的事件尾部，仅容忍最后一条撕裂行作为崩溃痕迹。被杀后重启的 controller 能从事件重建出同一棵树，从第一个未完成调用继续。</li>
+    <li><code>budget.jsonl</code> — 多维预算账本：调用数、可选金额、token 用量。记账走 预留→结算→释放，崩溃在预留与结算之间既不重复计费也不丢预留；resume 不发放新额度，重放 journaled key 免费。<code>max_calls</code>（CLI <code>--max-calls</code>，默认 1000）是全树硬上限；<code>meta.moneyCap</code>（分）仅在契约显式给出时才成为硬限；token 仅作归因、永不叫停。</li>
+    <li><code>boundary.jsonl</code> — boundary 审计证据。契约可前置声明 <code>readPaths</code>/<code>writePaths</code>/<code>network</code>/<code>environment.allow</code>，host 对每条 <code>command</code> 比对声明并记录；未声明的写、越权的环境继承、子 run 放宽权限都会记为违例并阻断成功。这是审计边界而非内核级沙箱。journal 永不存凭据明文——密钥经 allowlisted 环境变量穿过，在 journal 中被脱敏。</li>
+    <li><code>run-summary.html</code> — 每个终态 run 都拥有的自包含机器/运行证据页，由 Rust 从持久化 state 与 journal 生成，绝不打开浏览器。它是运行证据，不是面向读者的交付报告；读者交付报告由工作流 reporting 阶段用 <code>reader-centered-reporting</code> + <code>l1uyun-surface</code> 产出，Rust 仅在 workflow 返回指向已存在非空文件的绝对路径时才接受 <code>report</code> 字段。</li>
+    <li><code>pause.request</code> / <code>cancel.request</code> — pause 与 cancel 的请求落盘文件，支撑暂停/取消的恢复语义。</li>
+  </ul>
 
-<h3>Journal replay 的确定性假设</h3>
-<p>journal replay 假定脚本在每次执行中产生<strong>相同的调用输入</strong>。因此常见非确定性来源在工作流脚本内直接抛 <code>TypeError</code>：<code>Date.now()</code>、<code>Math.random()</code>、无参 <code>new Date()</code>、以及作为函数调用的 <code>Date()</code>。时间戳与随机量应由 <code>args</code> 传入（如 <code>args.startedAt</code>），墙钟时间在工作流返回后再盖戳。<code>new Date(explicitValue)</code>、<code>Date.parse(...)</code>、<code>Date.UTC(...)</code> 仍然合法。</p>
+  <h3>Journal replay 的确定性假设</h3>
+  <p>Journal replay 假定脚本每次执行都产生相同的调用输入。为此，常见的不确定性来源在工作流脚本内会抛 <code>TypeError</code>：<code>Date.now()</code>、<code>Math.random()</code>、无参 <code>new Date()</code>、以及作为函数调用的 <code>Date()</code>。时间戳与随机量应通过 <code>args</code> 传入（如 <code>args.startedAt</code>），墙钟时间在工作流返回后再加盖。<code>new Date(explicitValue)</code>、<code>Date.parse(...)</code>、<code>Date.UTC(...)</code> 仍合法。<code>retry()</code> 的墙钟计时用一颗隐藏的宿主时钟，豁免于确定性禁令，因为它绝不喂入调用 key——每次 attempt 是独立的 journaled 调用，attempt 编号是 journal key 的一部分，故确定性 replay 仍成立：成功的 attempt 在 resume 时跳过，失败的 attempt 重跑。</p>
 
-<h3>Resume 语义</h3>
-<p>resume 重放同一段 JavaScript，对 paused、interrupted、failed 的 run 生效。稳定调用身份加出现序号从 journal 取回已完成调用，并通过 Servitor run id 重连已提交的 agent 调用；<strong>已结算的调用不会被重新提交，失败的调用在同一个稳定身份下重跑</strong>。<code>succeeded</code> 与 <code>cancelled</code> 保持 terminal，resume 只对齐它们的 terminal 产物；<code>superseded</code> 同样阻止重执行。JavaScript VM 本身不被序列化。<code>inspect</code> 暴露 <code>resume_count</code>，terminal run summary 显示同一计数。一条在打断前已完成的命令会被缓存；一条在控制器进程存活期间被打断的命令可能在 resume 时再执行一次，因此有副作用的命令必须自带幂等检查。</p>
+  <h3>Resume 策略</h3>
+  <p>Resume 对 paused、interrupted、failed 的 run 重放同一段 JavaScript。稳定调用身份加出现序号从 journal 取回已完成调用，已提交的 agent 调用通过其 Servitor run id 重新挂接，失败调用在同一稳定身份下重跑。<code>succeeded</code>、<code>cancelled</code>、<code>superseded</code> 阻止再执行，保持终态；<code>failed</code> 仍可 resume 以便恢复。<code>max_calls</code> 预算按 journal 大小种子化，resume 不发放新预算，重放 journaled key 免费。JavaScript VM 本身不序列化；中断前已完成的 command 被缓存，而中断时 controller 进程可能在 resume 时再次执行 command，故有副作用的 command 必须自带幂等检查。<code>inspect</code> 暴露 <code>resume_count</code>，终态 run summary 显示同一计数。</p>
 
-<h3>watch 从 events.jsonl 重建</h3>
-<p><code>servitor-workflows watch RUN_ID</code>（或 <code>--output jsonl watch RUN_ID</code>）仅从持久化的 <code>events.jsonl</code> 重建运行树视图——状态、活跃 phase、预算/用量、等待类别、critical path、恢复命令——没有任何内存状态。被杀并重启的控制器能从事件重建出完全相同的树，并从第一个未完成调用处续跑。畸形或撕裂的事件尾在重建时被拒绝；仅最后一行撕裂作为崩溃痕迹被容忍。</p>
-
-<h3>状态机</h3>
-<p>一个 run 的状态取值：<code>running</code> | <code>waiting_human</code> | <code>pausing</code> | <code>paused</code> | <code>cancelling</code> | <code>succeeded</code> | <code>failed</code> | <code>cancelled</code> | <code>superseded</code>。其中 <code>supersede</code> 是“方向本身错了”的独立终态，与 <code>failed</code>/<code>cancelled</code> 区分，记录 <code>{reason, evidence?, newContract?}</code>；它是 continue-as-new，从不就地改脚本。resume 策略：<code>succeeded|cancelled|superseded</code> 阻止重执行，<code>failed</code> 仍可 resume 以做恢复。</p>
+  <h3>状态机</h3>
+  <p>一个 run 处于以下状态之一：</p>
+  <p><code>running | waiting_human | pausing | paused | cancelling | succeeded | failed | cancelled | superseded</code></p>
+  <p>其中 <code>superseded</code> 与 <code>failed</code>/<code>cancelled</code> 相区别：当方向本身错了，<code>supersede</code> 把整个 run 标记为终态 <code>superseded</code>，并把 <code>{reason, evidence?, newContract?}</code> 记入 state，controller 读取 <code>get</code> 的 <code>status=superseded</code> 后写 supersede-chain 说明并另起一个新 run——这是 continue-as-new，绝不就地改脚本。<code>waiting_human</code> 是 gate 暂停点，controller 收集到人类值后用 <code>approve RUN_ID --reason TEXT --value '&lt;JSON&gt;'</code> 注入，<code>get</code> 返回该存储值。</p>
 </section>
 <section id="budget-boundary">
-<h2>预算与边界审计</h2>
+  <h2>预算与边界审计</h2>
 
-<p><code>servitor-workflows</code> 用两套独立机制把“一个工作流能花多少、能碰什么”变成可审计的持久事实：一套是多维预算账本，一套是边界声明审计。两者都落到 <code>state</code> 下的 <code>.jsonl</code> 文件里，崩溃与恢复都不会破坏记账的正确性。</p>
+  <p>servitor-workflows 把「能花多少」和「能碰什么」都做成可持久化、可回放的事实：预算记入 <code>budget.jsonl</code>，边界记入 <code>boundary.jsonl</code>。两者都随 run 存活，resume 不会凭空赠送额度，replay 也不会重复计费。</p>
 
-<h3>预算（Budget）</h3>
+  <h3>预算账本</h3>
+  <p>每个 run 拥有一个跨整棵 workflow 树共享的多维预算账本，持久化在 <code>budget.jsonl</code> 中，核算 call count、可选 money 与 token 用量。</p>
+  <ul>
+    <li><code>max_calls</code> 是整棵 workflow 树共享的硬上限，CLI 通过 <code>--max-calls</code> 设置，默认 <code>1000</code>。每一次 host 调用——agent、command、gate 以及子 workflow——都消耗它。</li>
+    <li><code>meta.moneyCap</code> 以 cents 为单位，可选，默认无限。只有当 contract 显式给出时，它才成为硬上限。</li>
+    <li>Token 用量仅用于归因（attribution），永远不会停止一个 run；不存在 token limit。</li>
+    <li>记账模型为 <strong>reservation → settlement → release</strong>。在 reservation 之后、settlement 之前崩溃，既不会双扣，也不会丢失预留。resume 不发放新额度，replay 永不重复计费。</li>
+  </ul>
 
-<p>每个 run 拥有一份共享的多维预算账本，持久化到 <code>budget.jsonl</code>，跨整棵工作流树（含子工作流）统一记账。账本覆盖三类维度：</p>
-
-<ul>
-  <li><strong>调用次数 <code>max_calls</code></strong>：整棵工作流树的共享硬上限，默认 <code>1000</code>，可用 CLI <code>--max-calls</code> 覆盖。每一次宿主调用——<code>agent</code>、<code>command</code>、<code>gate</code> 以及子工作流 <code>workflow()</code>——都消耗它。</li>
-  <li><strong>金钱 <code>meta.moneyCap</code></strong>：可选，单位是 cents（分），默认无限制。只有当契约显式给出时，它才成为硬上限。</li>
-  <li><strong>Token 用量</strong>：仅用于归因（attribution），永不停止一个 run。系统不存在 token 上限。</li>
-</ul>
-
-<p>记账流程是 <strong>reservation → settlement → release</strong>（预留 → 结算 → 释放）。在预留之后、结算之前发生崩溃，既不会重复扣费，也不会丢失预留。恢复（resume）不会授予新的容量，重放（replay）也绝不二次计费——重放已记录在 journal 中的调用键是免费的。</p>
-
-<h3>边界审计（Boundary audit）</h3>
-
-<p>一个契约可以预先声明自己的可观测写入面：</p>
-
-<pre><code>export const meta = {
+  <h3>边界审计</h3>
+  <p>一个 contract 可以预先声明自己的可观测写面：</p>
+  <pre><code>export const meta = {
   name: "chain",
   contract: "workflow",
   boundary: {
@@ -398,59 +251,47 @@ return results;</code></pre>
     environment: { allow: ["EVIDENCE"] },
   },
 };</code></pre>
-
-<p>宿主对每一个 <code>command</code> 调用都按这份声明进行审计，并把证据记录到 <code>boundary.jsonl</code>。下列情况会被记为违规（violation）并阻断成功：</p>
-
-<ul>
-  <li>未声明的写入（undeclared write）；</li>
-  <li>环境变量继承越权（excess environment inheritance）；</li>
-  <li>子工作流试图放宽权限（child permission widening）。</li>
-</ul>
-
-<p>需要强调：<strong>这是审计边界，不是 OS 沙箱</strong>。它只观察并记录，不在内核层面进行隔离与限制。因此它依赖声明与审计来形成约束，而非依赖操作系统级的强制 confinement。</p>
-
-<p>凭据安全方面，journal 永不存储凭据值本身。密钥本体通过 allowlist（白名单）内的环境变量传递，并在 journal 中被脱敏（redacted）处理——敏感数据只流动于受控的环境变量通道，不会落进持久化的调用记录里。</p>
-
-<p>预算账本与边界审计共同构成 <code>servitor-workflows</code> 的“能花多少 / 能碰什么”治理层：前者用可恢复的预留-结算模型保证计费正确，后者用声明-审计模型把可观测副作用显式化，两者都以 <code>.jsonl</code> 的事实记录为唯一真相。</p>
+  <p>host 对每一条 command 都按此声明进行审计，并把证据记录到 <code>boundary.jsonl</code>。下列情况记为 violation 并阻断 success：未声明的写、过度的环境继承，以及子 workflow 放宽权限。子 workflow 只能收紧（tighten）继承来的边界，永远不能放宽（widen）。</p>
+  <p>需要强调：这是<strong>审计边界，而非 OS 沙箱</strong>——它观察并记录，不在内核层级做隔离。<code>isolation</code> 层级有 <code>none</code>、<code>worktree</code>、<code>process</code>，以及显式请求的 <code>container</code>；其中 <code>worktree</code> 隔离产出 patch/commit 证据，同样不是安全沙箱。</p>
+  <p>关于凭据：journal 永不存储凭据值。密钥本体通过 allowlist 的环境变量穿越边界，并在 journal 中被脱敏（redacted），因此 <code>boundary.jsonl</code> 与 <code>journal.jsonl</code> 都不会泄漏 secret bodies。</p>
 </section>
 <section id="cli">
 <h2>CLI 速查</h2>
-<p>两个 CLI 都默认输出 JSON，统一使用 agent-native 信封 <code>{ok,data,meta,error}</code>，错误也走 stdout 以便代理只解析一个流。<code>--output</code> 是全局选项。</p>
+<p>两个工具都是 Rust 二进制，默认 JSON 输出，统一使用 agent-native envelope <code>{ok,data,meta,error}</code>。所有错误都走 stdout 的同一 envelope，便于代理解析单一流。退出码：servitor 为 <code>0</code> ok、<code>1</code> 运行失败、<code>2</code> 输入无效、<code>3</code> 未找到；servitor-workflows 多一个 <code>4</code> wait 超时，且 <code>get --wait</code> 命中 <code>waiting_human</code> 时也返回 <code>3</code>。</p>
 
 <h3>servitor</h3>
-<p>servitor 是 Rust 传输层：接收一次请求，跑一个 provider 进程，落持久证据，返回一个小的类型化结果。工作流策略、扇出、角色、验收都不在 servitor 范围。</p>
-<pre><code># 提交并立即拿到一个 durable handle
+<p>传输层：一次请求 → 一个 provider 进程 → 持久化证据 → 返回类型化结果。</p>
+<pre><code># 提交并立即拿到持久化句柄
 servitor submit --prompt-file task.md --cwd D:\AgentWork
 servitor submit --dry-run --prompt "validate fields only"
 
-# 读取（不等）或等待（不改 run）
+# 读取或等待（不改运行）
 servitor get RUN_ID
 servitor get RUN_ID --wait 120
 
 # 盘点与清理
 servitor list --limit 20 --state running
-servitor gc              # dry report of stuck runs
-servitor gc --apply      # finalize stuck workers as failed
+servitor gc              # 干跑报告卡住的 run
+servitor gc --apply      # 把卡住的 worker 终结为 failed
 
-# 唯一会请求进程终止的 controller 操作
+# 唯一会请求终止进程的控制器操作
 servitor cancel RUN_ID
 servitor cancel RUN_ID --dry-run
 
-# 传输证据与 provider 能力检查
+# 传输证据与 provider 能力查看
 servitor inspect RUN_ID
 servitor inspect capabilities
 servitor doctor
 servitor schema
 servitor completions powershell
 
-# 通过 NewAPI 的 Rust 图像生成/编辑传输
-sigil env run L1UYUN_NEWAPI_API_KEY -- servitor image `
+# 通过 NewAPI 的图像生成/编辑传输
+sigil env run L1UYUN_NEWAPI_API_KEY -- servitor image \
   --prompt-file prompt.md --out output.png</code></pre>
-<p>普通委派 worker：<code>servitor submit --agent codebuddy --model hy3 ...</code>（<code>hy3</code> 是 CodeBuddy 内置免费 model id）。<code>servitor inspect capabilities</code> 报告 <code>custom_models_source</code> 与 <code>custom_model_count</code>（本地配置的 NewAPI 模型，独立于 agent 内置模型）。</p>
-<p>退出码：<code>0</code> ok，<code>1</code> 运行失败，<code>2</code> 输入非法，<code>3</code> 未找到。输出模式：<code>--output human|json|quiet</code>。</p>
+<p>全局选项 <code>--output human|json|quiet</code>。委派 worker 形如 <code>servitor submit --agent codebuddy --model hy3 ...</code>（<code>hy3</code> 是 CodeBuddy 内置免费模型 id）。无 <code>advisor</code> 子命令；专家咨询是经 <code>submit --model ... --system-prompt ...</code> 表达的角色。安装须 <code>cargo install --path . --force</code>，使 <code>servitor</code> 与 <code>servitor-worker(.exe)</code> 落在同一 Cargo bin 目录；运行中（<code>activity=working</code>）勿覆盖 worker。</p>
 
 <h3>servitor-workflows</h3>
-<p>位于 servitor 之上的 Rust 编排层，拥有动态工作流执行、并发、commands、human gates、持久状态、replay、pause、cancellation 与 machine run evidence。执行契约三原语：<code>agent + command + gate</code>。</p>
+<p>编排层：动态工作流、并发、命令、human gate、持久化状态、重放/暂停/取消、机器运行证据。执行契约三原语 <code>agent + command + gate</code>。</p>
 <pre><code>servitor-workflows run WORKFLOW.js [--args JSON] [--max-parallel N] [--max-calls N] [--detach]
 servitor-workflows check WORKFLOW.js
 servitor-workflows resume RUN_ID
@@ -464,32 +305,36 @@ servitor-workflows supersede RUN_ID --reason TEXT [--evidence PATH] [--new-contr
 servitor-workflows inspect RUN_ID
 servitor-workflows watch RUN_ID
 servitor-workflows schema</code></pre>
-<ul>
-<li><code>run --detach</code>：做相同校验，创建一个 run 记录，对该已有记录启动一个 console-detached 子进程，立即返回其 <code>run_id</code> 与 <code>journal_path</code>，绝不创建第二个 workflow run。用 <code>get RUN_ID --wait</code> 每 500ms 轮询到 success / 终态失败 / cancellation / supersession / <code>waiting_human</code>，加 <code>--timeout-seconds N</code> 限定等待。</li>
-<li><code>check</code>：不运行即校验工作流——meta 声明加在精确 engine wrap 下解析脚本。<code>run</code> 做同样校验，脚本不可解析时以 exit <code>2</code> 拒绝，且不创建 run 目录。</li>
-<li><code>cancel</code> 需要 <code>--reason</code>，文本记入 <code>state.json</code> 的 <code>error: "cancelled: &lt;reason&gt;"</code> 供审计。</li>
-<li><code>watch</code> 仅从持久化的 <code>events.jsonl</code> 重建实时树视图，无内存状态。</li>
-</ul>
-<p>输出模式：<code>--output json</code>（机器面公开结果，默认）/ <code>--output human</code> / <code>--output quiet</code>；<code>watch</code> 还支持 <code>--output jsonl</code>。</p>
-<p>退出码：<code>0</code> ok，<code>1</code> 运行/终态失败，<code>2</code> 输入非法，<code>3</code> 未找到或 <code>get --wait</code> 到达 <code>waiting_human</code>，<code>4</code> 等待超时。错误同样走 stdout 信封。</p>
+<p>输出模式 <code>--output json|human|quiet</code>，<code>watch</code> 还支持 <code>--output jsonl</code>。<code>run --detach</code> 做相同校验、建一条 run 记录、启动一个脱离控制台的子进程，并立即返回 <code>run_id</code> 与 <code>journal_path</code>，绝不创建第二条 workflow run；用 <code>get RUN_ID --wait</code> 每 500 ms 轮询。退出码 <code>0/1/2/3/4</code>，错误同 envelope。</p>
+<p><code>check</code> 不运行即校验：meta 声明 + 在精确引擎包裹下解析脚本；<code>run</code> 复用该校验，不可解析则 <code>2</code> 退出且不建 run 目录。<code>cancel</code> 必须带 <code>--reason</code>，记入 <code>state.json</code> 为 <code>error: "cancelled: &lt;reason&gt;"</code>。恢复策略：<code>succeeded|cancelled|superseded</code> 阻止重跑，<code>failed</code> 仍可恢复。<code>max_calls</code> 预算从 journal 大小种子，重放不另发预算。默认 <code>max_parallel = min(16, available_parallelism)</code>、<code>max_calls = 1000</code>。</p>
+<pre><code># 真实示例
+servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\dynamic.workflow.js
+
+servitor-workflows run ...\negotiate-2body.workflow.js \
+  --args '{"topic":"pick a 30s local canary","maxRounds":2}'
+
+servitor-workflows run ...\goalchain.workflow.js \
+  --args '{"contractPath":"contract.md","mechanicalTokens":["dual-gate","boundary-audit"]}'</code></pre>
 </section>
 <section id="design">
-  <h2>设计理念</h2>
+<h2>设计理念</h2>
 
-  <h3>为什么用沙箱 JavaScript 而非静态 DAG</h3>
-  <p><code>servitor-workflows</code> 用沙箱 JavaScript 表达工作流，Boa 直接内嵌在 Rust 二进制里，因此运行时不依赖 Node、Deno、V8 或 Python。理由很直接：普通的循环、分支和动态 fan-out 在脚本里写比在一张静态 DAG 里拼清晰得多。工作流的执行契约只有三个原语——<code>agent + command + gate</code>，其余控制流交给脚本本身。</p>
-  <p>沙箱是严格的：JavaScript 没有直接的文件系统或进程 API，一切外部工作都必须穿过类型化的 <code>agent</code>、<code>command</code> 或 <code>gate</code> 边界。为了支撑 journal replay 的确定性假设，脚本每次执行应产出相同的调用输入，因此常见的不确定性来源——<code>Date.now()</code>、<code>Math.random()</code>、无参 <code>new Date()</code>、作为函数调用的 <code>Date()</code>——在工作流脚本里会直接抛 <code>TypeError</code>；时间戳和随机量要通过 <code>args</code> 传入，墙钟时间在 workflow 返回后再盖戳。<code>new Date(explicitValue)</code>、<code>Date.parse(...)</code>、<code>Date.UTC(...)</code> 仍然合法。</p>
+<h3>为什么用沙箱 JavaScript，而不是静态 DAG</h3>
+<p>servitor-workflows 的执行契约只有三个原语：<code>agent + command + gate</code>。工作流用沙箱化的 JavaScript 编写，理由很直接：普通的循环、分支、动态 fan-out，在 JavaScript 里写比在静态 DAG 里清晰得多。Rust 二进制内嵌了 <code>Boa</code> 引擎，<code>Node</code>、<code>Deno</code>、<code>V8</code>、<code>Python</code> 都不是运行时依赖。</p>
+<p>脚本本身没有直接的文件系统或进程 API——一切外部工作必须穿过有类型的 <code>agent</code>、<code>command</code> 或 <code>gate</code> 边界。这套设计把“编排逻辑”和“实际副作用”彻底分开：逻辑写在 JS 里自由组合，副作用只在三个边界上发生并被记入日志。</p>
 
-  <h3>为什么传输层只做一次调用</h3>
-  <p><code>servitor</code> 刻意停在 one durable provider call：接收一个请求，跑一个 provider 进程，捕获持久证据，返回一个小型类型化结果。多步执行、fan-out、命令、人工 gate、replay/resume、acceptance 以及机器 run evidence，全部属于上层的 <code>servitor-workflows</code>。工作流 journal 存储稳定的调用身份和 Servitor run id，resume 会复用已完成的调用，而不是让传输层重新提交；<code>servitor</code> 本身对 workflow 阶段和报告策略一无所知。reader-facing 报告由 workflow 的 reporting stage 用 reporting skills 产出，传输层不渲染报告。</p>
+<h3>为什么传输层只做一次调用</h3>
+<p>servitor 刻意停在“一次持久的 provider 调用”。它接收一个请求、运行一个 provider 进程、捕获持久证据、返回一个小的类型化结果。多步执行、fan-out、命令、人工 gate、replay/resume、验收、机器运行证据——这些都交给 sibling 工具 servitor-workflows，不属于传输层。</p>
+<p>这条边界让职责清晰：servitor 不感知 workflow 阶段和报告策略，journal 里存的是稳定的调用身份和 Servitor run id；resume 时复用已完成的调用，而不是让传输层再提交一遍。面向读者的交付报告由 workflow 的 reporting stage 产生，不是传输层渲染的。</p>
 
-  <h3>为什么 maker/checker 用独立子 run</h3>
-  <p>独立审查不是靠提示词约定，而是结构性的。<code>workflow(path, args?, options?)</code> 把另一个 workflow 脚本作为当前 run 的 child 运行：每个 child 有自己的 run id、journal 和边界，同时共享根 run 的并发调度器和 budget 账本。children 继承父级的 budget、boundary、capabilities 和 isolation，且只能收紧、不能放宽；child 失败只拒绝那一次 <code>workflow()</code> 调用，策略由父脚本决定；人工等待会沿树可见地上浮，批准根 run 即恢复等待中的后代；循环和无界递归在任何 dispatch 之前就被拒绝；取消从父级向所有 live 后代传播。</p>
-  <p>这样 maker/checker 独立是结构保证的：reviewer 作为 child workflow 跑在自己缩窄的只读 boundary 里，maker 的输出永远不会在同一个 run 里被自评。配合能力路由，maker 选用的模型永远不会成为 reviewer 那个 run 的候选。</p>
+<h3>为什么 maker/checker 用独立子 run</h3>
+<p>独立的审查不是靠“换个 prompt”实现的，而是结构性的：<code>reviewer</code> 作为一个 child workflow 运行，拥有自己的 run id、journal 和边界。child 只能继承并收紧父级的 budget、boundary、capabilities、isolation，绝不能放宽。</p>
+<p>因为 reviewer 跑在单独的 run 里，maker 选用的模型在 reviewer 的 run 里根本不是候选——maker 的模型选择永远不会成为 reviewer 的自评对象。maker/checker 的独立性是结构性的，不是 prompt 层面的约定。</p>
 
-  <h3>能力路由显式、不静默替换</h3>
-  <p>契约可以显式声明 provider/model 候选与角色要求。路由是基于能力的、可解释的：一个显式的 provider/model 选择永远不会被静默替换；一个不可接受的选择会在 transport submission 之前就失败，而不是去探测某个 provider 或制造一个 fallback。children 继承声明的候选集且只能收窄。这种显式性也延伸到模型格式：为 <code>pi</code> 指定模型时必须用 <code>provider/model-id</code> 格式，provider 前缀必须匹配 <code>~/.pi/agent/models.json</code> 的 <code>providers</code> 键；裸 model id（如 <code>"glm-5.2""</code>）会让 pi 按名字猜上游 provider 并以 <code>No API key found for &lt;guessed-provider&gt;</code> 失败。</p>
+<h3>能力路由：显式，不静默替换</h3>
+<p>契约可以声明显式的 provider/model 候选和 role 要求（如 <code>maker</code> 需要 <code>reasoning</code> 能力、<code>effort: high</code>、一定 contextTokens）。路由是基于能力的、可解释的。一个显式的 provider/model 选择永远不会被静默替换；一个不可接受的选择会在传输提交之前就失败，而不是去探测某个 provider 或制造一个 fallback。child 继承声明的候选集，且只能收窄。</p>
 </section>
+  </main>
 </div>
 </body>
 </html>

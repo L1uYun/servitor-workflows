@@ -3,8 +3,12 @@ export const meta = {
   description: "Generate a self-contained newcomer HTML intro to servitor + servitor-workflows from their READMEs (parallel section assembly)",
   contract: "workflow",
   boundary: {
-    readPaths: ["D:\\AgentWork\\_tmp\\intro-html"],
-    writePaths: ["D:\\AgentWork\\_tmp\\intro-html\\out"],
+    // Repo-relative: this script lives in examples/, so ".." is the
+    // servitor-workflows repo and "../.." is tools/ (covers the servitor README).
+    // Agent calls default their cwd to the script's parent (examples/), which
+    // must fall inside readPaths or the boundary audit rejects every call.
+    readPaths: ["../.."],
+    writePaths: ["../docs"],
     network: "allow",
     environment: { allow: ["PART", "HEAD", "FOOT", "BODY"] },
   },
@@ -18,22 +22,21 @@ export const meta = {
   },
 };
 
-const BASE = "D:\\AgentWork\\_tmp\\intro-html";
-
 // ---------------------------------------------------------------------------
 phase("gather");
 // Read both READMEs once; the text is passed verbatim to every section writer so
-// no section may invent a fact the READMEs do not contain.
+// no section may invent a fact the READMEs do not contain. Paths are relative to
+// the script's parent dir (examples/), which is the default command cwd.
 const readmes = await command("pwsh", [
   "-NoProfile", "-Command",
   "$ErrorActionPreference='Stop';" +
-  "$a=Get-Content -LiteralPath '" + BASE + "\\servitor-readme.md' -Raw -Encoding utf8;" +
-  "$b=Get-Content -LiteralPath '" + BASE + "\\servitor-workflows-readme.md' -Raw -Encoding utf8;" +
+  "$a=Get-Content -LiteralPath '../../servitor/README.md' -Raw -Encoding utf8;" +
+  "$b=Get-Content -LiteralPath '../README.md' -Raw -Encoding utf8;" +
   "Write-Output '===== SERVITOR README =====';" +
   "Write-Output $a;" +
   "Write-Output '===== SERVITOR-WORKFLOWS README =====';" +
   "Write-Output $b"
-], { label: "read-readmes", cwd: BASE, timeoutSeconds: 60 });
+], { label: "read-readmes", timeoutSeconds: 60 });
 if (readmes.exitCode !== 0 || readmes.timedOut) {
   throw new Error("gather failed: " + (readmes.stderr || readmes.stdout));
 }
@@ -137,18 +140,18 @@ phase("write");
 const write = await command("pwsh", [
   "-NoProfile", "-Command",
   "$ErrorActionPreference='Stop';" +
-  "$p='" + BASE + "\\out\\servitor-intro.html';" +
+  "$p='../docs/servitor-intro.html';" +
   "$dir=Split-Path -Parent $p; if($dir -and !(Test-Path -LiteralPath $dir)){ New-Item -ItemType Directory -Force -Path $dir | Out-Null };" +
   "Set-Content -LiteralPath $p -Value $env:BODY -Encoding utf8 -NoNewline;" +
   "'bytes:' + (Get-Item -LiteralPath $p).Length"
-], { label: "write-html", cwd: BASE, timeoutSeconds: 60, env: { BODY: full } });
+], { label: "write-html", timeoutSeconds: 60, env: { BODY: full } });
 if (write.exitCode !== 0 || write.timedOut) {
   throw new Error("write failed: " + (write.stderr || write.stdout));
 }
 
 return {
   summary: "generated servitor + servitor-workflows newcomer intro HTML (parallel section assembly)",
-  path: BASE + "\\out\\servitor-intro.html",
+  path: "../docs/servitor-intro.html",
   bytes: write.stdout.trim(),
   sectionCount: SECTIONS.length,
 };
