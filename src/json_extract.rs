@@ -774,14 +774,20 @@ fn match_balanced(bytes: &[u8], start: usize) -> Option<usize> {
 }
 
 /// Drop trailing commas before `}` / `]` outside strings.
+///
+/// Iterates by `char`, not by byte. A byte+`as char` loop re-encodes each
+/// UTF-8 continuation byte as a Latin-1 codepoint when pushed back into the
+/// `String`, silently corrupting non-ASCII string values while still removing
+/// the comma — the repaired text then parsed as valid JSON with a garbled
+/// value, so schema validation passed and the correction retry never fired.
 pub fn remove_trailing_commas(input: &str) -> String {
-    let bytes = input.as_bytes();
+    let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
     let mut in_string = false;
     let mut escaped = false;
     let mut i = 0;
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
+    while i < chars.len() {
+        let ch = chars[i];
         if in_string {
             out.push(ch);
             if escaped {
@@ -802,10 +808,10 @@ pub fn remove_trailing_commas(input: &str) -> String {
         }
         if ch == ',' {
             let mut j = i + 1;
-            while j < bytes.len() && matches!(bytes[j], b' ' | b'\n' | b'\r' | b'\t') {
+            while j < chars.len() && matches!(chars[j], ' ' | '\n' | '\r' | '\t') {
                 j += 1;
             }
-            if j < bytes.len() && matches!(bytes[j], b'}' | b']') {
+            if j < chars.len() && matches!(chars[j], '}' | ']') {
                 i += 1;
                 continue;
             }
@@ -855,6 +861,22 @@ mod tests {
         let text = r#"{"a":1,"b":[2,3,],}"#;
         let value = extract_json_value(text, Expect::Object).expect("extract");
         assert_eq!(value, json!({"a":1,"b":[2,3]}));
+    }
+
+    #[test]
+    fn repairs_trailing_commas_without_corrupting_non_ascii() {
+        // Regression: the byte+`as char` loop re-encoded UTF-8 continuation
+        // bytes as Latin-1, garbling 中文 string values while still dropping
+        // the comma — so the repaired text parsed as valid JSON with a corrupt
+        // value and schema validation passed, never triggering the correction
+        // retry. This shape is the intro-html workflow's actual output.
+        let text = r#"{"html": "<p>你好，世界</p>",}"#;
+        let value = extract_json_value(text, Expect::Object).expect("extract");
+        assert_eq!(value["html"], json!("<p>你好，世界</p>"));
+        // Comma inside a string must NOT be treated as a trailing comma.
+        let text2 = r#"{"a": "x,y",}"#;
+        let value2 = extract_json_value(text2, Expect::Object).expect("extract");
+        assert_eq!(value2["a"], json!("x,y"));
     }
 
     #[test]
