@@ -472,6 +472,10 @@ servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\negotiate-
 # mechanical gate → human gate → semantic gate → writeback.
 servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\goalchain.workflow.js `
   --args '{"contractPath":"contract.md","mechanicalTokens":["dual-gate","boundary-audit"]}'
+
+# Newcomer intro: parallel() section assembly builds a self-contained HTML that
+# introduces servitor + servitor-workflows from these two READMEs (see docs/servitor-intro.html).
+servitor-workflows run D:\AgentWork\tools\servitor-workflows\examples\intro-html.workflow.js
 ```
 
 Pause/resume evidence uses the original run id:
